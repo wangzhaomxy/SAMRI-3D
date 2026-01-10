@@ -25,10 +25,10 @@ Example:
     
     
 python test_vis.py \
---sam2-config /home/s4670484/Desktop/Scratch/samri/SAMRI2/sam2/sam2_hiera_t.yaml \
+--sam2-config configs/sam2.1/sam2.1_hiera_t.yaml \
 --ckpt-path /home/s4670484/Desktop/Scratch/samri/pretrained_ckpt/sam2.1_hiera_tiny.pt \
 --save-path /home/s4670484/Desktop/Scratch/samri/Eval_results/SAM2/sam2_hiera_t.pkl \
---test-file-paths /path/to/dataset/main-folder\
+--test-file-paths /home/s4670484/Desktop/Scratch/samri/Datasets/SAMRI_train_test/ \
 --device cuda
     
     sam2_hiera_t.yaml     sam2.1_hiera_tiny.pt
@@ -112,11 +112,12 @@ def test_image_path(path):
     Returns:
         list: A list of paths to the testing subdirectories.
     """
+    print("Generating test image paths from:", path)
     return [
         ds + "/testing/" for ds in sorted(glob(path + "*"))
         if os.path.isdir(ds)
     ]
-
+TEST_IMAGE_PATH = [ds + "/testing/" for ds in sorted(glob(TEST_PATH + "*"))]
 
 # -----------------------------
 # SAM2-only evaluation core
