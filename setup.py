@@ -31,6 +31,9 @@ setup(
         "ipyfilechooser==0.6.0",
         "jupyterlab==4.5.0",
         "notebook==7.5.0",
+        "hydra-core>=1.3.2",
+        "iopath>=0.1.10",
+        "pillow>=9.4.0",
     ],
     classifiers=[
         "Development Status :: 3 - Alpha",
