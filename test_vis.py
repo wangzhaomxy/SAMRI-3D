@@ -117,7 +117,7 @@ def test_image_path(path):
         ds + "/testing/" for ds in sorted(glob(path + "*"))
         if os.path.isdir(ds)
     ]
-TEST_IMAGE_PATH = [ds + "/testing/" for ds in sorted(glob(TEST_PATH + "*"))]
+
 
 # -----------------------------
 # SAM2-only evaluation core
