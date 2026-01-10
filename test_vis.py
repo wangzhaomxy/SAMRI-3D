@@ -303,8 +303,7 @@ def main():
     parser.add_argument("--save-path", type=str, required=True,
                         help="Output pickle path OR output folder if testing multiple ckpts.")
     parser.add_argument("--num-workers", type=int, default=8)
-
-    parser.add_argument("--test-file-paths", type=str, nargs="+", required=True,
+    parser.add_argument("--test-file-paths", type=str, required=True,
                         help="List of dataset folder paths (same format you used before).")
 
     args = parser.parse_args()
