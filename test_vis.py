@@ -20,11 +20,27 @@ Example:
     --sam2-config configs/sam2.1/sam2.1_hiera_l.yaml \
     --ckpt-path /path/to/sam2_checkpoint.pt \
     --save-path /path/to/save/results.pkl \
+    --test-file-paths /path/to/dataset/main-folder\
     --device cuda
+    
+    
+python test_vis.py \
+--sam2-config /home/s4670484/Desktop/Scratch/samri/SAMRI2/sam2/sam2_hiera_t.yaml \
+--ckpt-path /home/s4670484/Desktop/Scratch/samri/pretrained_ckpt/sam2.1_hiera_tiny.pt \
+--save-path /home/s4670484/Desktop/Scratch/samri/Eval_results/SAM2/sam2_hiera_t.pkl \
+--test-file-paths /path/to/dataset/main-folder\
+--device cuda
+    
+    sam2_hiera_t.yaml     sam2.1_hiera_tiny.pt
+    sam2_hiera_s.yaml     sam2.1_hiera_small.pt
+    sam2_hiera_b+.yaml    sam2.1_hiera_base_plus.pt
+    sam2_hiera_l.yaml     sam2.1_hiera_large.pt
+
 """
 
 from __future__ import annotations
 
+from glob import glob
 import os
 import sys
 import time
@@ -86,6 +102,20 @@ def _ensure_hwc_uint8_rgb(image: np.ndarray) -> np.ndarray:
             image = image.clip(0, 255).astype(np.uint8)
 
     return image
+
+def test_image_path(path):
+    """substract images from the main dataset folder
+
+    Args:
+        path (str): The root path of the datasets.
+
+    Returns:
+        list: A list of paths to the testing subdirectories.
+    """
+    return [
+        ds + "/testing/" for ds in sorted(glob(path + "*"))
+        if os.path.isdir(ds)
+    ]
 
 
 # -----------------------------
@@ -273,8 +303,6 @@ def main():
                         help="Output pickle path OR output folder if testing multiple ckpts.")
     parser.add_argument("--num-workers", type=int, default=8)
 
-    # IMPORTANT: keep your dataset list definition wherever you normally keep it.
-    # If you have cfg.TEST_IMAGE_PATH in your project, you can import it here.
     parser.add_argument("--test-file-paths", type=str, nargs="+", required=True,
                         help="List of dataset folder paths (same format you used before).")
 
@@ -304,7 +332,7 @@ def main():
             out_path = str(save_root / (Path(ckpt).stem + ".pkl"))
 
         save_test_record(
-            file_paths=args.test_file_paths,
+            file_paths=test_image_path(args.test_file_paths),
             sam2_model=sam2_model,
             save_path=out_path,
             num_workers=args.num_workers,
