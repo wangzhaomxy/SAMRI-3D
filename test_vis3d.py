@@ -42,7 +42,7 @@ python test_vis3d.py \
 --ckpt-path /home/s4670484/Desktop/Scratch/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
 --dataset-path /home/s4670484/Desktop/Scratch/samri/Datasets/Test_3d/ \
 --save-path /home/s4670484/Desktop/Scratch/samri/Eval_results/SAM2/sam2_hiera_s_3d.pkl \
---prompt-mode box \
+--prompt-mode mask \
 --device cuda
   
 Available SAM2 configs/checkpoints:
@@ -51,6 +51,7 @@ Available SAM2 configs/checkpoints:
     sam2_hiera_b+.yaml    sam2.1_hiera_base_plus.pt
     sam2_hiera_l.yaml     sam2.1_hiera_large.pt
     SAMRI_train_test/     Test_3d/
+    box / mask          
 """
 
 from __future__ import annotations
