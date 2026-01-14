@@ -40,9 +40,9 @@ python test_vis3d.py \
 python test_vis3d.py \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
 --ckpt-path /home/s4670484/Desktop/Scratch/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
---dataset-path /home/s4670484/Desktop/Scratch/samri/Datasets/Test_3d/ \
+--dataset-path /home/s4670484/Desktop/Scratch/samri/Datasets/SAMRI_datasets_3D/ \
 --save-path /home/s4670484/Desktop/Scratch/samri/Eval_results/SAM2/sam2_hiera_s_3d.pkl \
---prompt-mode mask \
+--prompt-mode box \
 --device cuda
   
 Available SAM2 configs/checkpoints:
@@ -50,7 +50,7 @@ Available SAM2 configs/checkpoints:
     sam2_hiera_s.yaml     sam2.1_hiera_small.pt
     sam2_hiera_b+.yaml    sam2.1_hiera_base_plus.pt
     sam2_hiera_l.yaml     sam2.1_hiera_large.pt
-    SAMRI_train_test/     Test_3d/
+    SAMRI_datasets_3D/     Test_3d/
     box / mask          
 """
 
@@ -85,6 +85,37 @@ _THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_THIS_DIR))
 
 from sam2.build_sam import build_sam2_video_predictor
+
+import contextlib
+
+@contextlib.contextmanager
+def suppress_sam2_output(enabled: bool = True):
+    """
+    Suppress stdout/stderr (SAM2 prints + tqdm bars) inside the context.
+    Keeps your dataset-level tqdm clean.
+    """
+    if not enabled:
+        yield
+        return
+
+    # Also helps some tqdm-based libs
+    old_env = os.environ.get("TQDM_DISABLE", None)
+    os.environ["TQDM_DISABLE"] = "1"
+
+    devnull = open(os.devnull, "w")
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    try:
+        sys.stdout = devnull
+        sys.stderr = devnull
+        yield
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+        devnull.close()
+        if old_env is None:
+            os.environ.pop("TQDM_DISABLE", None)
+        else:
+            os.environ["TQDM_DISABLE"] = old_env
 
 
 # ----------------------------
@@ -353,7 +384,8 @@ def prepare_videos_once(
 
     # Try streaming sanity check (init_state once and immediately discard state)
     try:
-        _st = init_state_compat(predictor, loader1, num1, prefer_streaming=True)
+        with suppress_sam2_output(True):
+            _st = init_state_compat(predictor, loader1, num1, prefer_streaming=True)
         # If it succeeded, assume streaming works
         return PreparedVideos(
             v1_source=loader1,
@@ -551,18 +583,20 @@ def predict_one_label(
     lb = int(label)
 
     # video1
-    st1 = init_state_compat(predictor, prepared.v1_source, prepared.v1_len, prefer_streaming=prepared.use_streaming)
-    ok = add_prompt_single_label(predictor, st1, prompt_mode, gt_cut_slice, lb, ann_frame_idx=0)
-    if not ok:
-        return None
-    pred1 = propagate_video_singleobj(predictor, st1, obj_id=lb)
+    with suppress_sam2_output(True):
+        st1 = init_state_compat(predictor, prepared.v1_source, prepared.v1_len, prefer_streaming=prepared.use_streaming)
+        ok = add_prompt_single_label(predictor, st1, prompt_mode, gt_cut_slice, lb, ann_frame_idx=0)
+        if not ok:
+            return None
+        pred1 = propagate_video_singleobj(predictor, st1, obj_id=lb)
 
     # video2
-    st2 = init_state_compat(predictor, prepared.v2_source, prepared.v2_len, prefer_streaming=prepared.use_streaming)
-    ok2 = add_prompt_single_label(predictor, st2, prompt_mode, gt_cut_slice, lb, ann_frame_idx=0)
-    if not ok2:
-        return None
-    pred2 = propagate_video_singleobj(predictor, st2, obj_id=lb)
+    with suppress_sam2_output(True):
+        st2 = init_state_compat(predictor, prepared.v2_source, prepared.v2_len, prefer_streaming=prepared.use_streaming)
+        ok2 = add_prompt_single_label(predictor, st2, prompt_mode, gt_cut_slice, lb, ann_frame_idx=0)
+        if not ok2:
+            return None
+        pred2 = propagate_video_singleobj(predictor, st2, obj_id=lb)
 
     # merge
     pred0 = merge_two_videos_single_label(
