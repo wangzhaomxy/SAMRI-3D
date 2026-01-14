@@ -66,7 +66,7 @@ import argparse
 import tempfile
 from glob import glob
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Callable, Any
+from typing import Dict, List, Tuple, Optional, Callable, Any, Union
 
 import numpy as np
 import SimpleITK as sitk
@@ -74,7 +74,13 @@ from PIL import Image
 
 import torch
 
-# Ensure local ./sam2 is importable (preferred over site-packages)
+# tqdm optional
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover
+    tqdm = None
+
+# Prefer local ./sam2
 _THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_THIS_DIR))
 
@@ -146,12 +152,6 @@ def replace_img_to_gt_name(name: str) -> str:
 
 
 def try_find_gt_same_folder(img_path: Path) -> Optional[Path]:
-    """
-    Find GT in SAME directory:
-    1) direct name replacement (same extension)
-    2) try common medical extensions with same base name
-    3) fallback: first glob match base.* in same folder
-    """
     gt_name = replace_img_to_gt_name(img_path.name)
     gt_path = img_path.with_name(gt_name)
     if gt_path.exists():
@@ -173,9 +173,6 @@ def try_find_gt_same_folder(img_path: Path) -> Optional[Path]:
 
 
 def scan_pairs_same_folder(folder: str) -> List[Tuple[str, str]]:
-    """
-    Recursively find all *_img_* items and pair with *_gt_* in the same folder.
-    """
     rootp = Path(folder)
     pairs: List[Tuple[str, str]] = []
     for p in rootp.rglob("*"):
@@ -183,7 +180,6 @@ def scan_pairs_same_folder(folder: str) -> List[Tuple[str, str]]:
             continue
         gt = try_find_gt_same_folder(p)
         if gt is None or not gt.exists():
-            print(f"[Warn] GT not found for image: {p}")
             continue
         pairs.append((str(p), str(gt)))
     pairs.sort()
@@ -191,18 +187,7 @@ def scan_pairs_same_folder(folder: str) -> List[Tuple[str, str]]:
 
 
 def collect_test_folders(dataset_path: str) -> List[str]:
-    """
-    dataset-path contains multiple dataset folders.
-    For each dataset folder, prefer <ds>/testing if exists; else scan <ds>.
-    If dataset_path itself contains *_img_* files, we just scan dataset_path.
-    """
     dataset_path = dataset_path.rstrip("/")
-
-    # If dataset_path already looks like a test folder (contains any _img_), just use it.
-    if any("_img_" in p.name for p in Path(dataset_path).rglob("*")):
-        # It might still be a multi-dataset root; we’ll handle both cases below.
-        pass
-
     ds_folders = [d for d in sorted(glob(dataset_path + "/*")) if os.path.isdir(d)]
     if not ds_folders:
         return [dataset_path]
@@ -215,7 +200,19 @@ def collect_test_folders(dataset_path: str) -> List[str]:
 
 
 # ----------------------------
-# Cut-slice selection
+# Empty sample filtering
+# ----------------------------
+def is_image_empty(img_zyx: np.ndarray, eps: float = 1e-8) -> bool:
+    return float(np.max(np.abs(img_zyx))) <= eps
+
+
+def get_labels_from_mask(gt_zyx: np.ndarray) -> List[int]:
+    labels = [int(x) for x in np.unique(gt_zyx)]
+    return sorted([x for x in labels if x != 0])
+
+
+# ----------------------------
+# Cut-slice selection + split videos
 # ----------------------------
 def shortest_axes(shape: Tuple[int, int, int]) -> List[int]:
     m = min(shape)
@@ -228,10 +225,6 @@ def choose_primary_axis(shape: Tuple[int, int, int]) -> int:
 
 
 def largest_mask_slice_index(mask: np.ndarray, axis: int, label: Optional[int] = None) -> int:
-    """
-    Slice index along `axis` with maximum foreground area.
-    If label is provided: area of (mask==label); else area of (mask>0).
-    """
     moved = np.moveaxis(mask, axis, 0)  # [S, ...]
     fg = (moved == label) if (label is not None) else (moved > 0)
     sums = fg.sum(axis=tuple(range(1, moved.ndim)))
@@ -239,18 +232,13 @@ def largest_mask_slice_index(mask: np.ndarray, axis: int, label: Optional[int] =
 
 
 def build_two_videos_indices(N: int, n: int) -> Tuple[List[int], List[int]]:
-    """
-    N slices total (0..N-1). Cut slice = n.
-    video1: n, n-1, ..., 0
-    video2: n, n+1, ..., N-1
-    """
     v1 = list(range(n, -1, -1))
     v2 = [n] + list(range(n + 1, N))
     return v1, v2
 
 
 # ----------------------------
-# Frame adapters: streaming callable (preferred) + jpg fallback
+# Frame adapters: streaming callable + jpg fallback (reused per case)
 # ----------------------------
 def normalize_to_uint8(slice2d: np.ndarray, p_low: float = 0.5, p_high: float = 99.5) -> np.ndarray:
     sl = slice2d.astype(np.float32)
@@ -265,32 +253,23 @@ def normalize_to_uint8(slice2d: np.ndarray, p_low: float = 0.5, p_high: float = 
 def make_pil_loader_from_volume(
     vol_shw: np.ndarray,        # [S,H,W]
     slice_indices: List[int],   # maps frame_idx -> slice_idx
-) -> Tuple[Callable[[int], Image.Image], int, int, int]:
-    """
-    Returns loader_func(frame_idx)->PIL.Image RGB, and (num_frames, H, W).
-    """
-    _, H, W = vol_shw.shape
-
+) -> Tuple[Callable[[int], Image.Image], int]:
     def loader_func(frame_idx: int) -> Image.Image:
         z = slice_indices[frame_idx]
         s2d = normalize_to_uint8(vol_shw[z])
         rgb = np.stack([s2d, s2d, s2d], axis=-1)
         return Image.fromarray(rgb)
 
-    return loader_func, len(slice_indices), H, W
+    return loader_func, len(slice_indices)
 
 
 def get_fast_tmp_root() -> Optional[str]:
-    # Prefer RAM-backed tmp on Linux/HPC
     if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
         return "/dev/shm"
     return None
 
 
 def write_video_frames_to_dir(vol_shw: np.ndarray, slice_indices: List[int], out_dir: str) -> str:
-    """
-    Writes frames as 00000.jpg, 00001.jpg, ... into out_dir.
-    """
     os.makedirs(out_dir, exist_ok=True)
     for i, z in enumerate(slice_indices):
         s2d = normalize_to_uint8(vol_shw[z])
@@ -304,37 +283,110 @@ def init_state_compat(predictor, video_source: Any, num_frames: int, prefer_stre
     Version-compatible init_state:
     - Newer SAM2: may accept frame_load_config
     - Mid SAM2: may accept callable video_path but no frame_load_config
-    - Older SAM2: requires a directory of jpg frames
+    - Older SAM2: requires directory of jpg frames
     """
     sig = inspect.signature(predictor.init_state)
     params = sig.parameters
 
-    # 1) Try streaming callable
     if prefer_streaming and callable(video_source):
         kwargs = {"video_path": video_source}
-
-        # Only pass supported kwargs
         if "frame_load_config" in params:
             kwargs["frame_load_config"] = {"max_frames": int(num_frames), "first_frame_num": 0}
         elif "max_frames" in params:
             kwargs["max_frames"] = int(num_frames)
         elif "num_frames" in params:
             kwargs["num_frames"] = int(num_frames)
-
         try:
             return predictor.init_state(**kwargs)
-        except TypeError as e:
-            print(f"[Warn] Streaming init_state failed: {e}")
-            # fallthrough to folder mode
+        except TypeError:
+            pass
 
-    # 2) Folder mode
     if not isinstance(video_source, str):
         raise TypeError("Fallback init_state requires a directory path (str) as video_source.")
     return predictor.init_state(video_path=video_source)
 
 
+class PreparedVideos:
+    """
+    Prepared per-case video sources for video1 and video2.
+    - If streaming works: sources are callables (no disk IO).
+    - Else: sources are directories with jpgs (written once and reused).
+    """
+    def __init__(
+        self,
+        v1_source: Union[Callable[[int], Image.Image], str],
+        v2_source: Union[Callable[[int], Image.Image], str],
+        v1_len: int,
+        v2_len: int,
+        v1_slices: List[int],
+        v2_slices: List[int],
+        tmp_base: Optional[str],
+        use_streaming: bool,
+    ):
+        self.v1_source = v1_source
+        self.v2_source = v2_source
+        self.v1_len = v1_len
+        self.v2_len = v2_len
+        self.v1_slices = v1_slices
+        self.v2_slices = v2_slices
+        self.tmp_base = tmp_base
+        self.use_streaming = use_streaming
+
+    def cleanup(self):
+        if self.tmp_base:
+            shutil.rmtree(self.tmp_base, ignore_errors=True)
+
+
+def prepare_videos_once(
+    predictor,
+    vol0: np.ndarray,            # [S,H,W]
+    v1_slices: List[int],
+    v2_slices: List[int],
+) -> PreparedVideos:
+    """
+    Prepare video sources ONCE per case:
+    - Try streaming callables first
+    - If SAM2 rejects callables, write both videos to jpg dirs ONCE and reuse
+    """
+    loader1, num1 = make_pil_loader_from_volume(vol0, v1_slices)
+    loader2, num2 = make_pil_loader_from_volume(vol0, v2_slices)
+
+    # Try streaming sanity check (init_state once and immediately discard state)
+    try:
+        _st = init_state_compat(predictor, loader1, num1, prefer_streaming=True)
+        # If it succeeded, assume streaming works
+        return PreparedVideos(
+            v1_source=loader1,
+            v2_source=loader2,
+            v1_len=num1,
+            v2_len=num2,
+            v1_slices=v1_slices,
+            v2_slices=v2_slices,
+            tmp_base=None,
+            use_streaming=True,
+        )
+    except Exception:
+        # Fallback to jpg dirs (write once)
+        fast_tmp = get_fast_tmp_root()
+        tmp_base = tempfile.mkdtemp(prefix="sam2_3d_case_", dir=fast_tmp)
+        v1_dir = os.path.join(tmp_base, "video1")
+        v2_dir = os.path.join(tmp_base, "video2")
+        write_video_frames_to_dir(vol0, v1_slices, v1_dir)
+        write_video_frames_to_dir(vol0, v2_slices, v2_dir)
+        return PreparedVideos(
+            v1_source=v1_dir,
+            v2_source=v2_dir,
+            v1_len=num1,
+            v2_len=num2,
+            v1_slices=v1_slices,
+            v2_slices=v2_slices,
+            tmp_base=tmp_base,
+            use_streaming=False,
+        )
+
+
 # ----------------------------
-# Prompts: box or mask (fallback to points if needed)
+# Prompts: single-object
 # ----------------------------
 def mask2d_to_bbox_xyxy(mask2d: np.ndarray) -> Optional[np.ndarray]:
     ys, xs = np.where(mask2d > 0)
@@ -345,7 +397,7 @@ def mask2d_to_bbox_xyxy(mask2d: np.ndarray) -> Optional[np.ndarray]:
     return np.array([x0, y0, x1, y1], dtype=np.float32)
 
 
-def sample_positive_points(mask2d: np.ndarray, num_pos: int = 128) -> Tuple[np.ndarray, np.ndarray]:
+def sample_positive_points(mask2d: np.ndarray, num_pos: int = 256) -> Tuple[np.ndarray, np.ndarray]:
     ys, xs = np.where(mask2d > 0)
     if xs.size == 0:
         return np.zeros((0, 2), np.float32), np.zeros((0,), np.int32)
@@ -356,144 +408,177 @@ def sample_positive_points(mask2d: np.ndarray, num_pos: int = 128) -> Tuple[np.n
     return pts, lbls
 
 
-def add_prompts_for_all_labels(
+def add_prompt_single_label(
     predictor,
     inference_state,
     prompt_mode: str,
     gt_cut_slice: np.ndarray,   # [H,W] label ids
-    labels: List[int],
+    label: int,
     ann_frame_idx: int = 0,
-) -> List[int]:
+) -> bool:
     """
-    Adds one SAM2 object per label with obj_id=label.
-    Skips labels absent on cut slice.
-    Returns labels actually added.
+    Add prompt for exactly ONE label (obj_id=label).
+    Returns True if prompt added, False if label not present on cut slice.
     """
-    added = []
-    for lb in labels:
-        obj_id = int(lb)
-        mask_lb = (gt_cut_slice == lb).astype(np.uint8)
-        if mask_lb.sum() == 0:
-            continue
+    lb = int(label)
+    mask_lb = (gt_cut_slice == lb).astype(np.uint8)
+    if mask_lb.sum() == 0:
+        return False
 
-        if prompt_mode == "box":
-            box = mask2d_to_bbox_xyxy(mask_lb)
-            if box is None:
-                continue
-            try:
-                predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=ann_frame_idx,
-                    obj_id=obj_id,
-                    box=box,
-                )
-            except TypeError:
-                predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=ann_frame_idx,
-                    obj_id=obj_id,
-                    points=None,
-                    labels=None,
-                    box=box,
-                )
-            added.append(lb)
+    if prompt_mode == "box":
+        box = mask2d_to_bbox_xyxy(mask_lb)
+        if box is None:
+            return False
+        try:
+            predictor.add_new_points_or_box(
+                inference_state=inference_state,
+                frame_idx=ann_frame_idx,
+                obj_id=lb,
+                box=box,
+            )
+        except TypeError:
+            predictor.add_new_points_or_box(
+                inference_state=inference_state,
+                frame_idx=ann_frame_idx,
+                obj_id=lb,
+                points=None,
+                labels=None,
+                box=box,
+            )
+        return True
 
-        elif prompt_mode == "mask":
-            if hasattr(predictor, "add_new_mask"):
-                predictor.add_new_mask(
-                    inference_state=inference_state,
-                    frame_idx=ann_frame_idx,
-                    obj_id=obj_id,
-                    mask=mask_lb,
-                )
-                added.append(lb)
-            else:
-                pts, lbls = sample_positive_points(mask_lb, num_pos=256)
-                if pts.shape[0] == 0:
-                    continue
-                predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=ann_frame_idx,
-                    obj_id=obj_id,
-                    points=pts,
-                    labels=lbls,
-                )
-                added.append(lb)
-        else:
-            raise ValueError(f"Unknown prompt_mode: {prompt_mode}")
+    if prompt_mode == "mask":
+        if hasattr(predictor, "add_new_mask"):
+            predictor.add_new_mask(
+                inference_state=inference_state,
+                frame_idx=ann_frame_idx,
+                obj_id=lb,
+                mask=mask_lb,
+            )
+            return True
+        pts, lbls = sample_positive_points(mask_lb, num_pos=256)
+        if pts.shape[0] == 0:
+            return False
+        predictor.add_new_points_or_box(
+            inference_state=inference_state,
+            frame_idx=ann_frame_idx,
+            obj_id=lb,
+            points=pts,
+            labels=lbls,
+        )
+        return True
 
-    return added
+    raise ValueError(f"Unknown prompt_mode: {prompt_mode}")
 
 
 # ----------------------------
-# SAM2 propagation + merge
+# SAM2 propagation (single-object) + merge
 # ----------------------------
 @torch.no_grad()
-def propagate_video_multiobj(
+def propagate_video_singleobj(
     predictor,
     inference_state,
-) -> Dict[int, Dict[int, np.ndarray]]:
+    obj_id: int,
+) -> Dict[int, np.ndarray]:
     """
-    Returns: frame_idx -> {obj_id -> mask2d_uint8}
+    Returns: frame_idx -> mask2d_uint8 for a single obj_id.
     """
-    out: Dict[int, Dict[int, np.ndarray]] = {}
+    out: Dict[int, np.ndarray] = {}
+    oid = int(obj_id)
+
     for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
         fi = int(out_frame_idx)
-        out[fi] = {}
-        for i, oid in enumerate(out_obj_ids):
-            oid_i = int(oid)
-            logits = out_mask_logits[i]
-            if hasattr(logits, "detach"):
-                logits = logits.detach()
-            m = (logits > 0.0)
-            if hasattr(m, "cpu"):
-                m = m.cpu().numpy()
-            out[fi][oid_i] = np.squeeze(m).astype(np.uint8)
+        # find index of this obj_id
+        idx = None
+        for j, o in enumerate(out_obj_ids):
+            if int(o) == oid:
+                idx = j
+                break
+        if idx is None:
+            continue
+        logits = out_mask_logits[idx]
+        if hasattr(logits, "detach"):
+            logits = logits.detach()
+        m = (logits > 0.0)
+        if hasattr(m, "cpu"):
+            m = m.cpu().numpy()
+        out[fi] = np.squeeze(m).astype(np.uint8)
+
     return out
 
 
-def merge_two_videos_to_volume(
+def merge_two_videos_single_label(
     N: int,
     H: int,
     W: int,
     v1_slices: List[int],
     v2_slices: List[int],
-    v1_pred: Dict[int, Dict[int, np.ndarray]],
-    v2_pred: Dict[int, Dict[int, np.ndarray]],
-    labels: List[int],
+    v1_pred: Dict[int, np.ndarray],
+    v2_pred: Dict[int, np.ndarray],
 ) -> np.ndarray:
     """
-    Merge predictions back to a semantic label volume [S,H,W] (int32), background=0.
-    Overlap resolution: later writes override earlier ones.
+    Merge into [S,H,W] uint8 binary mask for ONE label.
     """
-    pred = np.zeros((N, H, W), dtype=np.int32)
+    pred = np.zeros((N, H, W), dtype=np.uint8)
     written = set()
 
-    def write_slice(z: int, obj_to_mask: Dict[int, np.ndarray]):
-        nonlocal pred
-        for lb in labels:
-            oid = int(lb)
-            if oid not in obj_to_mask:
-                continue
-            pred[z][obj_to_mask[oid] > 0] = oid
-
-    for fidx, objm in v1_pred.items():
+    for fidx, m in v1_pred.items():
         z = v1_slices[fidx]
-        write_slice(z, objm)
+        pred[z] = (m > 0).astype(np.uint8)
         written.add(z)
 
-    for fidx, objm in v2_pred.items():
+    for fidx, m in v2_pred.items():
         z = v2_slices[fidx]
         if z in written:
             continue
-        write_slice(z, objm)
+        pred[z] = (m > 0).astype(np.uint8)
         written.add(z)
 
     return pred
 
 
+def predict_one_label(
+    predictor,
+    prepared: PreparedVideos,
+    gt_cut_slice: np.ndarray,   # [H,W]
+    prompt_mode: str,
+    label: int,
+) -> Optional[np.ndarray]:
+    """
+    Run single-object inference for one label on prepared videos.
+    Returns pred0 binary [S,H,W] (uint8) or None if cannot prompt.
+    """
+    lb = int(label)
+
+    # video1
+    st1 = init_state_compat(predictor, prepared.v1_source, prepared.v1_len, prefer_streaming=prepared.use_streaming)
+    ok = add_prompt_single_label(predictor, st1, prompt_mode, gt_cut_slice, lb, ann_frame_idx=0)
+    if not ok:
+        return None
+    pred1 = propagate_video_singleobj(predictor, st1, obj_id=lb)
+
+    # video2
+    st2 = init_state_compat(predictor, prepared.v2_source, prepared.v2_len, prefer_streaming=prepared.use_streaming)
+    ok2 = add_prompt_single_label(predictor, st2, prompt_mode, gt_cut_slice, lb, ann_frame_idx=0)
+    if not ok2:
+        return None
+    pred2 = propagate_video_singleobj(predictor, st2, obj_id=lb)
+
+    # merge
+    pred0 = merge_two_videos_single_label(
+        N=len(prepared.v1_slices) + (len(prepared.v2_slices) - 1),  # N is original S
+        H=gt_cut_slice.shape[0],
+        W=gt_cut_slice.shape[1],
+        v1_slices=prepared.v1_slices,
+        v2_slices=prepared.v2_slices,
+        v1_pred=pred1,
+        v2_pred=pred2,
+    )
+    return pred0
+
+
 # ----------------------------
-# Metrics: 3D DSC, HD, MSD per label
+# Metrics (3D): DSC, HD, MSD
 # ----------------------------
 def dice_3d(pred: np.ndarray, gt: np.ndarray) -> float:
     pred = (pred > 0).astype(np.uint8)
@@ -550,180 +635,139 @@ def hd_msd_3d_sitk(
 
 
 # ----------------------------
-# Record saving (same style as test_vis2d.py)
+# Main record function (per-case, per-label records)
 # ----------------------------
-def run_two_videos_predict(
-    predictor,
-    vol0: np.ndarray,   # [S,H,W]
-    gt0: np.ndarray,    # [S,H,W] labels
-    labels: List[int],
-    prompt_mode: str,
-    cut_idx: int,
-) -> np.ndarray:
-    """
-    Runs SAM2 on two videos split around cut_idx, returns pred0: [S,H,W] int32 semantic labels.
-    Uses streaming callable if possible; else writes jpg frames to /dev/shm for speed.
-    """
-    N, H, W = vol0.shape
-    n = int(cut_idx)
-    v1_slices, v2_slices = build_two_videos_indices(N, n)
-    gt_cut = gt0[n]  # [H,W]
-
-    loader1, num1, _, _ = make_pil_loader_from_volume(vol0, v1_slices)
-    loader2, num2, _, _ = make_pil_loader_from_volume(vol0, v2_slices)
-
-    # We create a per-case tmp base only if we need fallback. (Also safe for folder mode.)
-    fast_tmp = get_fast_tmp_root()
-    tmp_base = tempfile.mkdtemp(prefix="sam2_3d_", dir=fast_tmp)
-
-    try:
-        # Video1 init (try streaming)
-        try:
-            st1 = init_state_compat(predictor, loader1, num1, prefer_streaming=True)
-        except Exception:
-            v1_dir = os.path.join(tmp_base, "video1")
-            write_video_frames_to_dir(vol0, v1_slices, v1_dir)
-            st1 = init_state_compat(predictor, v1_dir, num1, prefer_streaming=False)
-
-        added1 = add_prompts_for_all_labels(predictor, st1, prompt_mode, gt_cut, labels, ann_frame_idx=0)
-        if not added1:
-            raise RuntimeError("No labels present on cut slice for prompting; cannot proceed.")
-        pred1 = propagate_video_multiobj(predictor, st1)
-
-        # Video2 init (try streaming)
-        try:
-            st2 = init_state_compat(predictor, loader2, num2, prefer_streaming=True)
-        except Exception:
-            v2_dir = os.path.join(tmp_base, "video2")
-            write_video_frames_to_dir(vol0, v2_slices, v2_dir)
-            st2 = init_state_compat(predictor, v2_dir, num2, prefer_streaming=False)
-
-        _ = add_prompts_for_all_labels(predictor, st2, prompt_mode, gt_cut, labels, ann_frame_idx=0)
-        pred2 = propagate_video_multiobj(predictor, st2)
-
-        pred0 = merge_two_videos_to_volume(N, H, W, v1_slices, v2_slices, pred1, pred2, labels)
-        return pred0
-
-    finally:
-        # Cleanup (important to avoid filling /dev/shm)
-        shutil.rmtree(tmp_base, ignore_errors=True)
-
-
-def save_test_record_3d(
+def save_test_record_3d_single_object(
     dataset_path: str,
     predictor,
     prompt_mode: str,
     save_path: str,
 ) -> Dict[str, List[Dict]]:
     """
-    Evaluate all datasets under dataset_path and pickle:
-      {ds_name: record_list}
+    Saves pickle:
+      final_record = {ds_name: [row, row, ...], ...}
 
-    Each record_list item mirrors test_vis2d.py keys:
-      img_name, mask_name, labels, pixel_count, area_percentage,
-      p_dice/b_dice/bp_dice, p_hd/b_hd/bp_hd, p_msd/b_msd/bp_msd
-    For this 3D script:
-      - if prompt_mode == "box": fill b_* lists; others empty
-      - if prompt_mode == "mask": fill p_* lists; others empty
+    Each row corresponds to ONE (case, label):
+      img_name, mask_name, label,
+      voxel_count, voxel_percentage,
+      dice, hd, msd,
+      cut_axis, cut_idx
     """
     final_record: Dict[str, List[Dict]] = {}
 
     test_folders = collect_test_folders(dataset_path)
     for test_folder in test_folders:
         tf = Path(test_folder).resolve()
-        # dataset name: if scanning .../<ds>/testing then ds is parent name, else folder name
         ds_name = tf.parent.name if tf.name == "testing" else tf.name
-
-        print(f"\n[Dataset] {ds_name}")
-        print(f"[Scan  ] {test_folder}")
 
         pairs = scan_pairs_same_folder(test_folder)
         if not pairs:
-            print(f"[Warn] No *_img_/*_gt_* pairs under: {test_folder}")
             final_record[ds_name] = []
             continue
 
-        ds_records: List[Dict] = []
-        for (img_path, gt_path) in pairs:
-            img_zyx, img_sitk = read_3d_image(img_path)
-            gt_zyx, _ = read_3d_image(gt_path)
-            ensure_same_shape(img_zyx, gt_zyx, img_path, gt_path)
+        iterator = pairs
+        if tqdm is not None:
+            iterator = tqdm(pairs, desc=f"{ds_name}", leave=True)
 
-            labels = sorted([int(x) for x in np.unique(gt_zyx) if int(x) != 0])
-            if not labels:
+        ds_rows: List[Dict] = []
+        skipped_empty = 0
+        skipped_prompt = 0
+        skipped_errors = 0
+        kept_labels = 0
+
+        for (img_path, gt_path) in iterator:
+            try:
+                img_zyx, img_sitk = read_3d_image(img_path)
+                gt_zyx, _ = read_3d_image(gt_path)
+                ensure_same_shape(img_zyx, gt_zyx, img_path, gt_path)
+
+                # discard empty samples
+                if is_image_empty(img_zyx):
+                    skipped_empty += 1
+                    continue
+                labels = get_labels_from_mask(gt_zyx)
+                if not labels:
+                    skipped_empty += 1
+                    continue
+
+                # choose cut slice on shortest axis
+                primary_axis = choose_primary_axis(img_zyx.shape)
+                cut_idx = largest_mask_slice_index(gt_zyx, primary_axis, label=None)
+
+                # axis-0 view for splitting
+                vol0 = np.moveaxis(img_zyx, primary_axis, 0)  # [S,H,W]
+                gt0 = np.moveaxis(gt_zyx, primary_axis, 0)    # [S,H,W]
+                N, H, W = vol0.shape
+                n = int(cut_idx)
+                v1_slices, v2_slices = build_two_videos_indices(N, n)
+                gt_cut = gt0[n]  # [H,W]
+
+                # prepare reusable video sources ONCE per case
+                prepared = prepare_videos_once(predictor, vol0, v1_slices, v2_slices)
+
+                # spacing for HD/MSD
+                spacing_xyz = img_sitk.GetSpacing()  # (x,y,z)
+                spacing_zyx = (float(spacing_xyz[2]), float(spacing_xyz[1]), float(spacing_xyz[0]))
+
+                total_voxels = int(gt_zyx.size)
+
+                try:
+                    for lb in labels:
+                        # if label cannot be prompted from cut slice, skip it (requested: discard)
+                        if np.sum(gt_cut == lb) == 0:
+                            skipped_prompt += 1
+                            continue
+
+                        # run single-object inference (binary in axis-0)
+                        pred0 = predict_one_label(
+                            predictor=predictor,
+                            prepared=prepared,
+                            gt_cut_slice=gt_cut,
+                            prompt_mode=prompt_mode,
+                            label=lb,
+                        )
+                        if pred0 is None:
+                            skipped_prompt += 1
+                            continue
+
+                        # restore to zyx orientation
+                        pred_zyx_bin = np.moveaxis(pred0, 0, primary_axis)  # [Z,Y,X]
+
+                        gt_lb = (gt_zyx == lb).astype(np.uint8)
+                        pr_lb = (pred_zyx_bin > 0).astype(np.uint8)
+
+                        dsc = dice_3d(pr_lb, gt_lb)
+                        hd, msd = hd_msd_3d_sitk(pr_lb, gt_lb, spacing_zyx=spacing_zyx)
+
+                        vc = int(gt_lb.sum())
+                        vp = vc / float(total_voxels)
+
+                        ds_rows.append({
+                            "img_name": img_path,
+                            "mask_name": gt_path,
+                            "label": int(lb),
+                            "voxel_count": vc,
+                            "voxel_percentage": vp,
+                            "dice": float(dsc),
+                            "hd": float(hd),
+                            "msd": float(msd),
+                            "cut_axis": int(primary_axis),
+                            "cut_idx": int(cut_idx),
+                        })
+                        kept_labels += 1
+
+                finally:
+                    prepared.cleanup()
+
+            except Exception:
+                skipped_errors += 1
                 continue
 
-            shape = img_zyx.shape  # (Z,Y,X)
-            primary_axis = choose_primary_axis(shape)
-            cut_idx = largest_mask_slice_index(gt_zyx, primary_axis, label=None)
-
-            # axis-0 view
-            vol0 = np.moveaxis(img_zyx, primary_axis, 0)  # [S,H,W]
-            gt0 = np.moveaxis(gt_zyx, primary_axis, 0)    # [S,H,W]
-
-            # Predict in axis-0, then restore
-            pred0 = run_two_videos_predict(
-                predictor=predictor,
-                vol0=vol0,
-                gt0=gt0,
-                labels=labels,
-                prompt_mode=prompt_mode,
-                cut_idx=cut_idx,
-            )
-            pred_zyx = np.moveaxis(pred0, 0, primary_axis)  # [Z,Y,X]
-
-            # spacing
-            spacing_xyz = img_sitk.GetSpacing()  # (x,y,z)
-            spacing_zyx = (float(spacing_xyz[2]), float(spacing_xyz[1]), float(spacing_xyz[0]))
-
-            # voxel stats
-            total_voxels = int(gt_zyx.size)
-            pixel_count = [int(np.sum(gt_zyx == lb)) for lb in labels]
-            area_percentage = [pc / float(total_voxels) for pc in pixel_count]
-
-            # 2D-style lists
-            p_dice, b_dice, bp_dice = [], [], []
-            p_hd, b_hd, bp_hd = [], [], []
-            p_msd, b_msd, bp_msd = [], [], []
-
-            for lb in labels:
-                gt_lb = (gt_zyx == lb).astype(np.uint8)
-                pr_lb = (pred_zyx == lb).astype(np.uint8)
-
-                dsc = dice_3d(pr_lb, gt_lb)
-                hd, msd = hd_msd_3d_sitk(pr_lb, gt_lb, spacing_zyx=spacing_zyx)
-
-                if prompt_mode == "box":
-                    b_dice.append(dsc); b_hd.append(hd); b_msd.append(msd)
-                else:  # "mask"
-                    p_dice.append(dsc); p_hd.append(hd); p_msd.append(msd)
-
-            single_data_result = {
-                "img_name": img_path,
-                "mask_name": gt_path,
-                "labels": labels,
-                "pixel_count": pixel_count,
-                "area_percentage": area_percentage,
-
-                # Keep 2D-style keys
-                "p_dice": p_dice,
-                "b_dice": b_dice,
-                "bp_dice": bp_dice,
-                "p_hd": p_hd,
-                "b_hd": b_hd,
-                "bp_hd": bp_hd,
-                "p_msd": p_msd,
-                "b_msd": b_msd,
-                "bp_msd": bp_msd,
-
-                # Extra debug info (harmless for old readers)
-                "cut_axis": int(primary_axis),
-                "cut_idx": int(cut_idx),
-                "prompt_mode": prompt_mode,
-            }
-            ds_records.append(single_data_result)
-
-        final_record[ds_name] = ds_records
+        final_record[ds_name] = ds_rows
+        print(
+            f"[Done] {ds_name}: cases={len(pairs)} | kept_labels={kept_labels} | "
+            f"skip_empty_cases={skipped_empty}, skip_unpromptable_labels={skipped_prompt}, errors={skipped_errors}"
+        )
 
     # Save pickle
     save_path = str(save_path)
@@ -763,7 +807,7 @@ def main():
     t0 = time.time()
     predictor = build_sam2_video_predictor(args.sam2_config, args.ckpt_path, device=args.device)
 
-    save_test_record_3d(
+    save_test_record_3d_single_object(
         dataset_path=args.dataset_path,
         predictor=predictor,
         prompt_mode=args.prompt_mode,
