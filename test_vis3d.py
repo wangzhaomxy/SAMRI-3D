@@ -59,10 +59,13 @@ import os
 import sys
 import time
 import pickle
+import shutil
+import inspect
 import argparse
+import tempfile
 from glob import glob
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Callable
+from typing import Dict, List, Tuple, Optional, Callable, Any
 
 import numpy as np
 import SimpleITK as sitk
@@ -70,7 +73,7 @@ from PIL import Image
 
 import torch
 
-# Make sure local ./sam2 is importable (sam2 folder is sibling of this script)
+# Ensure local ./sam2 is importable (preferred over site-packages)
 _THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_THIS_DIR))
 
@@ -88,7 +91,7 @@ def _is_nii_gz(p: Path) -> bool:
     return p.name.lower().endswith(".nii.gz")
 
 
-def _has_med_ext(p: Path) -> bool:
+def _has_med_ext_or_dir(p: Path) -> bool:
     if p.is_dir():
         return True
     if _is_nii_gz(p):
@@ -134,7 +137,7 @@ def ensure_same_shape(img: np.ndarray, msk: np.ndarray, img_path: str, msk_path:
 # Dataset scanning: same folder pairing _img_ -> _gt_
 # ----------------------------
 def is_img_candidate(p: Path) -> bool:
-    return ("_img_" in p.name) and _has_med_ext(p) and (p.is_file() or p.is_dir())
+    return ("_img_" in p.name) and _has_med_ext_or_dir(p) and (p.is_file() or p.is_dir())
 
 
 def replace_img_to_gt_name(name: str) -> str:
@@ -188,27 +191,25 @@ def scan_pairs_same_folder(folder: str) -> List[Tuple[str, str]]:
 
 def collect_test_folders(dataset_path: str) -> List[str]:
     """
-    Mimic test_vis2d.py behavior:
-    - dataset_path contains multiple dataset folders
-    - each dataset folder typically has /testing/
-    Return a list of folders to scan for *_img_*/ *_gt_* pairs.
-
-    If a dataset folder has no /testing/, we scan the dataset folder itself.
+    dataset-path contains multiple dataset folders.
+    For each dataset folder, prefer <ds>/testing if exists; else scan <ds>.
+    If dataset_path itself contains *_img_* files, we just scan dataset_path.
     """
-    dataset_path = dataset_path.rstrip("/") + "/"
-    ds_folders = [d for d in sorted(glob(dataset_path + "*")) if os.path.isdir(d)]
+    dataset_path = dataset_path.rstrip("/")
 
+    # If dataset_path already looks like a test folder (contains any _img_), just use it.
+    if any("_img_" in p.name for p in Path(dataset_path).rglob("*")):
+        # It might still be a multi-dataset root; we’ll handle both cases below.
+        pass
+
+    ds_folders = [d for d in sorted(glob(dataset_path + "/*")) if os.path.isdir(d)]
     if not ds_folders:
-        # If dataset_path itself is already the test folder, just use it.
-        return [dataset_path.rstrip("/")]
+        return [dataset_path]
 
     test_folders: List[str] = []
     for ds in ds_folders:
         cand = os.path.join(ds, "testing")
-        if os.path.isdir(cand):
-            test_folders.append(cand)
-        else:
-            test_folders.append(ds)
+        test_folders.append(cand if os.path.isdir(cand) else ds)
     return test_folders
 
 
@@ -248,7 +249,7 @@ def build_two_videos_indices(N: int, n: int) -> Tuple[List[int], List[int]]:
 
 
 # ----------------------------
-# In-memory slice -> PIL loader (NO temp jpg)
+# Frame adapters: streaming callable (preferred) + jpg fallback
 # ----------------------------
 def normalize_to_uint8(slice2d: np.ndarray, p_low: float = 0.5, p_high: float = 99.5) -> np.ndarray:
     sl = slice2d.astype(np.float32)
@@ -278,15 +279,57 @@ def make_pil_loader_from_volume(
     return loader_func, len(slice_indices), H, W
 
 
-def init_state_streaming(predictor, loader_func: Callable[[int], Image.Image], num_frames: int):
+def get_fast_tmp_root() -> Optional[str]:
+    # Prefer RAM-backed tmp on Linux/HPC
+    if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
+        return "/dev/shm"
+    return None
+
+
+def write_video_frames_to_dir(vol_shw: np.ndarray, slice_indices: List[int], out_dir: str) -> str:
     """
-    SAM2 supports callable video_path for streaming frame loading (fast).
+    Writes frames as 00000.jpg, 00001.jpg, ... into out_dir.
     """
-    frame_load_config = {
-        "max_frames": int(num_frames),
-        "first_frame_num": 0,
-    }
-    return predictor.init_state(video_path=loader_func, frame_load_config=frame_load_config)
+    os.makedirs(out_dir, exist_ok=True)
+    for i, z in enumerate(slice_indices):
+        s2d = normalize_to_uint8(vol_shw[z])
+        rgb = np.stack([s2d, s2d, s2d], axis=-1)
+        Image.fromarray(rgb).save(os.path.join(out_dir, f"{i:05d}.jpg"), quality=95)
+    return out_dir
+
+
+def init_state_compat(predictor, video_source: Any, num_frames: int, prefer_streaming: bool = True):
+    """
+    Version-compatible init_state:
+    - Newer SAM2: may accept frame_load_config
+    - Mid SAM2: may accept callable video_path but no frame_load_config
+    - Older SAM2: requires a directory of jpg frames
+    """
+    sig = inspect.signature(predictor.init_state)
+    params = sig.parameters
+
+    # 1) Try streaming callable
+    if prefer_streaming and callable(video_source):
+        kwargs = {"video_path": video_source}
+
+        # Only pass supported kwargs
+        if "frame_load_config" in params:
+            kwargs["frame_load_config"] = {"max_frames": int(num_frames), "first_frame_num": 0}
+        elif "max_frames" in params:
+            kwargs["max_frames"] = int(num_frames)
+        elif "num_frames" in params:
+            kwargs["num_frames"] = int(num_frames)
+
+        try:
+            return predictor.init_state(**kwargs)
+        except TypeError as e:
+            print(f"[Warn] Streaming init_state failed: {e}")
+            # fallthrough to folder mode
+
+    # 2) Folder mode
+    if not isinstance(video_source, str):
+        raise TypeError("Fallback init_state requires a directory path (str) as video_source.")
+    return predictor.init_state(video_path=video_source)
 
 
 # ----------------------------
@@ -382,7 +425,7 @@ def add_prompts_for_all_labels(
 
 
 # ----------------------------
-# SAM2 propagation
+# SAM2 propagation + merge
 # ----------------------------
 @torch.no_grad()
 def propagate_video_multiobj(
@@ -508,6 +551,63 @@ def hd_msd_3d_sitk(
 # ----------------------------
 # Record saving (same style as test_vis2d.py)
 # ----------------------------
+def run_two_videos_predict(
+    predictor,
+    vol0: np.ndarray,   # [S,H,W]
+    gt0: np.ndarray,    # [S,H,W] labels
+    labels: List[int],
+    prompt_mode: str,
+    cut_idx: int,
+) -> np.ndarray:
+    """
+    Runs SAM2 on two videos split around cut_idx, returns pred0: [S,H,W] int32 semantic labels.
+    Uses streaming callable if possible; else writes jpg frames to /dev/shm for speed.
+    """
+    N, H, W = vol0.shape
+    n = int(cut_idx)
+    v1_slices, v2_slices = build_two_videos_indices(N, n)
+    gt_cut = gt0[n]  # [H,W]
+
+    loader1, num1, _, _ = make_pil_loader_from_volume(vol0, v1_slices)
+    loader2, num2, _, _ = make_pil_loader_from_volume(vol0, v2_slices)
+
+    # We create a per-case tmp base only if we need fallback. (Also safe for folder mode.)
+    fast_tmp = get_fast_tmp_root()
+    tmp_base = tempfile.mkdtemp(prefix="sam2_3d_", dir=fast_tmp)
+
+    try:
+        # Video1 init (try streaming)
+        try:
+            st1 = init_state_compat(predictor, loader1, num1, prefer_streaming=True)
+        except Exception:
+            v1_dir = os.path.join(tmp_base, "video1")
+            write_video_frames_to_dir(vol0, v1_slices, v1_dir)
+            st1 = init_state_compat(predictor, v1_dir, num1, prefer_streaming=False)
+
+        added1 = add_prompts_for_all_labels(predictor, st1, prompt_mode, gt_cut, labels, ann_frame_idx=0)
+        if not added1:
+            raise RuntimeError("No labels present on cut slice for prompting; cannot proceed.")
+        pred1 = propagate_video_multiobj(predictor, st1)
+
+        # Video2 init (try streaming)
+        try:
+            st2 = init_state_compat(predictor, loader2, num2, prefer_streaming=True)
+        except Exception:
+            v2_dir = os.path.join(tmp_base, "video2")
+            write_video_frames_to_dir(vol0, v2_slices, v2_dir)
+            st2 = init_state_compat(predictor, v2_dir, num2, prefer_streaming=False)
+
+        _ = add_prompts_for_all_labels(predictor, st2, prompt_mode, gt_cut, labels, ann_frame_idx=0)
+        pred2 = propagate_video_multiobj(predictor, st2)
+
+        pred0 = merge_two_videos_to_volume(N, H, W, v1_slices, v2_slices, pred1, pred2, labels)
+        return pred0
+
+    finally:
+        # Cleanup (important to avoid filling /dev/shm)
+        shutil.rmtree(tmp_base, ignore_errors=True)
+
+
 def save_test_record_3d(
     dataset_path: str,
     predictor,
@@ -529,7 +629,10 @@ def save_test_record_3d(
 
     test_folders = collect_test_folders(dataset_path)
     for test_folder in test_folders:
-        ds_name = Path(test_folder).resolve().parent.name if Path(test_folder).name == "testing" else Path(test_folder).name
+        tf = Path(test_folder).resolve()
+        # dataset name: if scanning .../<ds>/testing then ds is parent name, else folder name
+        ds_name = tf.parent.name if tf.name == "testing" else tf.name
+
         print(f"\n[Dataset] {ds_name}")
         print(f"[Scan  ] {test_folder}")
 
@@ -545,55 +648,39 @@ def save_test_record_3d(
             gt_zyx, _ = read_3d_image(gt_path)
             ensure_same_shape(img_zyx, gt_zyx, img_path, gt_path)
 
-            # auto labels (exclude 0)
             labels = sorted([int(x) for x in np.unique(gt_zyx) if int(x) != 0])
             if not labels:
                 continue
 
-            Z, Y, X = img_zyx.shape
-            primary_axis = choose_primary_axis((Z, Y, X))
+            shape = img_zyx.shape  # (Z,Y,X)
+            primary_axis = choose_primary_axis(shape)
             cut_idx = largest_mask_slice_index(gt_zyx, primary_axis, label=None)
 
             # axis-0 view
             vol0 = np.moveaxis(img_zyx, primary_axis, 0)  # [S,H,W]
-            gt0 = np.moveaxis(gt_zyx, primary_axis, 0)
-            N, H, W = vol0.shape
-            n = int(cut_idx)
+            gt0 = np.moveaxis(gt_zyx, primary_axis, 0)    # [S,H,W]
 
-            v1_slices, v2_slices = build_two_videos_indices(N, n)
-            gt_cut = gt0[n]  # [H,W]
-
-            # streaming loaders
-            loader1, num1, _, _ = make_pil_loader_from_volume(vol0, v1_slices)
-            loader2, num2, _, _ = make_pil_loader_from_volume(vol0, v2_slices)
-
-            # run video1
-            st1 = init_state_streaming(predictor, loader1, num1)
-            added1 = add_prompts_for_all_labels(predictor, st1, prompt_mode, gt_cut, labels, ann_frame_idx=0)
-            if not added1:
-                # if cut slice contains none of the labels (rare), skip case
-                continue
-            pred1 = propagate_video_multiobj(predictor, st1)
-
-            # run video2
-            st2 = init_state_streaming(predictor, loader2, num2)
-            _ = add_prompts_for_all_labels(predictor, st2, prompt_mode, gt_cut, labels, ann_frame_idx=0)
-            pred2 = propagate_video_multiobj(predictor, st2)
-
-            # merge + restore orientation
-            pred0 = merge_two_videos_to_volume(N, H, W, v1_slices, v2_slices, pred1, pred2, labels)
-            pred_zyx = np.moveaxis(pred0, 0, primary_axis)
+            # Predict in axis-0, then restore
+            pred0 = run_two_videos_predict(
+                predictor=predictor,
+                vol0=vol0,
+                gt0=gt0,
+                labels=labels,
+                prompt_mode=prompt_mode,
+                cut_idx=cut_idx,
+            )
+            pred_zyx = np.moveaxis(pred0, 0, primary_axis)  # [Z,Y,X]
 
             # spacing
             spacing_xyz = img_sitk.GetSpacing()  # (x,y,z)
             spacing_zyx = (float(spacing_xyz[2]), float(spacing_xyz[1]), float(spacing_xyz[0]))
 
-            # pixel stats (3D voxel stats)
+            # voxel stats
             total_voxels = int(gt_zyx.size)
             pixel_count = [int(np.sum(gt_zyx == lb)) for lb in labels]
             area_percentage = [pc / float(total_voxels) for pc in pixel_count]
 
-            # prepare lists compatible with 2D record format
+            # 2D-style lists
             p_dice, b_dice, bp_dice = [], [], []
             p_hd, b_hd, bp_hd = [], [], []
             p_msd, b_msd, bp_msd = [], [], []
@@ -637,7 +724,7 @@ def save_test_record_3d(
 
         final_record[ds_name] = ds_records
 
-    # save pickle
+    # Save pickle
     save_path = str(save_path)
     Path(os.path.dirname(save_path) or ".").mkdir(parents=True, exist_ok=True)
     with open(save_path, "wb") as f:
@@ -651,20 +738,17 @@ def save_test_record_3d(
 # ----------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sam2-config", type=str, required=True,
-                        help="SAM2 config yaml, e.g. configs/sam2.1/sam2.1_hiera_l.yaml")
-    parser.add_argument("--ckpt-path", type=str, required=True,
-                        help="SAM2 checkpoint (.pt/.pth)")
-    parser.add_argument("--dataset-path", type=str, required=True,
-                        help="Root folder containing multiple dataset folders (each may have /testing/).")
-    parser.add_argument("--save-path", type=str, required=True,
-                        help="Output pickle path, e.g. /path/to/results_3d.pkl")
+    parser.add_argument("--sam2-config", type=str, required=True)
+    parser.add_argument("--ckpt-path", type=str, required=True)
+    parser.add_argument("--dataset-path", type=str, required=True)
+    parser.add_argument("--save-path", type=str, required=True)
     parser.add_argument("--prompt-mode", type=str, choices=["box", "mask"], default="box")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
     np.random.seed(args.seed)
+    torch.set_grad_enabled(False)
 
     print("\n======================================")
     print(f"SAM2 config   : {args.sam2_config}")
@@ -676,10 +760,7 @@ def main():
     print("======================================\n")
 
     t0 = time.time()
-
     predictor = build_sam2_video_predictor(args.sam2_config, args.ckpt_path, device=args.device)
-    # predictor is already eval-ish; still safe to ensure no grad globally
-    torch.set_grad_enabled(False)
 
     save_test_record_3d(
         dataset_path=args.dataset_path,
@@ -694,3 +775,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
