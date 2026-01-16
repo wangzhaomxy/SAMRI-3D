@@ -38,18 +38,18 @@ python test_vis3d.py \
   --device cuda
   
 python test_vis3d.py \
---sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-path /home/s4670484/Desktop/Scratch/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+--sam2-config configs/sam2.1/sam2.1_hiera_l.yaml \
+--ckpt-path /home/s4670484/Desktop/Scratch/samri/pretrained_ckpt/sam2.1_hiera_large.pt \
 --dataset-path /home/s4670484/Desktop/Scratch/samri/Datasets/SAMRI_datasets_3D/ \
---save-path /home/s4670484/Desktop/Scratch/samri/Eval_results/SAM2/sam2_hiera_s_3d.pkl \
+--save-path /home/s4670484/Desktop/Scratch/samri/Eval_results/SAM2/sam2_hiera_l_3d.pkl \
 --prompt-mode box \
 --device cuda
   
 Available SAM2 configs/checkpoints:
-    sam2_hiera_t.yaml     sam2.1_hiera_tiny.pt
-    sam2_hiera_s.yaml     sam2.1_hiera_small.pt
-    sam2_hiera_b+.yaml    sam2.1_hiera_base_plus.pt
-    sam2_hiera_l.yaml     sam2.1_hiera_large.pt
+    sam2.1_hiera_t.yaml     sam2.1_hiera_tiny.pt
+    sam2.1_hiera_s.yaml     sam2.1_hiera_small.pt
+    sam2.1_hiera_b+.yaml    sam2.1_hiera_base_plus.pt
+    sam2.1_hiera_l.yaml     sam2.1_hiera_large.pt
     SAMRI_datasets_3D/     Test_3d/
     box / mask          
 """

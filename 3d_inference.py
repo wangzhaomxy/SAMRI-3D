@@ -39,10 +39,10 @@ python 3d_inference.py \
 --device cuda
   
 Available SAM2 configs/checkpoints:
-    sam2_hiera_s.yaml     sam2.1_hiera_small.pt
-    sam2_hiera_b.yaml     sam2.1_hiera_base.pt
-    sam2_hiera_l+.yaml    sam2.1_hiera_large_plus.pt
-    sam2_hiera_m.yaml     sam2.1_hiera_medium.pt
+    sam2.1_hiera_s.yaml     sam2.1_hiera_small.pt
+    sam2.1_hiera_b.yaml     sam2.1_hiera_base.pt
+    sam2.1_hiera_l+.yaml    sam2.1_hiera_large_plus.pt
+    sam2.1_hiera_m.yaml     sam2.1_hiera_medium.pt
 """
 
 from __future__ import annotations
