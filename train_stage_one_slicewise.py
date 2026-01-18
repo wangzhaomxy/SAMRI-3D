@@ -87,6 +87,8 @@ def parse_args():
                         help="Number of data loading workers")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
+    parser.add_argument("--master-port", type=int, default=None,
+                        help="Master port for DDP (default: random port between 29500-29999)")
 
     args = parser.parse_args()
 
@@ -109,9 +111,7 @@ def ddp_setup(rank: int, world_size: int):
         rank: Unique identifier of each process
         world_size: Total number of processes
     """
-    master_port = os.environ.get("MASTER_PORT", "29500")
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = master_port
+    # MASTER_PORT should already be set before spawning processes
     torch.cuda.set_device(rank)
     init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
@@ -729,11 +729,22 @@ def main(rank, world_size, args):
 
 
 if __name__ == "__main__":
+    import random as py_random
+
     args = parse_args()
 
     world_size = torch.cuda.device_count()
     if world_size == 0:
         raise RuntimeError("No CUDA devices available")
 
+    # Setup distributed environment variables before spawning
+    os.environ["MASTER_ADDR"] = "localhost"
+    if args.master_port is not None:
+        os.environ["MASTER_PORT"] = str(args.master_port)
+    elif "MASTER_PORT" not in os.environ:
+        # Use random port to avoid conflicts
+        os.environ["MASTER_PORT"] = str(py_random.randint(29500, 29999))
+
     print(f"Starting training with {world_size} GPUs")
+    print(f"Using MASTER_PORT: {os.environ['MASTER_PORT']}")
     mp.spawn(main, args=(world_size, args), nprocs=world_size)
