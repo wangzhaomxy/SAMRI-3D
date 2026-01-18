@@ -24,6 +24,22 @@ python test_vis3d_multi.py \
   --save-path /path/to/Eval_results/SAM2/sam2_hiera_s_3d_box_multi.pkl \
   --prompt-mode box \
   --device cuda
+  
+python test_vis3d_multi.py \
+--sam2-config configs/sam2.1/sam2.1_hiera_t.yaml \
+--ckpt-path /home/s4670484/Desktop/Scratch/samri/pretrained_ckpt/sam2.1_hiera_tiny.pt \
+--dataset-path /home/s4670484/Desktop/Scratch/samri/Datasets/SAMRI_datasets_3D/ \
+--save-path /home/s4670484/Desktop/Scratch/samri/Eval_results/SAM2/sam2_hiera_t_3d_multi.pkl \
+--prompt-mode box \
+--device cuda
+  
+Available SAM2 configs/checkpoints:
+    sam2.1_hiera_t.yaml     sam2.1_hiera_tiny.pt
+    sam2.1_hiera_s.yaml     sam2.1_hiera_small.pt
+    sam2.1_hiera_b+.yaml    sam2.1_hiera_base_plus.pt
+    sam2.1_hiera_l.yaml     sam2.1_hiera_large.pt
+    SAMRI_datasets_3D/     Test_3d/
+    box / mask          
 """
 
 from __future__ import annotations
