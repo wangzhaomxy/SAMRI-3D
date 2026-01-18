@@ -5,10 +5,10 @@
 #SBATCH --mem=1T
 #SBATCH --job-name=SAMRI2_S1
 #SBATCH --time=7-00:00:00
-#SBATCH --partition=gpu_rocm
-#SBATCH --gres=gpu:mi300x:8
+#SBATCH --partition=gpu_cuda        # gpu_rocm
+#SBATCH --gres=gpu:h100:2           # mi300x:8
 #SBATCH --account=a_ai_collab
-#SBATCH --qos=sdf
+#SBATCH --qos=gpu                   # sdf
 #SBATCH -o /home/s4670484/Documents/SAMRI2_log/slurm-samri2phase1-%j.output
 #SBATCH -e /home/s4670484/Documents/SAMRI2_log/slurm-samri2phase1-%j.error
 #SBATCH --mail-type=ALL
@@ -43,7 +43,7 @@ TRAIN_DATA_PATHS="/scratch/project/samri/Datasets/SAMRI_train_test/*/training/"
 
 # Training hyperparameters
 NUM_EPOCHS=200
-BATCH_SIZE=1024
+BATCH_SIZE=256
 LR=1e-5
 PROMPT_MODE="mixed"
 SAVE_EVERY=5
