@@ -9,8 +9,8 @@
 #SBATCH --gres=gpu:mi300x:8
 #SBATCH --account=a_ai_collab
 #SBATCH --qos=sdf
-#SBATCH -o /home/s4670484/Documents/slurm-%j.output
-#SBATCH -e /home/s4670484/Documents/slurm-%j.error
+#SBATCH -o /home/s4670484/Documents/SAMRI2_log/slurm-samri2phase1-%j.output
+#SBATCH -e /home/s4670484/Documents/SAMRI2_log/slurm-samri2phase1-%j.error
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=zhao.wang1@uq.edu.au
 
