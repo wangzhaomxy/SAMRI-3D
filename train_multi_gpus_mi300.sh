@@ -36,14 +36,14 @@ DATA_MODE="embeddings"
 
 # For embedding mode (faster training with pre-computed embeddings)
 EMBEDDING_FILE="/scratch/project/samri/train_list.pkl"
-SUBSET="all"  # Options: "60_up", "60_down", "all"
+SUBSET="60_up"  # Options: "60_up", "60_down", "all"
 
 # For image mode (raw NIfTI images)
 TRAIN_DATA_PATHS="/scratch/project/samri/Datasets/SAMRI_train_test/*/training/"
 
 # Training hyperparameters
-NUM_EPOCHS=100
-BATCH_SIZE=4
+NUM_EPOCHS=200
+BATCH_SIZE=1024
 LR=1e-5
 PROMPT_MODE="mixed"
 SAVE_EVERY=5
