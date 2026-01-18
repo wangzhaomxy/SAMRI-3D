@@ -25,29 +25,3 @@ tmpclaude-*-cwd
 plan.md
 ```
 
-### **What TO COMMIT to GitHub:**
-
-✅ `.claude/settings.json` - Team-shared configuration  
-✅ `.claude/commands/` - Custom slash commands for the team  
-✅ `CLAUDE.md` - Project documentation/context  
-✅ `.worktreeinclude` - Worktree configuration (if used)
-
-### **What NOT TO COMMIT:**
-
-❌ `.claude/settings.local.json` - Personal settings  
-❌ `tmpclaude-*-cwd` - Temporary files  
-❌ Any session-specific or machine-specific data
-
----
-
-## **Git Attribution When Publishing**
-
-When Claude Code creates commits, it automatically adds attribution to commit messages by default:
-```
-fix: resolve authentication bug in login flow
-
-Fixes the issue where users were being logged out unexpectedly 
-after session timeout.
-
-Generated with Claude Code
-Co-Authored-By: Claude <noreply@anthropic.com>
