@@ -33,6 +33,16 @@ from utils.losses import DiceFocalLoss
 from utils.utils import gen_points, gen_bboxes, get_checkpoint
 
 
+def variable_size_collate_fn(batch):
+    """
+    Custom collate function for variable-sized images and masks.
+    Returns lists instead of stacked tensors.
+    """
+    images = [item[0] for item in batch]
+    masks = [item[1] for item in batch]
+    return images, masks
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Stage 1: Slice-wise SAM2 mask decoder training")
 
@@ -425,6 +435,7 @@ def forward_sam2_embedding(model, embeddings, point_coords, point_labels, boxes,
 def train_epoch(model, dataloader, optimizer, loss_fn, transforms, args, device, rank):
     """
     Train for one epoch (raw image mode).
+    Handles variable-sized images by processing each sample individually.
 
     Args:
         model: SAM2 model (DDP wrapped)
@@ -444,64 +455,77 @@ def train_epoch(model, dataloader, optimizer, loss_fn, transforms, args, device,
     num_batches = 0
 
     pbar = tqdm(dataloader, disable=(rank != 0))
-    for images, masks in pbar:
-        # images: (B, H, W, 3) uint8
-        # masks: (B, 1, H, W) or (B, H, W)
+    for images_list, masks_list in pbar:
+        # images_list: list of (H, W, 3) numpy arrays
+        # masks_list: list of (1, H, W) or (H, W) numpy arrays
 
-        batch_size = images.shape[0]
-        orig_hw = (images.shape[1], images.shape[2])
+        batch_size = len(images_list)
 
-        # Transform images using SAM2Transforms
-        # Convert from HWC uint8 to transformed tensor
-        images_list = [img.numpy() for img in images]
-        images_tensor = transforms.forward_batch(images_list).to(device)
+        # Process each image individually due to variable sizes
+        batch_loss = 0.0
+        valid_samples = 0
 
-        # Prepare masks
-        if masks.dim() == 3:
-            masks = masks.unsqueeze(1)  # (B, 1, H, W)
-        masks = masks.float().to(device)
-
-        # Resize masks to match model output (256x256)
-        masks_resized = torch.nn.functional.interpolate(
-            masks, size=(256, 256), mode="nearest"
-        )
-
-        # Prepare prompts
-        point_coords, point_labels, boxes = prepare_prompts(
-            masks, args.prompt_mode, args.jitter, device, transforms, orig_hw
-        )
-
-        # Forward pass
         optimizer.zero_grad()
 
-        with torch.cuda.amp.autocast(enabled=False):
-            low_res_masks = forward_sam2_image(
-                model.module if hasattr(model, 'module') else model,
-                images_tensor, point_coords, point_labels, boxes,
-                transforms, orig_hw
+        for i in range(batch_size):
+            image = images_list[i]  # (H, W, 3) numpy array
+            mask = masks_list[i]  # (1, H, W) or (H, W) numpy array
+
+            # Get original size
+            if isinstance(image, np.ndarray):
+                orig_hw = (image.shape[0], image.shape[1])
+            else:
+                orig_hw = (image.shape[0], image.shape[1])
+                image = image.numpy()
+
+            # Transform image
+            image_tensor = transforms(image).unsqueeze(0).to(device)  # (1, 3, H, W)
+
+            # Prepare mask
+            if isinstance(mask, np.ndarray):
+                mask = torch.from_numpy(mask)
+            if mask.dim() == 2:
+                mask = mask.unsqueeze(0)  # (1, H, W)
+            mask = mask.unsqueeze(0).float().to(device)  # (1, 1, H, W)
+
+            # Resize mask to 256x256
+            mask_resized = torch.nn.functional.interpolate(
+                mask, size=(256, 256), mode="nearest"
             )
 
-            # Check for NaN
-            if torch.isnan(low_res_masks).any():
-                print(f"[Rank {rank}] NaN in model output, skipping batch")
-                continue
+            # Prepare prompts for single sample
+            point_coords, point_labels, boxes = prepare_prompts(
+                mask, args.prompt_mode, args.jitter, device, transforms, orig_hw
+            )
 
-            # Compute loss
-            loss = loss_fn(low_res_masks, masks_resized)
+            with torch.cuda.amp.autocast(enabled=False):
+                low_res_mask = forward_sam2_image(
+                    model.module if hasattr(model, 'module') else model,
+                    image_tensor, point_coords, point_labels, boxes,
+                    transforms, orig_hw
+                )
 
-            if torch.isnan(loss):
-                print(f"[Rank {rank}] NaN loss, skipping batch")
-                continue
+                if torch.isnan(low_res_mask).any():
+                    continue
 
-        # Backward pass
-        loss.backward()
-        optimizer.step()
+                # Compute loss for this sample
+                sample_loss = loss_fn(low_res_mask, mask_resized)
 
-        epoch_loss += loss.item()
-        num_batches += 1
+                if torch.isnan(sample_loss):
+                    continue
 
-        if rank == 0:
-            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+                # Accumulate gradients
+                (sample_loss / batch_size).backward()
+                batch_loss += sample_loss.item()
+                valid_samples += 1
+
+        if valid_samples > 0:
+            optimizer.step()
+            epoch_loss += batch_loss / valid_samples
+            num_batches += 1
+
+            if rank == 0:
+                pbar.set_postfix({"loss": f"{batch_loss / valid_samples:.4f}"})
 
     return epoch_loss / max(num_batches, 1)
 
@@ -794,6 +818,10 @@ def main(rank, world_size, args):
         train_fn = train_epoch
 
     train_sampler = DistributedSampler(train_dataset)
+
+    # Use custom collate function for raw images (variable sizes)
+    collate_fn = variable_size_collate_fn if not args.use_embeddings else None
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -801,6 +829,7 @@ def main(rank, world_size, args):
         num_workers=args.num_workers,
         sampler=train_sampler,
         pin_memory=True,
+        collate_fn=collate_fn,
     )
 
     if rank == 0:
