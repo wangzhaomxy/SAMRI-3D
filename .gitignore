@@ -1,0 +1,53 @@
+# macOS system files
+.DS_Store
+
+# VSCode settings
+.vscode/
+
+# Python cache files
+__pycache__/
+
+# Package installed history files
+dist/
+build/
+*.egg-info/
+
+# Ignore model checkpoints
+*.pth
+
+# Claude Code local settings (personal preferences)
+.claude/settings.local.json
+
+# Temporary Claude Code files (known bug)
+tmpclaude-*-cwd
+
+# Optional: plan files created during builds
+plan.md
+```
+
+### **What TO COMMIT to GitHub:**
+
+✅ `.claude/settings.json` - Team-shared configuration  
+✅ `.claude/commands/` - Custom slash commands for the team  
+✅ `CLAUDE.md` - Project documentation/context  
+✅ `.worktreeinclude` - Worktree configuration (if used)
+
+### **What NOT TO COMMIT:**
+
+❌ `.claude/settings.local.json` - Personal settings  
+❌ `tmpclaude-*-cwd` - Temporary files  
+❌ Any session-specific or machine-specific data
+
+---
+
+## **Git Attribution When Publishing**
+
+When Claude Code creates commits, it automatically adds attribution to commit messages by default:
+```
+fix: resolve authentication bug in login flow
+
+Fixes the issue where users were being logged out unexpectedly 
+after session timeout.
+
+Generated with Claude Code
+Co-Authored-By: Claude <noreply@anthropic.com>
