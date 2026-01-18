@@ -8,6 +8,10 @@ This script trains only the mask decoder while freezing all other components:
 - Memory encoder (frozen)
 - Memory attention (frozen)
 
+Supports two data modes:
+1. Raw images (NiiDataset): Load NIfTI images and compute embeddings on-the-fly
+2. Pre-computed embeddings (BalancedEmbDataset): Load pre-computed embeddings for faster training
+
 Based on SAMRI v1 training approach adapted for SAM2 architecture.
 """
 
@@ -24,7 +28,7 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from sam2.build_sam import build_sam2
 from sam2.utils.transforms import SAM2Transforms
-from utils.dataloader import NiiDataset
+from utils.dataloader import NiiDataset, BalancedEmbDataset
 from utils.losses import DiceFocalLoss
 from utils.utils import gen_points, gen_bboxes, get_checkpoint
 
@@ -38,9 +42,16 @@ def parse_args():
     parser.add_argument("--ckpt-path", type=str, required=True,
                         help="Path to SAM2 checkpoint")
 
-    # Data paths
-    parser.add_argument("--train-data-paths", type=str, nargs="+", required=True,
-                        help="List of training data paths")
+    # Data configuration
+    parser.add_argument("--use-embeddings", action="store_true",
+                        help="Use pre-computed embeddings (BalancedEmbDataset) instead of raw images")
+    parser.add_argument("--embedding-file", type=str, default=None,
+                        help="Path to pickle file containing embedding file list (required if --use-embeddings)")
+    parser.add_argument("--subset", type=str, default="all",
+                        choices=["60_up", "60_down", "all"],
+                        help="Subset to use from embedding file (default: all)")
+    parser.add_argument("--train-data-paths", type=str, nargs="+", default=None,
+                        help="List of training data paths (for raw image mode)")
     parser.add_argument("--val-data-paths", type=str, nargs="+", default=None,
                         help="List of validation data paths (optional)")
 
@@ -77,7 +88,17 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Validate arguments
+    if args.use_embeddings:
+        if args.embedding_file is None:
+            parser.error("--embedding-file is required when using --use-embeddings")
+    else:
+        if args.train_data_paths is None:
+            parser.error("--train-data-paths is required when not using --use-embeddings")
+
+    return args
 
 
 def ddp_setup(rank: int, world_size: int):
@@ -186,9 +207,63 @@ def prepare_prompts(masks, prompt_mode, jitter, device, transforms, orig_hw):
     return point_coords, point_labels, boxes
 
 
+def prepare_prompts_from_embedding(masks, prompt_mode, jitter, device, transforms, orig_hw_list):
+    """
+    Prepare prompts for pre-computed embeddings (per-sample original size).
+
+    Args:
+        masks: Ground truth masks (B, 1, H, W)
+        prompt_mode: 'point', 'box', or 'mixed'
+        jitter: Bounding box jitter
+        device: Target device
+        transforms: SAM2Transforms for coordinate transformation
+        orig_hw_list: List of (H, W) tuples for each sample
+
+    Returns:
+        point_coords: Point coordinates tensor or None
+        point_labels: Point labels tensor or None
+        boxes: Box coordinates tensor or None
+    """
+    batch_size = masks.shape[0]
+    point_coords_list = []
+    point_labels_list = []
+    boxes_list = []
+
+    for i in range(batch_size):
+        mask = masks[i, 0].cpu().numpy()  # (H, W)
+        orig_hw = orig_hw_list[i]
+
+        if prompt_mode == "point" or prompt_mode == "mixed":
+            points = gen_points(mask, num_points=1)
+            # Transform per-sample
+            pt = torch.tensor(points, dtype=torch.float, device=device).unsqueeze(0)
+            pt = transforms.transform_coords(pt, normalize=True, orig_hw=orig_hw)
+            point_coords_list.append(pt.squeeze(0))
+            point_labels_list.append(torch.tensor([1], dtype=torch.int, device=device))
+
+        if prompt_mode == "box" or prompt_mode == "mixed":
+            box = gen_bboxes(mask, num_bboxes=1, jitter=jitter)
+            bx = torch.tensor(box, dtype=torch.float, device=device).unsqueeze(0)
+            bx = transforms.transform_boxes(bx, normalize=True, orig_hw=orig_hw)
+            boxes_list.append(bx.squeeze(0))
+
+    point_coords = None
+    point_labels = None
+    boxes = None
+
+    if prompt_mode == "point" or prompt_mode == "mixed":
+        point_coords = torch.stack(point_coords_list, dim=0)
+        point_labels = torch.stack(point_labels_list, dim=0)
+
+    if prompt_mode == "box" or prompt_mode == "mixed":
+        boxes = torch.stack(boxes_list, dim=0)
+
+    return point_coords, point_labels, boxes
+
+
 def forward_sam2_image(model, images, point_coords, point_labels, boxes, transforms, orig_hw):
     """
-    Forward pass through SAM2 for image segmentation.
+    Forward pass through SAM2 for image segmentation (raw images).
 
     Args:
         model: SAM2 model
@@ -270,9 +345,76 @@ def forward_sam2_image(model, images, point_coords, point_labels, boxes, transfo
     return low_res_masks
 
 
+def forward_sam2_embedding(model, embeddings, point_coords, point_labels, boxes, device):
+    """
+    Forward pass through SAM2 using pre-computed embeddings (skip image encoder).
+
+    Args:
+        model: SAM2 model
+        embeddings: Pre-computed image embeddings (B, 256, 64, 64)
+        point_coords: Point coordinates or None
+        point_labels: Point labels or None
+        boxes: Box coordinates or None
+        device: Target device
+
+    Returns:
+        low_res_masks: Low resolution mask logits (B, 1, 256, 256)
+    """
+    batch_size = embeddings.shape[0]
+
+    # Embeddings are already computed, use them directly
+    image_embed = embeddings.to(device)  # (B, 256, 64, 64)
+
+    # Prepare prompts
+    concat_points = None
+    if point_coords is not None:
+        concat_points = (point_coords, point_labels)
+
+    if boxes is not None:
+        box_coords = boxes.reshape(-1, 2, 2)
+        box_labels = torch.tensor([[2, 3]], dtype=torch.int, device=boxes.device)
+        box_labels = box_labels.repeat(boxes.size(0), 1)
+
+        if concat_points is not None:
+            concat_coords = torch.cat([box_coords, concat_points[0]], dim=1)
+            concat_labels = torch.cat([box_labels, concat_points[1]], dim=1)
+            concat_points = (concat_coords, concat_labels)
+        else:
+            concat_points = (box_coords, box_labels)
+
+    # Get prompt embeddings
+    sparse_embeddings, dense_embeddings = model.sam_prompt_encoder(
+        points=concat_points,
+        boxes=None,
+        masks=None,
+    )
+
+    # Process each image in batch
+    # Note: For pre-computed embeddings, we don't have high-res features
+    # Set high_res_features to None or empty list
+    all_low_res_masks = []
+    for i in range(batch_size):
+        # Predict masks without high-res features
+        low_res_masks, iou_predictions, _, _ = model.sam_mask_decoder(
+            image_embeddings=image_embed[i:i+1],
+            image_pe=model.sam_prompt_encoder.get_dense_pe(),
+            sparse_prompt_embeddings=sparse_embeddings[i:i+1],
+            dense_prompt_embeddings=dense_embeddings[i:i+1],
+            multimask_output=False,
+            repeat_image=False,
+            high_res_features=None,
+        )
+        all_low_res_masks.append(low_res_masks)
+
+    # Stack all masks
+    low_res_masks = torch.cat(all_low_res_masks, dim=0)  # (B, 1, 256, 256)
+
+    return low_res_masks
+
+
 def train_epoch(model, dataloader, optimizer, loss_fn, transforms, args, device, rank):
     """
-    Train for one epoch.
+    Train for one epoch (raw image mode).
 
     Args:
         model: SAM2 model (DDP wrapped)
@@ -354,6 +496,90 @@ def train_epoch(model, dataloader, optimizer, loss_fn, transforms, args, device,
     return epoch_loss / max(num_batches, 1)
 
 
+def train_epoch_embedding(model, dataloader, optimizer, loss_fn, transforms, args, device, rank):
+    """
+    Train for one epoch using pre-computed embeddings.
+
+    Args:
+        model: SAM2 model (DDP wrapped)
+        dataloader: Training data loader (BalancedEmbDataset)
+        optimizer: Optimizer
+        loss_fn: Loss function
+        transforms: SAM2Transforms
+        args: Command line arguments
+        device: Target device
+        rank: Process rank for DDP
+
+    Returns:
+        Average epoch loss
+    """
+    model.train()
+    epoch_loss = 0.0
+    num_batches = 0
+
+    pbar = tqdm(dataloader, disable=(rank != 0))
+    for embeddings, masks, ori_sizes in pbar:
+        # embeddings: (B, 256, 64, 64) - pre-computed image embeddings
+        # masks: (B, 1, H, W) - ground truth masks
+        # ori_sizes: tuple of original sizes
+
+        batch_size = embeddings.shape[0]
+
+        # Convert ori_sizes to list of tuples
+        orig_hw_list = [(int(ori_sizes[0][i]), int(ori_sizes[1][i])) for i in range(batch_size)]
+
+        # Move embeddings to device
+        embeddings = embeddings.float().to(device)
+
+        # Prepare masks
+        if masks.dim() == 3:
+            masks = masks.unsqueeze(1)  # (B, 1, H, W)
+        masks = masks.float().to(device)
+
+        # Resize masks to match model output (256x256)
+        masks_resized = torch.nn.functional.interpolate(
+            masks, size=(256, 256), mode="nearest"
+        )
+
+        # Prepare prompts (use original sizes for coordinate transformation)
+        point_coords, point_labels, boxes = prepare_prompts_from_embedding(
+            masks, args.prompt_mode, args.jitter, device, transforms, orig_hw_list
+        )
+
+        # Forward pass
+        optimizer.zero_grad()
+
+        with torch.cuda.amp.autocast(enabled=False):
+            low_res_masks = forward_sam2_embedding(
+                model.module if hasattr(model, 'module') else model,
+                embeddings, point_coords, point_labels, boxes, device
+            )
+
+            # Check for NaN
+            if torch.isnan(low_res_masks).any():
+                print(f"[Rank {rank}] NaN in model output, skipping batch")
+                continue
+
+            # Compute loss
+            loss = loss_fn(low_res_masks, masks_resized)
+
+            if torch.isnan(loss):
+                print(f"[Rank {rank}] NaN loss, skipping batch")
+                continue
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        epoch_loss += loss.item()
+        num_batches += 1
+
+        if rank == 0:
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+    return epoch_loss / max(num_batches, 1)
+
+
 def main(rank, world_size, args):
     """
     Main training function for each process.
@@ -396,6 +622,7 @@ def main(rank, world_size, args):
         print(f"Batch size per GPU: {args.batch_size}")
         print(f"Effective batch size: {args.batch_size * world_size}")
         print(f"Model will be saved to: {args.save_path}")
+        print(f"Using pre-computed embeddings: {args.use_embeddings}")
 
     # Wrap model with DDP
     model = DDP(
@@ -428,12 +655,24 @@ def main(rank, world_size, args):
     )
 
     # Setup dataset and dataloader
-    train_dataset = NiiDataset(
-        data_root=args.train_data_paths,
-        shuffle=True,
-        multi_mask=False,  # Single binary mask per sample
-        with_name=False,
-    )
+    if args.use_embeddings:
+        # Use pre-computed embeddings
+        train_dataset = BalancedEmbDataset(
+            data_root=args.embedding_file,
+            sub_set=args.subset,
+            resize_mask=True,
+            mask_size=256,
+        )
+        train_fn = train_epoch_embedding
+    else:
+        # Use raw images
+        train_dataset = NiiDataset(
+            data_root=args.train_data_paths,
+            shuffle=True,
+            multi_mask=False,
+            with_name=False,
+        )
+        train_fn = train_epoch
 
     train_sampler = DistributedSampler(train_dataset)
     train_loader = DataLoader(
@@ -463,7 +702,7 @@ def main(rank, world_size, args):
     for epoch in range(start_epoch, args.num_epochs):
         train_sampler.set_epoch(epoch)
 
-        epoch_loss = train_epoch(
+        epoch_loss = train_fn(
             model, train_loader, optimizer, loss_fn,
             transforms, args, f"cuda:{rank}", rank
         )
