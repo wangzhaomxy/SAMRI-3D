@@ -5,8 +5,8 @@
 #SBATCH --mem=128G
 #SBATCH --job-name=SAMRI2_S1
 #SBATCH --time=2-00:00:00
-#SBATCH --partition=gpu_rocm        # gpu_rocm      gpu_rocm    gpu_cuda
-#SBATCH --gres=gpu:mi300x:8         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2 
+#SBATCH --partition=gpu_cuda        # gpu_rocm      gpu_rocm    gpu_cuda
+#SBATCH --gres=gpu:h100:1         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2 
 #SBATCH --account=a_ai_collab
 #SBATCH --qos=sdf                   # sdf           gpu         gpu
 #SBATCH -o /home/s4670484/Documents/SAMRI2_log/slurm-samri2phase1-%j.output
@@ -16,7 +16,7 @@
 
 module load anaconda3
 source $EBROOTANACONDA3/etc/profile.d/conda.sh
-conda activate samri-mi300
+conda activate samri  # samri samri-mi300
 
 # Dynamically assign port from job ID to avoid collisions
 export MASTER_ADDR=localhost
@@ -32,7 +32,7 @@ SAM2_CKPT="/scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt"
 SAVE_PATH="/scratch/project/samri/Model_save/samri2_stage1/"
 
 # Data mode: "embeddings" or "images"
-DATA_MODE="embeddings"
+DATA_MODE="images"
 
 # For embedding mode (faster training with pre-computed embeddings)
 EMBEDDING_FILE="/scratch/project/samri/train_list.pkl"
