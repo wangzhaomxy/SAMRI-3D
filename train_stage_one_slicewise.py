@@ -28,7 +28,7 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from sam2.build_sam import build_sam2
 from sam2.utils.transforms import SAM2Transforms
-from utils.dataloader import NiiDataset, BalancedEmbDataset
+from utils.dataloader import NiiDataset, BalancedEmbDataset, SAM2EmbDataset
 from utils.losses import DiceFocalLoss
 from utils.utils import gen_points, gen_bboxes, get_checkpoint
 
@@ -44,7 +44,9 @@ def parse_args():
 
     # Data configuration
     parser.add_argument("--use-embeddings", action="store_true",
-                        help="Use pre-computed embeddings (BalancedEmbDataset) instead of raw images")
+                        help="Use pre-computed embeddings instead of raw images")
+    parser.add_argument("--sam2-embeddings", action="store_true",
+                        help="Use SAM2-format embeddings with high-res features (requires --use-embeddings)")
     parser.add_argument("--embedding-file", type=str, default=None,
                         help="Path to pickle file containing embedding file list (required if --use-embeddings)")
     parser.add_argument("--subset", type=str, default="all",
@@ -345,7 +347,7 @@ def forward_sam2_image(model, images, point_coords, point_labels, boxes, transfo
     return low_res_masks
 
 
-def forward_sam2_embedding(model, embeddings, point_coords, point_labels, boxes, device):
+def forward_sam2_embedding(model, embeddings, point_coords, point_labels, boxes, device, high_res_feats=None):
     """
     Forward pass through SAM2 using pre-computed embeddings (skip image encoder).
 
@@ -356,6 +358,7 @@ def forward_sam2_embedding(model, embeddings, point_coords, point_labels, boxes,
         point_labels: Point labels or None
         boxes: Box coordinates or None
         device: Target device
+        high_res_feats: Optional tuple of (high_res_feat_0, high_res_feat_1) tensors
 
     Returns:
         low_res_masks: Low resolution mask logits (B, 1, 256, 256)
@@ -390,11 +393,18 @@ def forward_sam2_embedding(model, embeddings, point_coords, point_labels, boxes,
     )
 
     # Process each image in batch
-    # Note: For pre-computed embeddings, we don't have high-res features
-    # Set high_res_features to None or empty list
     all_low_res_masks = []
     for i in range(batch_size):
-        # Predict masks without high-res features
+        # Prepare high-res features for this sample if available
+        if high_res_feats is not None:
+            high_res_features_i = [
+                high_res_feats[0][i:i+1],  # (1, 32, 256, 256)
+                high_res_feats[1][i:i+1],  # (1, 64, 128, 128)
+            ]
+        else:
+            high_res_features_i = None
+
+        # Predict masks
         low_res_masks, iou_predictions, _, _ = model.sam_mask_decoder(
             image_embeddings=image_embed[i:i+1],
             image_pe=model.sam_prompt_encoder.get_dense_pe(),
@@ -402,7 +412,7 @@ def forward_sam2_embedding(model, embeddings, point_coords, point_labels, boxes,
             dense_prompt_embeddings=dense_embeddings[i:i+1],
             multimask_output=False,
             repeat_image=False,
-            high_res_features=None,
+            high_res_features=high_res_features_i,
         )
         all_low_res_masks.append(low_res_masks)
 
@@ -498,7 +508,7 @@ def train_epoch(model, dataloader, optimizer, loss_fn, transforms, args, device,
 
 def train_epoch_embedding(model, dataloader, optimizer, loss_fn, transforms, args, device, rank):
     """
-    Train for one epoch using pre-computed embeddings.
+    Train for one epoch using pre-computed SAMRI v1 embeddings (deprecated, for backward compatibility).
 
     Args:
         model: SAM2 model (DDP wrapped)
@@ -519,9 +529,13 @@ def train_epoch_embedding(model, dataloader, optimizer, loss_fn, transforms, arg
 
     pbar = tqdm(dataloader, disable=(rank != 0))
     for embeddings, masks, ori_sizes in pbar:
-        # embeddings: (B, 256, 64, 64) - pre-computed image embeddings
+        # embeddings: (B, 1, 256, 64, 64) or (B, 256, 64, 64) - pre-computed image embeddings
         # masks: (B, 1, H, W) - ground truth masks
         # ori_sizes: tuple of original sizes
+
+        # Squeeze extra dimension if present (SAMRI v1 embeddings have shape (1, 256, 64, 64))
+        if embeddings.dim() == 5:
+            embeddings = embeddings.squeeze(1)  # (B, 1, 256, 64, 64) -> (B, 256, 64, 64)
 
         batch_size = embeddings.shape[0]
 
@@ -552,7 +566,97 @@ def train_epoch_embedding(model, dataloader, optimizer, loss_fn, transforms, arg
         with torch.cuda.amp.autocast(enabled=False):
             low_res_masks = forward_sam2_embedding(
                 model.module if hasattr(model, 'module') else model,
-                embeddings, point_coords, point_labels, boxes, device
+                embeddings, point_coords, point_labels, boxes, device,
+                high_res_feats=None  # SAMRI v1 embeddings don't have high-res features
+            )
+
+            # Check for NaN
+            if torch.isnan(low_res_masks).any():
+                print(f"[Rank {rank}] NaN in model output, skipping batch")
+                continue
+
+            # Compute loss
+            loss = loss_fn(low_res_masks, masks_resized)
+
+            if torch.isnan(loss):
+                print(f"[Rank {rank}] NaN loss, skipping batch")
+                continue
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        epoch_loss += loss.item()
+        num_batches += 1
+
+        if rank == 0:
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+    return epoch_loss / max(num_batches, 1)
+
+
+def train_epoch_sam2_embedding(model, dataloader, optimizer, loss_fn, transforms, args, device, rank):
+    """
+    Train for one epoch using SAM2 pre-computed embeddings with high-res features.
+
+    Args:
+        model: SAM2 model (DDP wrapped)
+        dataloader: Training data loader (SAM2EmbDataset)
+        optimizer: Optimizer
+        loss_fn: Loss function
+        transforms: SAM2Transforms
+        args: Command line arguments
+        device: Target device
+        rank: Process rank for DDP
+
+    Returns:
+        Average epoch loss
+    """
+    model.train()
+    epoch_loss = 0.0
+    num_batches = 0
+
+    pbar = tqdm(dataloader, disable=(rank != 0))
+    for image_embed, high_res_feat_0, high_res_feat_1, masks, ori_sizes in pbar:
+        # image_embed: (B, 256, 64, 64) - main image embedding
+        # high_res_feat_0: (B, 32, 256, 256) - high-res feature level 0
+        # high_res_feat_1: (B, 64, 128, 128) - high-res feature level 1
+        # masks: (B, 1, H, W) - ground truth masks
+        # ori_sizes: tuple of original sizes
+
+        batch_size = image_embed.shape[0]
+
+        # Convert ori_sizes to list of tuples
+        orig_hw_list = [(int(ori_sizes[0][i]), int(ori_sizes[1][i])) for i in range(batch_size)]
+
+        # Move to device
+        image_embed = image_embed.float().to(device)
+        high_res_feat_0 = high_res_feat_0.float().to(device)
+        high_res_feat_1 = high_res_feat_1.float().to(device)
+
+        # Prepare masks
+        if masks.dim() == 3:
+            masks = masks.unsqueeze(1)  # (B, 1, H, W)
+        masks = masks.float().to(device)
+
+        # Resize masks to match model output (256x256)
+        masks_resized = torch.nn.functional.interpolate(
+            masks, size=(256, 256), mode="nearest"
+        )
+
+        # Prepare prompts (use original sizes for coordinate transformation)
+        point_coords, point_labels, boxes = prepare_prompts_from_embedding(
+            masks, args.prompt_mode, args.jitter, device, transforms, orig_hw_list
+        )
+
+        # Forward pass
+        optimizer.zero_grad()
+
+        with torch.cuda.amp.autocast(enabled=False):
+            low_res_masks = forward_sam2_embedding(
+                model.module if hasattr(model, 'module') else model,
+                image_embed, point_coords, point_labels, boxes, device,
+                high_res_feats=(high_res_feat_0, high_res_feat_1)
             )
 
             # Check for NaN
@@ -656,14 +760,29 @@ def main(rank, world_size, args):
 
     # Setup dataset and dataloader
     if args.use_embeddings:
-        # Use pre-computed embeddings
-        train_dataset = BalancedEmbDataset(
-            data_root=args.embedding_file,
-            sub_set=args.subset,
-            resize_mask=True,
-            mask_size=256,
-        )
-        train_fn = train_epoch_embedding
+        if args.sam2_embeddings:
+            # Use SAM2-format pre-computed embeddings with high-res features
+            train_dataset = SAM2EmbDataset(
+                data_root=args.embedding_file,
+                sub_set=args.subset,
+                resize_mask=True,
+                mask_size=256,
+            )
+            train_fn = train_epoch_sam2_embedding
+            if rank == 0:
+                print("Using SAM2 embeddings with high-res features")
+        else:
+            # Use SAMRI v1 pre-computed embeddings (deprecated, may not work with SAM2)
+            train_dataset = BalancedEmbDataset(
+                data_root=args.embedding_file,
+                sub_set=args.subset,
+                resize_mask=True,
+                mask_size=256,
+            )
+            train_fn = train_epoch_embedding
+            if rank == 0:
+                print("WARNING: Using SAMRI v1 embeddings without high-res features. "
+                      "This may not work with SAM2. Consider using --sam2-embeddings.")
     else:
         # Use raw images
         train_dataset = NiiDataset(

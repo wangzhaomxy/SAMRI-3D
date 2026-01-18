@@ -310,16 +310,102 @@ class BalancedEmbDataset(Dataset):
         """
         return os.path.basename(self.cur_name)
 
-def emb_name_split(data_root, 
-             num_of_subset=2, 
+class SAM2EmbDataset(Dataset):
+    """
+    Dataset for SAM2 pre-computed embeddings with high-resolution features.
+
+    NPZ format:
+    - image_embed: (256, 64, 64) - main image embedding
+    - high_res_feat_0: (32, 256, 256) - high-res feature level 0
+    - high_res_feat_1: (64, 128, 128) - high-res feature level 1
+    - mask: (1, H, W) - ground truth mask
+    - ori_size: (H, W) - original image size
+    """
+    def __init__(self,
+                 data_root,
+                 sub_set="all",
+                 resize_mask=False,
+                 mask_size=256):
+        """
+        Args:
+            data_root (str): Path to pickle file containing embedding file list.
+            sub_set (str): Subset to use: "60_up", "60_down", or "all".
+            resize_mask (bool): If True, resize mask to mask_size.
+            mask_size (int): Target mask size. Default 256.
+        """
+        super().__init__()
+        self.data_root = data_root
+
+        with open(self.data_root, "rb") as f:
+            file_lists = pickle.load(f)
+
+        if sub_set == "60_up":
+            self.file_list = file_lists.get("train_60_up", [])
+        elif sub_set == "60_down":
+            self.file_list = file_lists.get("train_60_down", [])
+        elif sub_set == "all":
+            self.file_list = file_lists.get("train_60_up", []) + file_lists.get("train_60_down", [])
+        else:
+            raise ValueError(f"Unknown subset: {sub_set}")
+
+        self.cur_name = ""
+        self.resize_mask = resize_mask
+        self.mask_size = mask_size
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, index):
+        """
+        Load SAM2 embedding with high-res features.
+
+        Returns:
+            image_embed: (256, 64, 64) - main image embedding
+            high_res_feat_0: (32, 256, 256) - high-res feature level 0
+            high_res_feat_1: (64, 128, 128) - high-res feature level 1
+            mask: (1, H, W) - binary mask for the specified label
+            ori_size: tuple (H, W) - original image size
+        """
+        npz_file_path = self.file_list[index]["emb_path"]
+        label = self.file_list[index]["labels"]
+        npz_data = np.load(npz_file_path)
+        self.cur_name = npz_file_path
+
+        # Load embeddings
+        image_embed = npz_data["image_embed"]  # (256, 64, 64)
+        high_res_feat_0 = npz_data["high_res_feat_0"]  # (32, 256, 256)
+        high_res_feat_1 = npz_data["high_res_feat_1"]  # (64, 128, 128)
+
+        # Load and process mask
+        mask = npz_data["mask"] == int(label)
+        if not mask.any():
+            raise ValueError(f"Empty mask: {self.cur_name}, label: {label}")
+
+        if self.resize_mask:
+            mask = torch.tensor(mask, dtype=torch.float)[None, :, :, :]
+            mask = preprocess_mask(mask, target_size=self.mask_size)
+            mask = mask.squeeze(0).numpy()
+            if not mask.any():
+                raise ValueError(f"Empty mask after resize: {self.get_name()}")
+
+        ori_size = tuple(npz_data["ori_size"])
+
+        return (image_embed, high_res_feat_0, high_res_feat_1, mask, ori_size)
+
+    def get_name(self):
+        return os.path.basename(self.cur_name)
+
+
+def emb_name_split(data_root,
+             num_of_subset=2,
              shuffle=True):
     npz_files = []
     for path in data_root:
         npz_files += sorted(glob.glob(path + "*"))
-    
+
     if shuffle:
         random.shuffle(npz_files)
-    
+
     sub_num = len(npz_files) // num_of_subset
-    
+
     return [npz_files[i*sub_num:(i+1)*sub_num] for i in range(num_of_subset)]
