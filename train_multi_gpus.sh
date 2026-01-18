@@ -8,7 +8,7 @@
 #SBATCH --partition=gpu_cuda        # gpu_rocm      gpu_rocm    gpu_cuda
 #SBATCH --gres=gpu:h100:1         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2 
 #SBATCH --account=a_ai_collab
-#SBATCH --qos=sdf                   # sdf           gpu         gpu
+#SBATCH --qos=gpu                   # sdf           gpu         gpu
 #SBATCH -o /home/s4670484/Documents/SAMRI2_log/slurm-samri2phase1-%j.output
 #SBATCH -e /home/s4670484/Documents/SAMRI2_log/slurm-samri2phase1-%j.error
 #SBATCH --mail-type=ALL
