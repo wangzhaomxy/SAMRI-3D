@@ -12,6 +12,22 @@ Output NPZ format:
 - high_res_feat_1: (64, 128, 128) - high-res feature level 1
 - mask: (1, H, W) - ground truth mask
 - ori_size: (H, W) - original image size
+
+  1. Generate SAM2 embeddings:                                                                                                              
+  python generate_sam2_embeddings.py \                                                                                                      
+      --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \                                                                                    
+      --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \                                                            
+      --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/*/training/ \                                                           
+      --output-dir /scratch/project/samri/SAM2_embeddings/ \                                                                                
+      --save-pickle-list                                                                                                                    
+  2. Train with SAM2 embeddings:                                                                                                            
+  python train_stage_one_slicewise.py \                                                                                                     
+      --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \                                                                                    
+      --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \                                                            
+      --use-embeddings \                                                                                                                    
+      --sam2-embeddings \                                                                                                                   
+      --embedding-file /scratch/project/samri/SAM2_embeddings/embedding_list.pkl \                                                          
+      --save-path /scratch/project/samri/Model_save/samri2_stage1/     
 """
 
 import os
