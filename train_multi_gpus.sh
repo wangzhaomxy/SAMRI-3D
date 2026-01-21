@@ -1,14 +1,14 @@
 #!/bin/bash --login
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=128G
+#SBATCH --cpus-per-task=128
+#SBATCH --mem=512G
 #SBATCH --job-name=SAMRI2_S1
 #SBATCH --time=2-00:00:00
-#SBATCH --partition=gpu_cuda        # gpu_rocm      gpu_rocm    gpu_cuda
-#SBATCH --gres=gpu:h100:1         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2 
+#SBATCH --partition=gpu_rocm        # gpu_rocm      gpu_rocm    gpu_cuda
+#SBATCH --gres=gpu:mi300x:8         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2 
 #SBATCH --account=a_ai_collab
-#SBATCH --qos=gpu                   # sdf           gpu         gpu
+#SBATCH --qos=sdf                   # sdf           gpu         gpu
 #SBATCH -o /home/s4670484/Documents/SAMRI2_log/slurm-samri2phase1-%j.output
 #SBATCH -e /home/s4670484/Documents/SAMRI2_log/slurm-samri2phase1-%j.error
 #SBATCH --mail-type=ALL
@@ -29,7 +29,7 @@ export MASTER_PORT=$((26000 + RANDOM % 1000))  # Pick a port between 26000 ~ 269
 # Paths - modify these according to your setup
 SAM2_CONFIG="configs/sam2.1/sam2.1_hiera_s.yaml"
 SAM2_CKPT="/scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt"
-SAVE_PATH="/scratch/project/samri/Model_save/samri2_stage1/"
+SAVE_PATH="/scratch/project/samri/Model_save/samri2_stage1_img/"
 
 # Data mode: "embeddings" or "images"
 DATA_MODE="images"
@@ -43,7 +43,7 @@ TRAIN_DATA_PATHS="/scratch/project/samri/Datasets/SAMRI_train_test/*/training/"
 
 # Training hyperparameters
 NUM_EPOCHS=200
-BATCH_SIZE=256
+BATCH_SIZE=1024
 LR=1e-5
 PROMPT_MODE="mixed"
 SAVE_EVERY=5
