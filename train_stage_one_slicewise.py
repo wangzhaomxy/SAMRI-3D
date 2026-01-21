@@ -848,7 +848,7 @@ def main(rank, world_size, args):
     # Training loop
     losses = []
     for epoch in range(start_epoch, args.num_epochs):
-        print(f"Epoch {epoch + 1}/{args.num_epochs}")
+        print(f"Start training epoch {epoch + 1}/{args.num_epochs}")
         train_sampler.set_epoch(epoch)
 
         epoch_loss = train_fn(
@@ -860,7 +860,7 @@ def main(rank, world_size, args):
 
         # Save checkpoint
         if (epoch + 1) % args.save_every == 0 and rank == 0:
-            print(f"Epoch {epoch + 1}/{args.num_epochs}, Loss: {epoch_loss:.4f}")
+            print(f"Saving epoch {epoch + 1}/{args.num_epochs} model, Loss: {epoch_loss:.4f}")
 
             # Save model state dict
             save_name = os.path.join(
