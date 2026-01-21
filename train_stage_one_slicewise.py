@@ -848,6 +848,7 @@ def main(rank, world_size, args):
     # Training loop
     losses = []
     for epoch in range(start_epoch, args.num_epochs):
+        print(f"Epoch {epoch + 1}/{args.num_epochs}")
         train_sampler.set_epoch(epoch)
 
         epoch_loss = train_fn(
