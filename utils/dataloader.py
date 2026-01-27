@@ -238,31 +238,31 @@ class EmbDataset(Dataset):
 class BalancedEmbDataset(Dataset):
     def __init__(self, 
                  data_root,
-                 sub_set = "60_up", 
+                 sub_set = "40_up", 
                  resize_mask=False,
                  mask_size=256):
         """
         Args:
             data_root (str): The path of the balanced dataset file.
-            sub_set (str): The subset of the dataset. The options are "60_up" and "60_down".
-                            60_up: The subset of the dataset with b_dice > 0.6.
-                            60_down: The subset of the dataset with b_dice > 0.2 and <= 0.6.
+            sub_set (str): The subset of the dataset. The options are "40_up" and "40_down".
+                            40_up: The subset of the dataset with b_dice > 0.6.
+                            40_down: The subset of the dataset with b_dice > 0.2 and <= 0.6.
             resize_mask(bool): If True, resize the mask into the mask size.
             mask_size(int): The target size of the mask, HW=(256, 256). Default is 256.
 
         """
         super().__init__()
         self.data_root = data_root
-        if sub_set == "60_up":
+        if sub_set == "40_up":
             with open(self.data_root, "rb") as f:
-                self.file_list = pickle.load(f)["train_60_up"]
-        elif sub_set == "60_down":
+                self.file_list = pickle.load(f)["train_40_up"]
+        elif sub_set == "40_down":
             with open(self.data_root, "rb") as f:
-                self.file_list = pickle.load(f)["train_60_down"]
+                self.file_list = pickle.load(f)["train_40_down"]
         elif sub_set == "all":
             with open(self.data_root, "rb") as f:
                 file_lists = pickle.load(f)
-                self.file_list = file_lists["train_60_up"] + file_lists["train_60_down"]
+                self.file_list = file_lists["train_40_up"] + file_lists["train_40_down"]
 
         self.cur_name = ""
         self.resize_mask = resize_mask
@@ -320,18 +320,33 @@ class SAM2EmbDataset(Dataset):
     - high_res_feat_1: (64, 128, 128) - high-res feature level 1
     - mask: (1, H, W) - ground truth mask
     - ori_size: (H, W) - original image size
+
+    Supports:
+    - Dynamic dice threshold filtering (using all_entries from pickle)
+    - Sample limitation with repetition for small datasets
     """
     def __init__(self,
                  data_root,
                  sub_set="all",
                  resize_mask=False,
-                 mask_size=256):
+                 mask_size=256,
+                 dice_threshold_low=None,
+                 dice_threshold_high=None,
+                 min_samples_per_epoch=5000):
         """
         Args:
             data_root (str): Path to pickle file containing embedding file list.
-            sub_set (str): Subset to use: "60_up", "60_down", or "all".
+            sub_set (str): Subset to use: "40_up", "40_down", "all", or "custom".
+                          Use "custom" with dice thresholds for dynamic filtering.
             resize_mask (bool): If True, resize mask to mask_size.
             mask_size (int): Target mask size. Default 256.
+            dice_threshold_low (float): Min dice threshold for custom filtering.
+                                       Only used when sub_set="custom".
+            dice_threshold_high (float): Max dice threshold for custom filtering.
+                                        If None, no upper limit. Only used when sub_set="custom".
+            min_samples_per_epoch (int): Minimum samples per epoch. If dataset has fewer
+                                        samples, entries are repeated to reach this number.
+                                        Set to 0 to disable. Default 5000.
         """
         super().__init__()
         self.data_root = data_root
@@ -339,14 +354,44 @@ class SAM2EmbDataset(Dataset):
         with open(self.data_root, "rb") as f:
             file_lists = pickle.load(f)
 
-        if sub_set == "60_up":
-            self.file_list = file_lists.get("train_60_up", [])
-        elif sub_set == "60_down":
-            self.file_list = file_lists.get("train_60_down", [])
+        # Get the file list based on sub_set
+        if sub_set == "40_up":
+            self.file_list = file_lists.get("train_40_up", [])
+        elif sub_set == "40_down":
+            self.file_list = file_lists.get("train_40_down", [])
         elif sub_set == "all":
-            self.file_list = file_lists.get("train_60_up", []) + file_lists.get("train_60_down", [])
+            self.file_list = file_lists.get("train_40_up", []) + file_lists.get("train_40_down", [])
+        elif sub_set == "custom":
+            # Use all_entries with custom dice threshold filtering
+            all_entries = file_lists.get("all_entries", [])
+            if not all_entries:
+                raise ValueError("Pickle file does not contain 'all_entries' for custom filtering")
+
+            self.file_list = []
+            for entry in all_entries:
+                dice = entry.get("dice", 1.0)  # Default to 1.0 if no dice score
+                # Apply threshold filtering
+                if dice_threshold_low is not None and dice <= dice_threshold_low:
+                    continue
+                if dice_threshold_high is not None and dice > dice_threshold_high:
+                    continue
+                # Add entry in compatible format
+                self.file_list.append({
+                    "emb_path": entry["emb_path"],
+                    "labels": entry["labels"],
+                })
         else:
             raise ValueError(f"Unknown subset: {sub_set}")
+
+        # Store original list length before repetition
+        self.original_length = len(self.file_list)
+
+        # Apply sample limitation with repetition
+        self.min_samples_per_epoch = min_samples_per_epoch
+        if min_samples_per_epoch > 0 and len(self.file_list) > 0 and len(self.file_list) < min_samples_per_epoch:
+            # Calculate how many times to repeat
+            repeat_times = (min_samples_per_epoch + len(self.file_list) - 1) // len(self.file_list)
+            self.file_list = self.file_list * repeat_times
 
         self.cur_name = ""
         self.resize_mask = resize_mask
