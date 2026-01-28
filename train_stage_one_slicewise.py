@@ -14,9 +14,39 @@ Supports two data modes:
 
 Based on SAMRI v1 training approach adapted for SAM2 architecture.
 
+=== Workflow ===
+
+Step 1: Generate embeddings (only dice > 0.4 are saved):
+  python generate_sam2_embeddings.py \\
+      --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
+      --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
+      --data-paths /scratch/project/samri/Datasets/*/training/ \\
+      --output-dir /scratch/project/samri/SAM2_embeddings/ \\
+      --num-workers 8 --prefetch-size 16
+
+Step 2: Train on embeddings (this script):
+  python train_stage_one_slicewise.py \\
+      --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
+      --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
+      --use-embeddings --sam2-embeddings \\
+      --embedding-dir /scratch/project/samri/SAM2_embeddings/ \\
+      --save-path /scratch/project/samri/Model_save/samri2_stage1/
+
 === CLI Examples ===
 
-1. Training from Raw Images (compute embeddings on-the-fly):
+1. Training from Pre-computed Embeddings (recommended, faster):
+   Note: Embeddings are pre-filtered (dice > 0.4) during generation
+
+   python train_stage_one_slicewise.py \\
+       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
+       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
+       --use-embeddings --sam2-embeddings \\
+       --embedding-dir /scratch/project/samri/SAM2_embeddings/ \\
+       --save-path /scratch/project/samri/Model_save/samri2_stage1_emb/ \\
+       --num-epochs 100 \\
+       --batch-size 8
+
+2. Training from Raw Images (compute embeddings on-the-fly):
    Note: Slower but doesn't require pre-computed embeddings
 
    python train_stage_one_slicewise.py \\
@@ -30,58 +60,15 @@ Based on SAMRI v1 training approach adapted for SAM2 architecture.
        --lr 1e-5 \\
        --prompt-mode mixed
 
-2. Training from Pre-computed Embeddings (recommended, faster):
-
-   a) Using all pre-filtered samples (train_40_up + train_40_down):
-   python train_stage_one_slicewise.py \\
-       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
-       --use-embeddings --sam2-embeddings \\
-       --embedding-file /scratch/project/samri/SAM2_embeddings/embedding_list.pkl \\
-       --subset all \\
-       --min-samples-per-epoch 5000 \\
-       --save-path /scratch/project/samri/Model_save/samri2_stage1_emb/ \\
-       --num-epochs 100 \\
-       --batch-size 8
-
-   b) Using only high-quality samples (dice > 0.4):
-   python train_stage_one_slicewise.py \\
-       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
-       --use-embeddings --sam2-embeddings \\
-       --embedding-file /scratch/project/samri/SAM2_embeddings/embedding_list.pkl \\
-       --subset 40_up \\
-       --min-samples-per-epoch 5000 \\
-       --save-path /scratch/project/samri/Model_save/samri2_stage1_60up/
-
-   c) Using custom dice threshold filtering (e.g., 0.2 < dice <= 0.6):
-   python train_stage_one_slicewise.py \\
-       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
-       --use-embeddings --sam2-embeddings \\
-       --embedding-file /scratch/project/samri/SAM2_embeddings/embedding_list.pkl \\
-       --subset custom \\
-       --dice-threshold-low 0.2 \\
-       --dice-threshold-high 0.6 \\
-       --min-samples-per-epoch 5000 \\
-       --save-path /scratch/project/samri/Model_save/samri2_stage1_custom/
-
-   d) No upper threshold (all samples with dice > 0.2):
-   python train_stage_one_slicewise.py \\
-       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
-       --use-embeddings --sam2-embeddings \\
-       --embedding-file /scratch/project/samri/SAM2_embeddings/embedding_list.pkl \\
-       --subset custom \\
-       --dice-threshold-low 0.2 \\
-       --min-samples-per-epoch 0 \\
-       --save-path /scratch/project/samri/Model_save/samri2_stage1_all/
-
-Key Arguments for Embedding Training:
-  --subset: "40_up" (dice>0.4), "40_down" (0.2<dice<=0.4), "all", or "custom"
-  --dice-threshold-low: Min dice to include (default: 0.2, only for subset=custom)
-  --dice-threshold-high: Max dice to include (default: None, only for subset=custom)
-  --min-samples-per-epoch: Repeat small datasets to reach this size (default: 5000, set 0 to disable)
+Key Arguments:
+  --use-embeddings      Use pre-computed embeddings instead of raw images
+  --sam2-embeddings     Use SAM2-format embeddings with high-res features
+  --embedding-dir       Directory containing .npz embedding files (scanned recursively)
+  --train-data-paths    List of NIfTI data paths (for raw image mode)
+  --prompt-mode         Prompt type: "point", "box", or "mixed" (default: box)
+  --batch-size          Batch size per GPU (default: 4)
+  --lr                  Learning rate (default: 1e-5)
+  --num-epochs          Number of training epochs (default: 100)
 """
 
 import os
@@ -126,25 +113,12 @@ def parse_args():
                         help="Use pre-computed embeddings instead of raw images")
     parser.add_argument("--sam2-embeddings", action="store_true",
                         help="Use SAM2-format embeddings with high-res features (requires --use-embeddings)")
-    parser.add_argument("--embedding-file", type=str, default=None,
-                        help="Path to pickle file containing embedding file list (required if --use-embeddings)")
-    parser.add_argument("--subset", type=str, default="all",
-                        choices=["40_up", "40_down", "all", "custom"],
-                        help="Subset to use from embedding file. Use 'custom' with dice thresholds (default: all)")
+    parser.add_argument("--embedding-dir", type=str, default=None,
+                        help="Directory containing pre-computed embeddings (.npz files)")
     parser.add_argument("--train-data-paths", type=str, nargs="+", default=None,
                         help="List of training data paths (for raw image mode)")
     parser.add_argument("--val-data-paths", type=str, nargs="+", default=None,
                         help="List of validation data paths (optional)")
-
-    # Embedding filtering options (only for --use-embeddings --sam2-embeddings)
-    parser.add_argument("--dice-threshold-low", type=float, default=0.2,
-                        help="Min dice threshold for custom filtering (samples with dice <= this are excluded). Default: 0.2")
-    parser.add_argument("--dice-threshold-high", type=float, default=None,
-                        help="Max dice threshold for custom filtering (samples with dice > this are excluded). "
-                             "Common values: 0.4 (hard samples), 0.6 (medium), None (no upper limit). Default: None")
-    parser.add_argument("--min-samples-per-epoch", type=int, default=5000,
-                        help="Minimum samples per epoch. Small datasets are repeated to reach this. "
-                             "Set to 0 to disable. Default: 5000")
 
     # Training configuration
     parser.add_argument("--save-path", type=str, required=True,
@@ -866,29 +840,19 @@ def main(rank, world_size, args):
         if args.sam2_embeddings:
             # Use SAM2-format pre-computed embeddings with high-res features
             train_dataset = SAM2EmbDataset(
-                data_root=args.embedding_file,
-                sub_set=args.subset,
+                data_root=args.embedding_dir,
                 resize_mask=True,
                 mask_size=256,
-                dice_threshold_low=args.dice_threshold_low if args.subset == "custom" else None,
-                dice_threshold_high=args.dice_threshold_high if args.subset == "custom" else None,
-                min_samples_per_epoch=args.min_samples_per_epoch,
             )
             train_fn = train_epoch_sam2_embedding
             if rank == 0:
                 print("Using SAM2 embeddings with high-res features")
-                if args.subset == "custom":
-                    print(f"  Custom filtering: dice > {args.dice_threshold_low}"
-                          + (f" and dice <= {args.dice_threshold_high}" if args.dice_threshold_high else ""))
-                print(f"  Original samples: {train_dataset.original_length}")
-                if args.min_samples_per_epoch > 0:
-                    print(f"  Min samples per epoch: {args.min_samples_per_epoch}")
-                    print(f"  Effective samples per epoch: {len(train_dataset)}")
+                print(f"  Embedding directory: {args.embedding_dir}")
+                print(f"  Total samples: {len(train_dataset)}")
         else:
             # Use SAMRI v1 pre-computed embeddings (deprecated, may not work with SAM2)
             train_dataset = BalancedEmbDataset(
-                data_root=args.embedding_file,
-                sub_set=args.subset,
+                data_root=args.embedding_dir,
                 resize_mask=True,
                 mask_size=256,
             )

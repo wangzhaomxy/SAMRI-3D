@@ -3,8 +3,8 @@
 Generate SAM2-compatible embeddings from NIfTI images.
 
 This script pre-computes SAM2 image embeddings including high-resolution features
-required by the SAM2 mask decoder. The embeddings can be used to accelerate
-training by skipping the image encoder forward pass.
+required by the SAM2 mask decoder. Only embeddings with dice score > 0.4 are saved
+to conserve disk space.
 
 Output NPZ format:
 - image_embed: (256, 64, 64) - main image embedding
@@ -13,81 +13,53 @@ Output NPZ format:
 - mask: (1, H, W) - ground truth mask
 - ori_size: (H, W) - original image size
 
-Pickle output format (embedding_list.pkl):
-- 'all_entries': List of all entries with full metadata for debugging/modification
-    [{'id': unique_id, 'emb_path': path, 'img_path': orig_img, 'mask_path': orig_mask,
-      'dataset': name, 'labels': label, 'dice': score}, ...]
-- 'train_40_down': Filtered list for training (0.2 < dice <= 0.4)
-- 'train_40_up': Filtered list for training (dice > 0.4)
-- 'metadata': Generation metadata (config, thresholds, timestamps, etc.)
-
 Usage:
-  1. Generate SAM2 embeddings (default settings):
+  1. Generate SAM2 embeddings (recommended):
 python generate_sam2_embeddings.py \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
 --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
 --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/*/training/ \
 --output-dir /scratch/project/samri/SAM2_embeddings/ \
---save-pickle-list
-
-  1b. Balanced (good GPU utilization + dice scores):
-python generate_sam2_embeddings.py \
---sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
---data-paths /scratch/project/samri/Datasets/SAMRI_train_test/*/training/ \
---output-dir /scratch/project/samri/SAM2_embeddings/ \
---save-pickle-list \
 --num-workers 8 --prefetch-size 16
 
-  1c. Maximum speed (skip dice eval, no compression):
+  2. Custom dice threshold (default is 0.4):
 python generate_sam2_embeddings.py \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
 --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
 --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/*/training/ \
 --output-dir /scratch/project/samri/SAM2_embeddings/ \
---save-pickle-list \
---num-workers 8 --prefetch-size 16 --no-compress --skip-dice-eval
+--dice-threshold 0.5 \
+--num-workers 8 --prefetch-size 16
+
+  3. Train with SAM2 embeddings (all embeddings in folder):
+python train_stage_one_slicewise.py \
+--sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+--ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+--use-embeddings --sam2-embeddings \
+--embedding-dir /scratch/project/samri/SAM2_embeddings/ \
+--save-path /scratch/project/samri/Model_save/samri2_stage1/
 
 Performance options:
   --num-workers N      Workers for parallel file I/O (default: 4)
   --prefetch-size N    Images to prefetch in background (default: 8)
   --no-compress        Disable NPZ compression for faster saves (~3-5x faster, larger files)
-  --skip-dice-eval     Skip dice evaluation (dice will be 1.0, fastest mode)
-
-  2. Train with SAM2 embeddings:
-python train_stage_one_slicewise.py \
---sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
---use-embeddings \
---sam2-embeddings \
---embedding-file /scratch/project/samri/SAM2_embeddings/embedding_list.pkl \
---save-path /scratch/project/samri/Model_save/samri2_stage1/
-
-  3. Modify training list (remove failed entries, re-filter):
-python generate_sam2_embeddings.py --modify-list embedding_list.pkl \
---remove-ids "dataset_file_1,dataset_file_2" \
---output modified_list.pkl
+  --dice-threshold     Minimum dice score to save embedding (default: 0.4)
 """
 
 import os
 import argparse
-from datetime import datetime
 from tqdm import tqdm
 import numpy as np
 import glob
 import nibabel as nib
-import pickle
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 
-# Dice score thresholds for pre-filtering (for backward compatibility)
-# Note: These are used for pre-generating train_40_up/train_40_down lists
-# The training script can also filter dynamically using all_entries with custom thresholds
-DICE_THRESHOLD_LOW = 0.2   # Minimum dice to include
-DICE_THRESHOLD_HIGH = 0.4  # Threshold to split train_40_down vs train_40_up
+# Minimum dice score threshold - embeddings below this are discarded to save space
+DICE_THRESHOLD = 0.4
 
 
 def parse_args():
@@ -122,34 +94,8 @@ def parse_args():
                         help="Disable NPZ compression for faster saving (larger files)")
     parser.add_argument("--prefetch-size", type=int, default=8,
                         help="Number of images to prefetch in background (default: 8)")
-    parser.add_argument("--skip-dice-eval", action="store_true",
-                        help="Skip dice evaluation for faster generation (dice will be set to 1.0)")
-
-    # Output options
-    parser.add_argument("--save-pickle-list", action="store_true",
-                        help="Also save a pickle file listing all embeddings for BalancedEmbDataset")
-    parser.add_argument("--pickle-output", type=str, default=None,
-                        help="Path for pickle list output (default: output_dir/embedding_list.pkl)")
-
-    # List modification options (alternative mode)
-    parser.add_argument("--modify-list", type=str, default=None,
-                        help="Path to existing pickle list to modify (enables modification mode)")
-    parser.add_argument("--remove-ids", type=str, default=None,
-                        help="Comma-separated list of entry IDs to remove")
-    parser.add_argument("--remove-by-emb-path", type=str, default=None,
-                        help="Remove entries matching this embedding path pattern")
-    parser.add_argument("--remove-by-dataset", type=str, default=None,
-                        help="Remove all entries from this dataset")
-    parser.add_argument("--refilter", action="store_true",
-                        help="Re-filter the list using current thresholds (use with --modify-list)")
-    parser.add_argument("--new-threshold-low", type=float, default=None,
-                        help="New low threshold for re-filtering")
-    parser.add_argument("--new-threshold-high", type=float, default=None,
-                        help="New high threshold for re-filtering")
-    parser.add_argument("--list-datasets", action="store_true",
-                        help="List all datasets in the pickle file (use with --modify-list)")
-    parser.add_argument("--show-stats", action="store_true",
-                        help="Show statistics of the pickle file (use with --modify-list)")
+    parser.add_argument("--dice-threshold", type=float, default=DICE_THRESHOLD,
+                        help=f"Minimum dice score to save embedding (default: {DICE_THRESHOLD})")
 
     return parser.parse_args()
 
@@ -384,10 +330,11 @@ def prefetch_data_generator(file_pairs, num_workers, prefetch_size):
 
 
 def process_dataset(predictor, data_paths, image_key, mask_key, output_dir,
-                    num_workers=4, compress=True, prefetch_size=8, skip_dice_eval=False):
+                    num_workers=4, compress=True, prefetch_size=8, dice_threshold=0.4):
     """
     Process all images in the dataset, generate embeddings, and evaluate dice scores.
 
+    Only saves embeddings with dice score > dice_threshold to conserve disk space.
     Uses parallel file I/O and async saving for better GPU utilization.
 
     Args:
@@ -399,10 +346,10 @@ def process_dataset(predictor, data_paths, image_key, mask_key, output_dir,
         num_workers: Number of workers for parallel I/O (default: 4)
         compress: Whether to use compression for NPZ files (default: True)
         prefetch_size: Number of images to prefetch (default: 8)
-        skip_dice_eval: Skip dice evaluation for faster generation (default: False)
+        dice_threshold: Minimum dice score to save embedding (default: 0.4)
 
     Returns:
-        list: List of dictionaries with embedding info, dice scores, and metadata
+        tuple: (saved_count, skipped_count)
     """
     # Collect all image and mask files
     img_files = []
@@ -426,9 +373,10 @@ def process_dataset(predictor, data_paths, image_key, mask_key, output_dir,
     print(f"  Parallel workers: {num_workers}")
     print(f"  Prefetch size: {prefetch_size}")
     print(f"  Compression: {'enabled' if compress else 'disabled'}")
-    print(f"  Dice evaluation: {'disabled' if skip_dice_eval else 'enabled'}")
+    print(f"  Dice threshold: {dice_threshold} (only save if dice > {dice_threshold})")
 
-    embedding_list = []
+    saved_count = 0
+    skipped_count = 0
     file_pairs = list(zip(img_files, mask_files))
 
     # Create thread pool for async saving
@@ -448,6 +396,37 @@ def process_dataset(predictor, data_paths, image_key, mask_key, output_dir,
         # Set image for predictor (this also extracts features internally)
         predictor.set_image(img)
 
+        # Collect unique labels and evaluate dice scores FIRST
+        unique_labels = np.unique(mask_2d)
+        unique_labels = unique_labels[unique_labels != 0]  # Remove background
+
+        # Check if any label passes the dice threshold
+        should_save = False
+        for label in unique_labels:
+            gt_mask = (mask_2d == label).astype(np.float32)
+            bbox = get_bbox_from_mask(gt_mask)
+            if bbox is None:
+                continue
+
+            # Predict mask using box prompt
+            masks, iou_preds, _ = predictor.predict(
+                box=bbox,
+                multimask_output=False,
+            )
+
+            # Calculate dice score
+            pred_mask = masks[0] > 0
+            dsc = dice_score(gt_mask, pred_mask.astype(np.float32))
+
+            if dsc > dice_threshold:
+                should_save = True
+                break
+
+        if not should_save:
+            skipped_count += 1
+            pbar.update(1)
+            continue
+
         # Extract features for saving (reuse from predictor's internal state)
         features = {
             'image_embed': predictor._features['image_embed'].cpu().numpy().squeeze(0),
@@ -464,17 +443,8 @@ def process_dataset(predictor, data_paths, image_key, mask_key, output_dir,
         output_name = f"{base_name}_sam2emb.npz"
 
         # Determine output subdirectory (preserve dataset structure)
-        rel_path = None
-        for dp in data_paths:
-            if img_path.startswith(dp):
-                rel_path = os.path.relpath(os.path.dirname(img_path), dp)
-                break
-
-        if rel_path and rel_path != '.':
-            out_subdir = os.path.join(output_dir, rel_path)
-        else:
-            out_subdir = output_dir
-
+        dataset_name = extract_dataset_name(img_path, data_paths)
+        out_subdir = os.path.join(output_dir, dataset_name)
         output_path = os.path.join(out_subdir, output_name)
 
         # Submit async save
@@ -485,52 +455,7 @@ def process_dataset(predictor, data_paths, image_key, mask_key, output_dir,
             'compress': compress,
         })
         save_futures.append(save_future)
-
-        # Extract dataset name for metadata
-        dataset_name = extract_dataset_name(img_path, data_paths)
-
-        # Collect unique labels and evaluate dice scores
-        unique_labels = np.unique(mask_2d)
-        unique_labels = unique_labels[unique_labels != 0]  # Remove background
-
-        for label in unique_labels:
-            # Create binary mask for this label
-            gt_mask = (mask_2d == label).astype(np.float32)
-
-            if skip_dice_eval:
-                # Skip dice evaluation for faster generation
-                dsc = 1.0
-                iou_pred = 1.0
-            else:
-                # Get bounding box from ground truth mask
-                bbox = get_bbox_from_mask(gt_mask)
-                if bbox is None:
-                    continue
-
-                # Predict mask using box prompt
-                masks, iou_preds, _ = predictor.predict(
-                    box=bbox,
-                    multimask_output=False,
-                )
-
-                # Calculate dice score
-                pred_mask = masks[0] > 0  # Binary mask
-                dsc = dice_score(gt_mask, pred_mask.astype(np.float32))
-                iou_pred = float(iou_preds[0])
-
-            # Generate unique ID for this entry
-            entry_id = generate_entry_id(dataset_name, base_name, int(label))
-
-            embedding_list.append({
-                'id': entry_id,
-                'emb_path': output_path,
-                'img_path': img_path,
-                'mask_path': mask_path,
-                'dataset': dataset_name,
-                'labels': int(label),
-                'dice': float(dsc),
-                'iou_pred': iou_pred,
-            })
+        saved_count += 1
 
         pbar.update(1)
 
@@ -546,189 +471,15 @@ def process_dataset(predictor, data_paths, image_key, mask_key, output_dir,
 
     save_executor.shutdown(wait=True)
 
-    return embedding_list
-
-
-def filter_entries(all_entries, threshold_low, threshold_high):
-    """
-    Filter entries by dice score thresholds.
-
-    Args:
-        all_entries: List of all entries with full metadata
-        threshold_low: Minimum dice to include
-        threshold_high: Threshold to split down vs up
-
-    Returns:
-        tuple: (train_40_down, train_40_up, skipped_count)
-    """
-    train_40_down = []
-    train_40_up = []
-    skipped_low = 0
-
-    for entry in all_entries:
-        dice = entry.get('dice', 0)
-        # Format for BalancedEmbDataset: {'emb_path': path, 'labels': label}
-        sample = {
-            'emb_path': entry['emb_path'],
-            'labels': entry['labels'],
-        }
-        if dice > threshold_high:
-            train_40_up.append(sample)
-        elif dice > threshold_low:
-            train_40_down.append(sample)
-        else:
-            skipped_low += 1
-
-    return train_40_down, train_40_up, skipped_low
-
-
-def show_pickle_stats(pickle_data):
-    """Display statistics of a pickle file."""
-    all_entries = pickle_data.get('all_entries', [])
-    metadata = pickle_data.get('metadata', {})
-
-    print("\n=== Pickle File Statistics ===")
-    print(f"Generated at: {metadata.get('generated_at', 'Unknown')}")
-    print(f"SAM2 config: {metadata.get('sam2_config', 'Unknown')}")
-    print(f"Checkpoint: {metadata.get('ckpt_path', 'Unknown')}")
-    print(f"\nThresholds:")
-    print(f"  Low: {metadata.get('dice_threshold_low', 'Unknown')}")
-    print(f"  High: {metadata.get('dice_threshold_high', 'Unknown')}")
-
-    print(f"\nTotal entries: {len(all_entries)}")
-    print(f"  train_40_up: {len(pickle_data.get('train_40_up', []))}")
-    print(f"  train_40_down: {len(pickle_data.get('train_40_down', []))}")
-    print(f"  Skipped: {metadata.get('skipped_low', 'Unknown')}")
-
-    # Dataset breakdown
-    if all_entries:
-        datasets = {}
-        for entry in all_entries:
-            ds = entry.get('dataset', 'Unknown')
-            datasets[ds] = datasets.get(ds, 0) + 1
-
-        print(f"\nDatasets ({len(datasets)} total):")
-        for ds, count in sorted(datasets.items()):
-            print(f"  {ds}: {count} entries")
-
-        # Dice score distribution
-        dices = [e.get('dice', 0) for e in all_entries]
-        print(f"\nDice score distribution:")
-        print(f"  Min: {min(dices):.4f}")
-        print(f"  Max: {max(dices):.4f}")
-        print(f"  Mean: {np.mean(dices):.4f}")
-        print(f"  Median: {np.median(dices):.4f}")
-
-
-def list_datasets(pickle_data):
-    """List all datasets in the pickle file."""
-    all_entries = pickle_data.get('all_entries', [])
-    datasets = {}
-    for entry in all_entries:
-        ds = entry.get('dataset', 'Unknown')
-        datasets[ds] = datasets.get(ds, 0) + 1
-
-    print("\n=== Datasets ===")
-    for ds, count in sorted(datasets.items()):
-        print(f"{ds}: {count} entries")
-
-
-def modify_pickle_list(args):
-    """Handle pickle list modification operations."""
-    print(f"Loading pickle list from {args.modify_list}...")
-    with open(args.modify_list, 'rb') as f:
-        pickle_data = pickle.load(f)
-
-    all_entries = pickle_data.get('all_entries', [])
-    metadata = pickle_data.get('metadata', {})
-
-    # Show stats if requested
-    if args.show_stats:
-        show_pickle_stats(pickle_data)
-        return
-
-    # List datasets if requested
-    if args.list_datasets:
-        list_datasets(pickle_data)
-        return
-
-    modified = False
-    original_count = len(all_entries)
-
-    # Remove by IDs
-    if args.remove_ids:
-        ids_to_remove = set(args.remove_ids.split(','))
-        all_entries = [e for e in all_entries if e.get('id') not in ids_to_remove]
-        removed = original_count - len(all_entries)
-        print(f"Removed {removed} entries by ID")
-        modified = True
-
-    # Remove by embedding path pattern
-    if args.remove_by_emb_path:
-        pattern = args.remove_by_emb_path
-        before = len(all_entries)
-        all_entries = [e for e in all_entries if pattern not in e.get('emb_path', '')]
-        removed = before - len(all_entries)
-        print(f"Removed {removed} entries matching emb_path pattern '{pattern}'")
-        modified = True
-
-    # Remove by dataset
-    if args.remove_by_dataset:
-        dataset = args.remove_by_dataset
-        before = len(all_entries)
-        all_entries = [e for e in all_entries if e.get('dataset') != dataset]
-        removed = before - len(all_entries)
-        print(f"Removed {removed} entries from dataset '{dataset}'")
-        modified = True
-
-    # Re-filter with new thresholds
-    threshold_low = args.new_threshold_low if args.new_threshold_low is not None else metadata.get('dice_threshold_low', DICE_THRESHOLD_LOW)
-    threshold_high = args.new_threshold_high if args.new_threshold_high is not None else metadata.get('dice_threshold_high', DICE_THRESHOLD_HIGH)
-
-    if args.refilter or modified or args.new_threshold_low is not None or args.new_threshold_high is not None:
-        train_40_down, train_40_up, skipped = filter_entries(all_entries, threshold_low, threshold_high)
-
-        # Update metadata
-        metadata['dice_threshold_low'] = threshold_low
-        metadata['dice_threshold_high'] = threshold_high
-        metadata['skipped_low'] = skipped
-        metadata['last_modified'] = datetime.now().isoformat()
-        metadata['total_entries'] = len(all_entries)
-
-        # Build new pickle data
-        new_pickle_data = {
-            'all_entries': all_entries,
-            'train_40_down': train_40_down,
-            'train_40_up': train_40_up,
-            'metadata': metadata,
-        }
-
-        # Save to output
-        output_path = args.pickle_output or args.modify_list
-        with open(output_path, 'wb') as f:
-            pickle.dump(new_pickle_data, f)
-
-        print(f"\nSaved modified list to {output_path}")
-        print(f"  Total entries: {len(all_entries)}")
-        print(f"  train_40_up (dice > {threshold_high}): {len(train_40_up)} samples")
-        print(f"  train_40_down ({threshold_low} < dice <= {threshold_high}): {len(train_40_down)} samples")
-        print(f"  Skipped (dice <= {threshold_low}): {skipped} samples")
-    else:
-        print("No modifications made. Use --show-stats to view current state.")
+    return saved_count, skipped_count
 
 
 def main():
     args = parse_args()
 
-    # Check if we're in modification mode
-    if args.modify_list:
-        modify_pickle_list(args)
-        return
-
-    # Validate required arguments for generation mode
+    # Validate required arguments
     if not all([args.sam2_config, args.ckpt_path, args.data_paths, args.output_dir]):
-        print("Error: Generation mode requires --sam2-config, --ckpt-path, --data-paths, and --output-dir")
-        print("Use --modify-list for modification mode")
+        print("Error: Required arguments: --sam2-config, --ckpt-path, --data-paths, and --output-dir")
         return
 
     # Create output directory
@@ -753,7 +504,7 @@ def main():
     print(f"Output directory: {args.output_dir}")
 
     # Process dataset with parallel I/O
-    embedding_list = process_dataset(
+    saved_count, skipped_count = process_dataset(
         predictor=predictor,
         data_paths=args.data_paths,
         image_key=args.image_key,
@@ -762,53 +513,13 @@ def main():
         num_workers=args.num_workers,
         compress=not args.no_compress,
         prefetch_size=args.prefetch_size,
-        skip_dice_eval=args.skip_dice_eval,
+        dice_threshold=args.dice_threshold,
     )
 
-    print(f"Generated {len(embedding_list)} embedding entries")
-
-    # Save pickle list if requested
-    if args.save_pickle_list:
-        pickle_path = args.pickle_output or os.path.join(args.output_dir, "embedding_list.pkl")
-
-        # Filter entries by dice score
-        train_40_down, train_40_up, skipped_low = filter_entries(
-            embedding_list, DICE_THRESHOLD_LOW, DICE_THRESHOLD_HIGH
-        )
-
-        # Build pickle data with full metadata
-        pickle_data = {
-            # Raw data with all metadata (for re-filtering and debugging)
-            'all_entries': embedding_list,
-
-            # Filtered lists for training (compatible with BalancedEmbDataset)
-            'train_40_down': train_40_down,
-            'train_40_up': train_40_up,
-
-            # Generation metadata
-            'metadata': {
-                'generated_at': datetime.now().isoformat(),
-                'sam2_config': args.sam2_config,
-                'ckpt_path': args.ckpt_path,
-                'data_paths': args.data_paths,
-                'image_key': args.image_key,
-                'mask_key': args.mask_key,
-                'dice_threshold_low': DICE_THRESHOLD_LOW,
-                'dice_threshold_high': DICE_THRESHOLD_HIGH,
-                'total_entries': len(embedding_list),
-                'skipped_low': skipped_low,
-            },
-        }
-
-        with open(pickle_path, 'wb') as f:
-            pickle.dump(pickle_data, f)
-
-        print(f"\nSaved embedding list to {pickle_path}")
-        print(f"  Total entries (all_entries): {len(embedding_list)}")
-        print(f"  train_40_up (dice > {DICE_THRESHOLD_HIGH}): {len(train_40_up)} samples")
-        print(f"  train_40_down ({DICE_THRESHOLD_LOW} < dice <= {DICE_THRESHOLD_HIGH}): {len(train_40_down)} samples")
-        print(f"  Skipped (dice <= {DICE_THRESHOLD_LOW}): {skipped_low} samples")
-
+    print(f"\n=== Summary ===")
+    print(f"  Saved: {saved_count} embeddings (dice > {args.dice_threshold})")
+    print(f"  Skipped: {skipped_count} embeddings (dice <= {args.dice_threshold})")
+    print(f"  Output directory: {args.output_dir}")
     print("\nDone!")
 
 

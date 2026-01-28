@@ -314,84 +314,57 @@ class SAM2EmbDataset(Dataset):
     """
     Dataset for SAM2 pre-computed embeddings with high-resolution features.
 
+    Scans a directory recursively for .npz files and extracts all labels from each mask.
+    Embeddings are pre-filtered during generation (only dice > threshold are saved).
+
     NPZ format:
     - image_embed: (256, 64, 64) - main image embedding
     - high_res_feat_0: (32, 256, 256) - high-res feature level 0
     - high_res_feat_1: (64, 128, 128) - high-res feature level 1
-    - mask: (1, H, W) - ground truth mask
+    - mask: (1, H, W) - ground truth mask with all labels
     - ori_size: (H, W) - original image size
-
-    Supports:
-    - Dynamic dice threshold filtering (using all_entries from pickle)
-    - Sample limitation with repetition for small datasets
     """
     def __init__(self,
                  data_root,
-                 sub_set="all",
                  resize_mask=False,
-                 mask_size=256,
-                 dice_threshold_low=None,
-                 dice_threshold_high=None,
-                 min_samples_per_epoch=5000):
+                 mask_size=256):
         """
         Args:
-            data_root (str): Path to pickle file containing embedding file list.
-            sub_set (str): Subset to use: "40_up", "40_down", "all", or "custom".
-                          Use "custom" with dice thresholds for dynamic filtering.
+            data_root (str): Directory containing .npz embedding files (searched recursively).
             resize_mask (bool): If True, resize mask to mask_size.
             mask_size (int): Target mask size. Default 256.
-            dice_threshold_low (float): Min dice threshold for custom filtering.
-                                       Only used when sub_set="custom".
-            dice_threshold_high (float): Max dice threshold for custom filtering.
-                                        If None, no upper limit. Only used when sub_set="custom".
-            min_samples_per_epoch (int): Minimum samples per epoch. If dataset has fewer
-                                        samples, entries are repeated to reach this number.
-                                        Set to 0 to disable. Default 5000.
         """
         super().__init__()
         self.data_root = data_root
 
-        with open(self.data_root, "rb") as f:
-            file_lists = pickle.load(f)
+        # Scan directory recursively for .npz files
+        npz_files = sorted(glob.glob(os.path.join(data_root, "**", "*.npz"), recursive=True))
+        if not npz_files:
+            raise ValueError(f"No .npz files found in {data_root}")
 
-        # Get the file list based on sub_set
-        if sub_set == "40_up":
-            self.file_list = file_lists.get("train_40_up", [])
-        elif sub_set == "40_down":
-            self.file_list = file_lists.get("train_40_down", [])
-        elif sub_set == "all":
-            self.file_list = file_lists.get("train_40_up", []) + file_lists.get("train_40_down", [])
-        elif sub_set == "custom":
-            # Use all_entries with custom dice threshold filtering
-            all_entries = file_lists.get("all_entries", [])
-            if not all_entries:
-                raise ValueError("Pickle file does not contain 'all_entries' for custom filtering")
+        # Build file list with (path, label) pairs by scanning each file's mask
+        self.file_list = []
+        print(f"Scanning {len(npz_files)} embedding files for labels...")
+        for npz_path in npz_files:
+            try:
+                npz_data = np.load(npz_path)
+                mask = npz_data["mask"]
+                # Get unique labels (excluding background 0)
+                labels = np.unique(mask)
+                labels = labels[labels != 0]
+                for label in labels:
+                    self.file_list.append({
+                        "emb_path": npz_path,
+                        "labels": int(label),
+                    })
+            except Exception as e:
+                print(f"Warning: Failed to load {npz_path}: {e}")
+                continue
 
-            self.file_list = []
-            for entry in all_entries:
-                dice = entry.get("dice", 1.0)  # Default to 1.0 if no dice score
-                # Apply threshold filtering
-                if dice_threshold_low is not None and dice <= dice_threshold_low:
-                    continue
-                if dice_threshold_high is not None and dice > dice_threshold_high:
-                    continue
-                # Add entry in compatible format
-                self.file_list.append({
-                    "emb_path": entry["emb_path"],
-                    "labels": entry["labels"],
-                })
-        else:
-            raise ValueError(f"Unknown subset: {sub_set}")
+        if not self.file_list:
+            raise ValueError(f"No valid embeddings found in {data_root}")
 
-        # Store original list length before repetition
-        self.original_length = len(self.file_list)
-
-        # Apply sample limitation with repetition
-        self.min_samples_per_epoch = min_samples_per_epoch
-        if min_samples_per_epoch > 0 and len(self.file_list) > 0 and len(self.file_list) < min_samples_per_epoch:
-            # Calculate how many times to repeat
-            repeat_times = (min_samples_per_epoch + len(self.file_list) - 1) // len(self.file_list)
-            self.file_list = self.file_list * repeat_times
+        print(f"Found {len(self.file_list)} (embedding, label) pairs from {len(npz_files)} files")
 
         self.cur_name = ""
         self.resize_mask = resize_mask
