@@ -1,12 +1,12 @@
 #!/bin/bash --login
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=128G
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=512G
 #SBATCH --job-name=SAMRI2_S1
 #SBATCH --time=2-00:00:00
 #SBATCH --partition=gpu_rocm        # gpu_rocm      gpu_rocm    gpu_cuda
-#SBATCH --gres=gpu:mi300x:6         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2 
+#SBATCH --gres=gpu:mi300x:8         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2 
 #SBATCH --account=a_ai_collab
 #SBATCH --qos=sdf                   # sdf           gpu         gpu
 #SBATCH -o /home/s4670484/Documents/SAMRI2_log/slurm-samri2phase1-%j.output
