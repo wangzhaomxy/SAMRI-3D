@@ -23,26 +23,26 @@ Pickle output format (embedding_list.pkl):
 
 Usage:
   1. Generate SAM2 embeddings:
-  python generate_sam2_embeddings.py \
-      --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-      --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
-      --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/*/training/ \
-      --output-dir /scratch/project/samri/SAM2_embeddings/ \
-      --save-pickle-list
+python generate_sam2_embeddings.py \
+--sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+--ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+--data-paths /scratch/project/samri/Datasets/SAMRI_train_test/*/training/ \
+--output-dir /scratch/project/samri/SAM2_embeddings/ \
+--save-pickle-list
 
   2. Train with SAM2 embeddings:
-  python train_stage_one_slicewise.py \
-      --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-      --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
-      --use-embeddings \
-      --sam2-embeddings \
-      --embedding-file /scratch/project/samri/SAM2_embeddings/embedding_list.pkl \
-      --save-path /scratch/project/samri/Model_save/samri2_stage1/
+python train_stage_one_slicewise.py \
+--sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+--ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+--use-embeddings \
+--sam2-embeddings \
+--embedding-file /scratch/project/samri/SAM2_embeddings/embedding_list.pkl \
+--save-path /scratch/project/samri/Model_save/samri2_stage1/
 
   3. Modify training list (remove failed entries, re-filter):
-  python generate_sam2_embeddings.py --modify-list embedding_list.pkl \
-      --remove-ids "dataset_file_1,dataset_file_2" \
-      --output modified_list.pkl
+python generate_sam2_embeddings.py --modify-list embedding_list.pkl \
+--remove-ids "dataset_file_1,dataset_file_2" \
+--output modified_list.pkl
 """
 
 import os
