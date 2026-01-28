@@ -30,7 +30,16 @@ python generate_sam2_embeddings.py \
 --output-dir /scratch/project/samri/SAM2_embeddings/ \
 --save-pickle-list
 
-  1b. Fast generation (no compression, skip dice eval, more workers):
+  1b. Balanced (good GPU utilization + dice scores):
+python generate_sam2_embeddings.py \
+--sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+--ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+--data-paths /scratch/project/samri/Datasets/SAMRI_train_test/*/training/ \
+--output-dir /scratch/project/samri/SAM2_embeddings/ \
+--save-pickle-list \
+--num-workers 8 --prefetch-size 16
+
+  1c. Maximum speed (skip dice eval, no compression):
 python generate_sam2_embeddings.py \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
 --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
@@ -38,6 +47,12 @@ python generate_sam2_embeddings.py \
 --output-dir /scratch/project/samri/SAM2_embeddings/ \
 --save-pickle-list \
 --num-workers 8 --prefetch-size 16 --no-compress --skip-dice-eval
+
+Performance options:
+  --num-workers N      Workers for parallel file I/O (default: 4)
+  --prefetch-size N    Images to prefetch in background (default: 8)
+  --no-compress        Disable NPZ compression for faster saves (~3-5x faster, larger files)
+  --skip-dice-eval     Skip dice evaluation (dice will be 1.0, fastest mode)
 
   2. Train with SAM2 embeddings:
 python train_stage_one_slicewise.py \
