@@ -22,13 +22,22 @@ Pickle output format (embedding_list.pkl):
 - 'metadata': Generation metadata (config, thresholds, timestamps, etc.)
 
 Usage:
-  1. Generate SAM2 embeddings:
+  1. Generate SAM2 embeddings (default settings):
 python generate_sam2_embeddings.py \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
 --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
 --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/*/training/ \
 --output-dir /scratch/project/samri/SAM2_embeddings/ \
 --save-pickle-list
+
+  1b. Fast generation (no compression, skip dice eval, more workers):
+python generate_sam2_embeddings.py \
+--sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+--ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+--data-paths /scratch/project/samri/Datasets/SAMRI_train_test/*/training/ \
+--output-dir /scratch/project/samri/SAM2_embeddings/ \
+--save-pickle-list \
+--num-workers 8 --prefetch-size 16 --no-compress --skip-dice-eval
 
   2. Train with SAM2 embeddings:
 python train_stage_one_slicewise.py \
@@ -53,6 +62,7 @@ import numpy as np
 import glob
 import nibabel as nib
 import pickle
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -89,6 +99,16 @@ def parse_args():
                         help="Device to use (cuda or cpu)")
     parser.add_argument("--batch-size", type=int, default=1,
                         help="Batch size for processing (currently only 1 supported)")
+
+    # Performance options
+    parser.add_argument("--num-workers", type=int, default=4,
+                        help="Number of workers for parallel file I/O (default: 4)")
+    parser.add_argument("--no-compress", action="store_true",
+                        help="Disable NPZ compression for faster saving (larger files)")
+    parser.add_argument("--prefetch-size", type=int, default=8,
+                        help="Number of images to prefetch in background (default: 8)")
+    parser.add_argument("--skip-dice-eval", action="store_true",
+                        help="Skip dice evaluation for faster generation (dice will be set to 1.0)")
 
     # Output options
     parser.add_argument("--save-pickle-list", action="store_true",
@@ -228,9 +248,132 @@ def generate_entry_id(dataset, filename, label):
     return f"{dataset}__{clean_name}__label{label}"
 
 
-def process_dataset(predictor, data_paths, image_key, mask_key, output_dir):
+def load_image_mask_pair(args_tuple):
+    """
+    Load and preprocess an image-mask pair (for parallel loading).
+
+    Args:
+        args_tuple: Tuple of (img_path, mask_path)
+
+    Returns:
+        dict: Loaded and preprocessed data
+    """
+    img_path, mask_path = args_tuple
+    img_nii = load_nii(img_path)
+    mask_nii = load_nii(mask_path)
+    img = preprocess_image(img_nii)
+
+    # Prepare mask (ensure it's in the right format)
+    if mask_nii.ndim == 2:
+        mask_2d = mask_nii
+        mask_nii = mask_nii[np.newaxis, ...]  # (H, W) -> (1, H, W)
+    elif mask_nii.ndim == 3 and mask_nii.shape[0] != 1:
+        # Assume it's (H, W, 1) or similar
+        mask_nii = mask_nii.transpose(2, 0, 1)
+        mask_2d = mask_nii[0]
+    else:
+        mask_2d = mask_nii[0] if mask_nii.ndim == 3 else mask_nii
+
+    return {
+        'img': img,
+        'mask_nii': mask_nii,
+        'mask_2d': mask_2d,
+        'img_path': img_path,
+        'mask_path': mask_path,
+    }
+
+
+def save_embedding_async(save_args):
+    """
+    Save embedding to NPZ file (for async saving).
+
+    Args:
+        save_args: Dict with output_path, features, mask_nii, compress flag
+    """
+    output_path = save_args['output_path']
+    features = save_args['features']
+    mask_nii = save_args['mask_nii']
+    compress = save_args['compress']
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    save_fn = np.savez_compressed if compress else np.savez
+    save_fn(
+        output_path,
+        image_embed=features['image_embed'],
+        high_res_feat_0=features['high_res_feat_0'],
+        high_res_feat_1=features['high_res_feat_1'],
+        mask=mask_nii.astype(np.int16),
+        ori_size=np.array(features['orig_hw']),
+    )
+    return output_path
+
+
+def prefetch_data_generator(file_pairs, num_workers, prefetch_size):
+    """
+    Generator that prefetches data using a thread pool.
+
+    Args:
+        file_pairs: List of (img_path, mask_path) tuples
+        num_workers: Number of worker threads
+        prefetch_size: Number of items to prefetch
+
+    Yields:
+        Preprocessed data dictionaries
+    """
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        # Submit initial batch
+        futures = {}
+        for i, pair in enumerate(file_pairs[:prefetch_size]):
+            future = executor.submit(load_image_mask_pair, pair)
+            futures[future] = i
+
+        next_idx = prefetch_size
+        results = {}
+        expected_idx = 0
+
+        while futures or expected_idx < len(file_pairs):
+            # Wait for any future to complete
+            if futures:
+                done_futures = []
+                for future in list(futures.keys()):
+                    if future.done():
+                        done_futures.append(future)
+
+                if not done_futures:
+                    # Wait for at least one to complete
+                    import concurrent.futures
+                    done, _ = concurrent.futures.wait(futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED)
+                    done_futures = list(done)
+
+                for future in done_futures:
+                    idx = futures.pop(future)
+                    try:
+                        results[idx] = future.result()
+                    except Exception as e:
+                        print(f"Error loading file pair {idx}: {e}")
+                        results[idx] = None
+
+                    # Submit next item if available
+                    if next_idx < len(file_pairs):
+                        new_future = executor.submit(load_image_mask_pair, file_pairs[next_idx])
+                        futures[new_future] = next_idx
+                        next_idx += 1
+
+            # Yield results in order
+            while expected_idx in results:
+                result = results.pop(expected_idx)
+                expected_idx += 1
+                if result is not None:
+                    yield result
+
+
+def process_dataset(predictor, data_paths, image_key, mask_key, output_dir,
+                    num_workers=4, compress=True, prefetch_size=8, skip_dice_eval=False):
     """
     Process all images in the dataset, generate embeddings, and evaluate dice scores.
+
+    Uses parallel file I/O and async saving for better GPU utilization.
 
     Args:
         predictor: SAM2ImagePredictor for mask prediction and feature extraction
@@ -238,6 +381,10 @@ def process_dataset(predictor, data_paths, image_key, mask_key, output_dir):
         image_key: Glob pattern for images
         mask_key: Glob pattern for masks
         output_dir: Output directory
+        num_workers: Number of workers for parallel I/O (default: 4)
+        compress: Whether to use compression for NPZ files (default: True)
+        prefetch_size: Number of images to prefetch (default: 8)
+        skip_dice_eval: Skip dice evaluation for faster generation (default: False)
 
     Returns:
         list: List of dictionaries with embedding info, dice scores, and metadata
@@ -261,16 +408,27 @@ def process_dataset(predictor, data_paths, image_key, mask_key, output_dir):
         print(f"Matched {len(img_files)} image-mask pairs")
 
     print(f"Processing {len(img_files)} images...")
+    print(f"  Parallel workers: {num_workers}")
+    print(f"  Prefetch size: {prefetch_size}")
+    print(f"  Compression: {'enabled' if compress else 'disabled'}")
+    print(f"  Dice evaluation: {'disabled' if skip_dice_eval else 'enabled'}")
 
     embedding_list = []
+    file_pairs = list(zip(img_files, mask_files))
 
-    for img_path, mask_path in tqdm(zip(img_files, mask_files), total=len(img_files)):
-        # Load image and mask
-        img_nii = load_nii(img_path)
-        mask_nii = load_nii(mask_path)
+    # Create thread pool for async saving
+    save_executor = ThreadPoolExecutor(max_workers=num_workers)
+    save_futures = []
 
-        # Preprocess image
-        img = preprocess_image(img_nii)
+    # Process with prefetching
+    pbar = tqdm(total=len(file_pairs))
+
+    for data in prefetch_data_generator(file_pairs, num_workers, prefetch_size):
+        img = data['img']
+        mask_nii = data['mask_nii']
+        mask_2d = data['mask_2d']
+        img_path = data['img_path']
+        mask_path = data['mask_path']
 
         # Set image for predictor (this also extracts features internally)
         predictor.set_image(img)
@@ -283,17 +441,6 @@ def process_dataset(predictor, data_paths, image_key, mask_key, output_dir):
             'orig_hw': predictor._orig_hw[0],
         }
 
-        # Prepare mask (ensure it's in the right format)
-        if mask_nii.ndim == 2:
-            mask_2d = mask_nii
-            mask_nii = mask_nii[np.newaxis, ...]  # (H, W) -> (1, H, W)
-        elif mask_nii.ndim == 3 and mask_nii.shape[0] != 1:
-            # Assume it's (H, W, 1) or similar
-            mask_nii = mask_nii.transpose(2, 0, 1)
-            mask_2d = mask_nii[0]
-        else:
-            mask_2d = mask_nii[0] if mask_nii.ndim == 3 else mask_nii
-
         # Create output filename
         base_name = os.path.basename(img_path)
         base_name = os.path.splitext(base_name)[0]
@@ -302,7 +449,6 @@ def process_dataset(predictor, data_paths, image_key, mask_key, output_dir):
         output_name = f"{base_name}_sam2emb.npz"
 
         # Determine output subdirectory (preserve dataset structure)
-        # Find which data_path this file came from
         rel_path = None
         for dp in data_paths:
             if img_path.startswith(dp):
@@ -314,18 +460,16 @@ def process_dataset(predictor, data_paths, image_key, mask_key, output_dir):
         else:
             out_subdir = output_dir
 
-        os.makedirs(out_subdir, exist_ok=True)
         output_path = os.path.join(out_subdir, output_name)
 
-        # Save embedding
-        np.savez_compressed(
-            output_path,
-            image_embed=features['image_embed'],
-            high_res_feat_0=features['high_res_feat_0'],
-            high_res_feat_1=features['high_res_feat_1'],
-            mask=mask_nii.astype(np.int16),
-            ori_size=np.array(features['orig_hw']),
-        )
+        # Submit async save
+        save_future = save_executor.submit(save_embedding_async, {
+            'output_path': output_path,
+            'features': features,
+            'mask_nii': mask_nii,
+            'compress': compress,
+        })
+        save_futures.append(save_future)
 
         # Extract dataset name for metadata
         dataset_name = extract_dataset_name(img_path, data_paths)
@@ -338,20 +482,26 @@ def process_dataset(predictor, data_paths, image_key, mask_key, output_dir):
             # Create binary mask for this label
             gt_mask = (mask_2d == label).astype(np.float32)
 
-            # Get bounding box from ground truth mask
-            bbox = get_bbox_from_mask(gt_mask)
-            if bbox is None:
-                continue
+            if skip_dice_eval:
+                # Skip dice evaluation for faster generation
+                dsc = 1.0
+                iou_pred = 1.0
+            else:
+                # Get bounding box from ground truth mask
+                bbox = get_bbox_from_mask(gt_mask)
+                if bbox is None:
+                    continue
 
-            # Predict mask using box prompt
-            masks, iou_preds, _ = predictor.predict(
-                box=bbox,
-                multimask_output=False,
-            )
+                # Predict mask using box prompt
+                masks, iou_preds, _ = predictor.predict(
+                    box=bbox,
+                    multimask_output=False,
+                )
 
-            # Calculate dice score
-            pred_mask = masks[0] > 0  # Binary mask
-            dsc = dice_score(gt_mask, pred_mask.astype(np.float32))
+                # Calculate dice score
+                pred_mask = masks[0] > 0  # Binary mask
+                dsc = dice_score(gt_mask, pred_mask.astype(np.float32))
+                iou_pred = float(iou_preds[0])
 
             # Generate unique ID for this entry
             entry_id = generate_entry_id(dataset_name, base_name, int(label))
@@ -364,8 +514,22 @@ def process_dataset(predictor, data_paths, image_key, mask_key, output_dir):
                 'dataset': dataset_name,
                 'labels': int(label),
                 'dice': float(dsc),
-                'iou_pred': float(iou_preds[0]),  # SAM2's predicted IoU
+                'iou_pred': iou_pred,
             })
+
+        pbar.update(1)
+
+    pbar.close()
+
+    # Wait for all saves to complete
+    print("Waiting for file saves to complete...")
+    for future in tqdm(as_completed(save_futures), total=len(save_futures), desc="Saving"):
+        try:
+            future.result()  # This will raise any exceptions
+        except Exception as e:
+            print(f"Error saving file: {e}")
+
+    save_executor.shutdown(wait=True)
 
     return embedding_list
 
@@ -573,13 +737,17 @@ def main():
     print(f"Processing data from: {args.data_paths}")
     print(f"Output directory: {args.output_dir}")
 
-    # Process dataset
+    # Process dataset with parallel I/O
     embedding_list = process_dataset(
         predictor=predictor,
         data_paths=args.data_paths,
         image_key=args.image_key,
         mask_key=args.mask_key,
         output_dir=args.output_dir,
+        num_workers=args.num_workers,
+        compress=not args.no_compress,
+        prefetch_size=args.prefetch_size,
+        skip_dice_eval=args.skip_dice_eval,
     )
 
     print(f"Generated {len(embedding_list)} embedding entries")
