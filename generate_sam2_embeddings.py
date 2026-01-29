@@ -20,9 +20,27 @@ python generate_sam2_embeddings.py \
 --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
 --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/*/training/ \
 --output-dir /scratch/project/samri/SAM2_embeddings/ \
+--num-workers 12 --prefetch-size 24
+--skip-existing
+
+  2. Resume after crash (enabled by default, automatically skips existing embeddings):
+python generate_sam2_embeddings.py \
+--sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+--ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+--data-paths /scratch/project/samri/Datasets/SAMRI_train_test/*/training/ \
+--output-dir /scratch/project/samri/SAM2_embeddings/ \
 --num-workers 8 --prefetch-size 16
 
-  2. Custom dice threshold (default is 0.4):
+  3. Force reprocessing all images (ignore existing embeddings):
+python generate_sam2_embeddings.py \
+--sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+--ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+--data-paths /scratch/project/samri/Datasets/SAMRI_train_test/*/training/ \
+--output-dir /scratch/project/samri/SAM2_embeddings/ \
+--no-skip-existing \
+--num-workers 8 --prefetch-size 16
+
+  4. Custom dice threshold (default is 0.4):
 python generate_sam2_embeddings.py \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
 --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
@@ -30,8 +48,9 @@ python generate_sam2_embeddings.py \
 --output-dir /scratch/project/samri/SAM2_embeddings/ \
 --dice-threshold 0.5 \
 --num-workers 8 --prefetch-size 16
+--skip-existing
 
-  3. Train with SAM2 embeddings (all embeddings in folder):
+  5. Train with SAM2 embeddings (all embeddings in folder):
 python train_stage_one_slicewise.py \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
 --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
@@ -44,6 +63,10 @@ Performance options:
   --prefetch-size N    Images to prefetch in background (default: 8)
   --no-compress        Disable NPZ compression for faster saves (~3-5x faster, larger files)
   --dice-threshold     Minimum dice score to save embedding (default: 0.4)
+
+Resume options:
+  --skip-existing      Skip images that already have embeddings (default: enabled)
+  --no-skip-existing   Force reprocessing of all images, even if embeddings exist
 """
 
 import os
@@ -96,6 +119,12 @@ def parse_args():
                         help="Number of images to prefetch in background (default: 8)")
     parser.add_argument("--dice-threshold", type=float, default=DICE_THRESHOLD,
                         help=f"Minimum dice score to save embedding (default: {DICE_THRESHOLD})")
+
+    # Resume options
+    parser.add_argument("--skip-existing", action="store_true", default=True,
+                        help="Skip images that already have embeddings (default: enabled)")
+    parser.add_argument("--no-skip-existing", action="store_true",
+                        help="Force reprocessing of all images, even if embeddings exist")
 
     return parser.parse_args()
 
@@ -207,6 +236,54 @@ def generate_entry_id(dataset, filename, label):
     clean_name = filename.replace('.nii.gz', '').replace('.nii', '')
     clean_name = clean_name.replace('.mha', '').replace('.mhd', '').replace('.nrrd', '')
     return f"{dataset}__{clean_name}__label{label}"
+
+
+def get_existing_embeddings(output_dir):
+    """
+    Scan output directory for existing embedding files.
+
+    Args:
+        output_dir: Root output directory containing dataset subdirectories
+
+    Returns:
+        set: Set of (dataset_name, base_name) tuples for existing embeddings
+    """
+    existing = set()
+    if not os.path.exists(output_dir):
+        return existing
+
+    # Recursively find all .npz files
+    npz_files = glob.glob(os.path.join(output_dir, "**", "*_sam2emb.npz"), recursive=True)
+
+    for npz_path in npz_files:
+        # Extract dataset name from parent directory
+        dataset_name = os.path.basename(os.path.dirname(npz_path))
+
+        # Extract base name from filename (remove _sam2emb.npz suffix)
+        filename = os.path.basename(npz_path)
+        base_name = filename.replace("_sam2emb.npz", "")
+
+        existing.add((dataset_name, base_name))
+
+    return existing
+
+
+def get_base_name_from_image_path(img_path):
+    """
+    Extract base name from image path for matching with existing embeddings.
+
+    Args:
+        img_path: Full path to the image file
+
+    Returns:
+        str: Base name without extension
+    """
+    base_name = os.path.basename(img_path)
+    # Remove common extensions
+    base_name = os.path.splitext(base_name)[0]
+    if base_name.endswith('.nii'):
+        base_name = base_name[:-4]
+    return base_name
 
 
 def load_image_mask_pair(args_tuple):
@@ -330,7 +407,8 @@ def prefetch_data_generator(file_pairs, num_workers, prefetch_size):
 
 
 def process_dataset(predictor, data_paths, image_key, mask_key, output_dir,
-                    num_workers=4, compress=True, prefetch_size=8, dice_threshold=0.4):
+                    num_workers=4, compress=True, prefetch_size=8, dice_threshold=0.4,
+                    skip_existing=True):
     """
     Process all images in the dataset, generate embeddings, and evaluate dice scores.
 
@@ -347,9 +425,10 @@ def process_dataset(predictor, data_paths, image_key, mask_key, output_dir,
         compress: Whether to use compression for NPZ files (default: True)
         prefetch_size: Number of images to prefetch (default: 8)
         dice_threshold: Minimum dice score to save embedding (default: 0.4)
+        skip_existing: If True, skip images that already have embeddings (default: True)
 
     Returns:
-        tuple: (saved_count, skipped_count)
+        tuple: (saved_count, skipped_count, already_exist_count)
     """
     # Collect all image and mask files
     img_files = []
@@ -368,6 +447,31 @@ def process_dataset(predictor, data_paths, image_key, mask_key, output_dir,
         img_files = [img_dict[k] for k in sorted(common_keys)]
         mask_files = [mask_dict[k] for k in sorted(common_keys)]
         print(f"Matched {len(img_files)} image-mask pairs")
+
+    print(f"Found {len(img_files)} images...")
+
+    # Check for existing embeddings if skip_existing is enabled
+    already_exist_count = 0
+    if skip_existing:
+        print("Scanning for existing embeddings...")
+        existing_embeddings = get_existing_embeddings(output_dir)
+        print(f"  Found {len(existing_embeddings)} existing embeddings")
+
+        # Filter out already-processed images
+        filtered_img_files = []
+        filtered_mask_files = []
+        for img_path, mask_path in zip(img_files, mask_files):
+            dataset_name = extract_dataset_name(img_path, data_paths)
+            base_name = get_base_name_from_image_path(img_path)
+            if (dataset_name, base_name) not in existing_embeddings:
+                filtered_img_files.append(img_path)
+                filtered_mask_files.append(mask_path)
+            else:
+                already_exist_count += 1
+
+        img_files = filtered_img_files
+        mask_files = filtered_mask_files
+        print(f"  Skipping {already_exist_count} already-processed images")
 
     print(f"Processing {len(img_files)} images...")
     print(f"  Parallel workers: {num_workers}")
@@ -471,7 +575,7 @@ def process_dataset(predictor, data_paths, image_key, mask_key, output_dir,
 
     save_executor.shutdown(wait=True)
 
-    return saved_count, skipped_count
+    return saved_count, skipped_count, already_exist_count
 
 
 def main():
@@ -503,8 +607,11 @@ def main():
     print(f"Processing data from: {args.data_paths}")
     print(f"Output directory: {args.output_dir}")
 
+    # Determine skip_existing flag (--no-skip-existing overrides default)
+    skip_existing = args.skip_existing and not args.no_skip_existing
+
     # Process dataset with parallel I/O
-    saved_count, skipped_count = process_dataset(
+    saved_count, skipped_count, already_exist_count = process_dataset(
         predictor=predictor,
         data_paths=args.data_paths,
         image_key=args.image_key,
@@ -514,11 +621,14 @@ def main():
         compress=not args.no_compress,
         prefetch_size=args.prefetch_size,
         dice_threshold=args.dice_threshold,
+        skip_existing=skip_existing,
     )
 
     print(f"\n=== Summary ===")
     print(f"  Saved: {saved_count} embeddings (dice > {args.dice_threshold})")
-    print(f"  Skipped: {skipped_count} embeddings (dice <= {args.dice_threshold})")
+    print(f"  Skipped (low dice): {skipped_count} embeddings (dice <= {args.dice_threshold})")
+    if skip_existing:
+        print(f"  Skipped (existing): {already_exist_count} embeddings already processed")
     print(f"  Output directory: {args.output_dir}")
     print("\nDone!")
 
