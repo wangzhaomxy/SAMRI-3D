@@ -820,78 +820,78 @@ def predict_one_label_3d(
 
     N, H, W = vol_shape
 
-    # Initialize and propagate video 1
+    # Suppress all SAM2 output (tqdm bars, prints) to keep dataset-level tqdm clean
     with suppress_sam2_output(True):
+        # Initialize video 1
         st1 = init_state_compat(predictor, prepared.v1_source, prepared.v1_len, prefer_streaming=prepared.use_streaming)
 
-    # Add prompt
-    try:
-        predictor.add_new_points_or_box(
-            inference_state=st1,
-            frame_idx=0,
-            obj_id=lb,
-            box=box,
-        )
-    except TypeError:
-        predictor.add_new_points_or_box(
-            inference_state=st1,
-            frame_idx=0,
-            obj_id=lb,
-            points=None,
-            labels=None,
-            box=box,
-        )
+        # Add prompt
+        try:
+            predictor.add_new_points_or_box(
+                inference_state=st1,
+                frame_idx=0,
+                obj_id=lb,
+                box=box,
+            )
+        except TypeError:
+            predictor.add_new_points_or_box(
+                inference_state=st1,
+                frame_idx=0,
+                obj_id=lb,
+                points=None,
+                labels=None,
+                box=box,
+            )
 
-    # Propagate video 1
-    pred1: Dict[int, np.ndarray] = {}
-    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(st1):
-        fi = int(out_frame_idx)
-        for j, o in enumerate(out_obj_ids):
-            if int(o) == lb:
-                logits = out_mask_logits[j]
-                if hasattr(logits, "detach"):
-                    logits = logits.detach()
-                m = (logits > 0.0)
-                if hasattr(m, "cpu"):
-                    m = m.cpu().numpy()
-                pred1[fi] = np.squeeze(m).astype(np.uint8)
-                break
+        # Propagate video 1
+        pred1: Dict[int, np.ndarray] = {}
+        for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(st1):
+            fi = int(out_frame_idx)
+            for j, o in enumerate(out_obj_ids):
+                if int(o) == lb:
+                    logits = out_mask_logits[j]
+                    if hasattr(logits, "detach"):
+                        logits = logits.detach()
+                    m = (logits > 0.0)
+                    if hasattr(m, "cpu"):
+                        m = m.cpu().numpy()
+                    pred1[fi] = np.squeeze(m).astype(np.uint8)
+                    break
 
-    # Initialize and propagate video 2
-    with suppress_sam2_output(True):
+        # Initialize video 2
         st2 = init_state_compat(predictor, prepared.v2_source, prepared.v2_len, prefer_streaming=prepared.use_streaming)
 
-    try:
-        predictor.add_new_points_or_box(
-            inference_state=st2,
-            frame_idx=0,
-            obj_id=lb,
-            box=box,
-        )
-    except TypeError:
-        predictor.add_new_points_or_box(
-            inference_state=st2,
-            frame_idx=0,
-            obj_id=lb,
-            points=None,
-            labels=None,
-            box=box,
-        )
+        try:
+            predictor.add_new_points_or_box(
+                inference_state=st2,
+                frame_idx=0,
+                obj_id=lb,
+                box=box,
+            )
+        except TypeError:
+            predictor.add_new_points_or_box(
+                inference_state=st2,
+                frame_idx=0,
+                obj_id=lb,
+                points=None,
+                labels=None,
+                box=box,
+            )
 
-    # Propagate video 2
-    pred2: Dict[int, np.ndarray] = {}
-    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(st2):
-        fi = int(out_frame_idx)
-        for j, o in enumerate(out_obj_ids):
-            if int(o) == lb:
-                logits = out_mask_logits[j]
-                if hasattr(logits, "detach"):
-                    logits = logits.detach()
-                m = (logits > 0.0)
-                if hasattr(m, "cpu"):
-                    m = m.cpu().numpy()
-                pred2[fi] = np.squeeze(m).astype(np.uint8)
-                break
+        # Propagate video 2
+        pred2: Dict[int, np.ndarray] = {}
+        for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(st2):
+            fi = int(out_frame_idx)
+            for j, o in enumerate(out_obj_ids):
+                if int(o) == lb:
+                    logits = out_mask_logits[j]
+                    if hasattr(logits, "detach"):
+                        logits = logits.detach()
+                    m = (logits > 0.0)
+                    if hasattr(m, "cpu"):
+                        m = m.cpu().numpy()
+                    pred2[fi] = np.squeeze(m).astype(np.uint8)
+                    break
 
     # Merge predictions
     pred0 = np.zeros((N, H, W), dtype=np.uint8)
