@@ -19,87 +19,113 @@ Based on SAMRI v1 training approach adapted for SAM2 architecture.
 
 Option A: Pre-computed Embeddings (recommended for large-scale training)
   Step 1: Generate embeddings (only dice > 0.4 are saved)
-    python generate_sam2_embeddings.py \\
-        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-        --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
-        --data-paths /scratch/project/samri/Datasets/*/training/ \\
-        --output-dir /scratch/project/samri/SAM2_embeddings/ \\
+    python generate_sam2_embeddings.py \
+        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+        --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+        --data-paths /scratch/project/samri/Datasets/*/training/ \
+        --output-dir /scratch/project/samri/SAM2_embeddings/ \
         --num-workers 8 --prefetch-size 16
 
   Step 2: Train on embeddings
-    python train_stage_one_slicewise.py \\
-        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-        --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
-        --use-embeddings --sam2-embeddings \\
-        --embedding-dir /scratch/project/samri/SAM2_embeddings/ \\
+    python train_stage_one_slicewise.py \
+        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+        --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+        --use-embeddings --sam2-embeddings \
+        --embedding-dir /scratch/project/samri/SAM2_embeddings/ \
         --save-path /scratch/project/samri/Model_save/samri2_stage1/
 
 Option B: Filtered Training List (recommended for flexible filtering)
   Step 1: Generate training list with dice scores
-    python gen_training_list.py \\
-        --mode 2d \\
-        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-        --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
-        --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/ \\
-        --save-path /scratch/project/samri/training_lists/training_list_2d.pkl \\
+    python gen_training_list.py \
+        --mode 2d \
+        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+        --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+        --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/ \
+        --save-path /scratch/project/samri/training_lists/training_list_2d.pkl \
         --num-workers 8
 
   Step 2: Train with filtered samples
-    python train_stage_one_slicewise.py \\
-        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-        --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
-        --training-list /scratch/project/samri/training_lists/training_list_2d.pkl \\
-        --dice-threshold 0.4 \\
+    python train_stage_one_slicewise.py \
+        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+        --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+        --training-list /scratch/project/samri/training_lists/training_list_2d.pkl \
+        --dice-threshold 0.4 \
         --save-path /scratch/project/samri/Model_save/samri2_filtered/
 
 === CLI Examples ===
 
-1. Training from Pre-computed Embeddings (fastest):
-   python train_stage_one_slicewise.py \\
-       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
-       --use-embeddings --sam2-embeddings \\
-       --embedding-dir /scratch/project/samri/SAM2_embeddings/ \\
-       --save-path /scratch/project/samri/Model_save/samri2_stage1_emb/ \\
-       --num-epochs 100 --batch-size 8
+1. Stratified Training from Embeddings with Dice Filtering (RECOMMENDED):
+   python train_stage_one_slicewise.py \
+       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+       --use-embeddings \
+       --embedding-dir /scratch/project/samri/SAM2_embeddings/ \
+       --training-list /scratch/project/samri/training_lists/training_list_2d.pkl \
+       --dice-threshold 0.4 \
+       --samples-per-dataset 1000 \
+       --save-path /scratch/project/samri/Model_save/samri2_stratified/ \
+       --num-epochs 100 --batch-size 256
 
-2. Training from Filtered Training List:
-   python train_stage_one_slicewise.py \\
-       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
-       --training-list /scratch/project/samri/training_lists/training_list_2d.pkl \\
-       --dice-threshold 0.4 \\
-       --save-path /scratch/project/samri/Model_save/samri2_filtered/ \\
+2. Stratified Training from 2D Training List (images):
+   python train_stage_one_slicewise.py \
+       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+       --training-list /scratch/project/samri/training_lists/training_list_2d.pkl \
+       --dice-threshold 0.4 \
+       --samples-per-dataset 1000 \
+       --save-path /scratch/project/samri/Model_save/samri2_stratified/ \
        --num-epochs 100 --batch-size 4
 
-3. Training from Raw Images (slowest, no pre-filtering):
-   python train_stage_one_slicewise.py \\
-       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
-       --train-data-paths /scratch/project/samri/Datasets/Dataset1/training/ \\
-                          /scratch/project/samri/Datasets/Dataset2/training/ \\
-       --save-path /scratch/project/samri/Model_save/samri2_stage1_raw/ \\
+3. Training from Pre-computed Embeddings (all samples, no stratification):
+   python train_stage_one_slicewise.py \
+       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+       --use-embeddings --sam2-embeddings \
+       --embedding-dir /scratch/project/samri/SAM2_embeddings/ \
+       --save-path /scratch/project/samri/Model_save/samri2_stage1_emb/ \
+       --num-epochs 100 --batch-size 8
+
+4. Training from Raw Images (slowest, no pre-filtering):
+   python train_stage_one_slicewise.py \
+       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+       --train-data-paths /scratch/project/samri/Datasets/Dataset1/training/ \
+                          /scratch/project/samri/Datasets/Dataset2/training/ \
+       --save-path /scratch/project/samri/Model_save/samri2_stage1_raw/ \
        --num-epochs 100 --batch-size 4 --lr 1e-5 --prompt-mode mixed
 
 Key Arguments:
-  --use-embeddings      Use pre-computed embeddings (requires --embedding-dir)
-  --sam2-embeddings     Use SAM2-format embeddings with high-res features
-  --embedding-dir       Directory containing .npz embedding files
-  --training-list       Path to training_list_2d.pkl from gen_training_list.py
-  --dice-threshold      Minimum dice score for filtered training (default: 0.4)
-  --train-data-paths    List of NIfTI data paths (for raw image mode)
-  --prompt-mode         Prompt type: "point", "box", or "mixed" (default: box)
-  --batch-size          Batch size per GPU (default: 4)
-  --lr                  Learning rate (default: 1e-5)
-  --num-epochs          Number of training epochs (default: 100)
+  --use-embeddings        Use pre-computed embeddings (requires --embedding-dir)
+  --sam2-embeddings       Use SAM2-format embeddings with high-res features
+  --embedding-dir         Directory containing .npz embedding files
+  --training-list         Path to training_list_2d.pkl from gen_training_list.py
+  --dice-threshold        Minimum dice score for filtered training (default: 0.4)
+  --samples-per-dataset   Samples per dataset per epoch for stratified sampling (default: 1000)
+  --train-data-paths      List of NIfTI data paths (for raw image mode)
+  --prompt-mode           Prompt type: "point", "box", or "mixed" (default: box)
+  --batch-size            Batch size per GPU (default: 4)
+  --lr                    Learning rate (default: 1e-5)
+  --num-epochs            Number of training epochs (default: 100)
+  --save-every            Save checkpoint every N epochs (default: 5)
+
+Stratified Sampling Strategy:
+  When --training-list is provided, the dataset uses stratified sampling:
+  - Samples are filtered by dice score (--dice-threshold)
+  - For each dataset, N samples are randomly selected per epoch (--samples-per-dataset)
+  - If a dataset has fewer than N samples, it oversamples with replacement
+  - This ensures balanced representation across datasets regardless of their size
 """
 
 import os
 import argparse
+import pickle
+from glob import glob
+from pathlib import Path
+from collections import defaultdict
 from tqdm import tqdm
 import torch
 import numpy as np
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -111,6 +137,300 @@ from utils.dataloader import NiiDataset, BalancedEmbDataset, SAM2EmbDataset
 from utils.losses import DiceFocalLoss
 from utils.utils import gen_points, gen_bboxes, get_checkpoint
 
+try:
+    import SimpleITK as sitk
+    HAS_SITK = True
+except ImportError:
+    HAS_SITK = False
+
+
+# =============================================================================
+# Stratified Training Datasets
+# =============================================================================
+
+class StratifiedTrainingDataset(Dataset):
+    """
+    Dataset for stratified training from 2D training list with dice filtering.
+
+    Features:
+    - Filters samples by dice score threshold
+    - Stratified sampling: N samples per dataset per epoch
+    - If dataset has fewer samples, randomly oversample with replacement
+
+    Args:
+        training_list_path: Path to training_list_2d.pkl
+        dice_threshold: Minimum dice score to include (default: 0.4)
+        samples_per_dataset: Number of samples per dataset per epoch (default: 1000)
+        seed: Random seed for reproducibility
+    """
+
+    def __init__(
+        self,
+        training_list_path: str,
+        dice_threshold: float = 0.4,
+        samples_per_dataset: int = 1000,
+        seed: int = 42,
+    ):
+        super().__init__()
+        self.dice_threshold = dice_threshold
+        self.samples_per_dataset = samples_per_dataset
+        self.seed = seed
+        self.rng = np.random.RandomState(seed)
+
+        # Load training list
+        with open(training_list_path, "rb") as f:
+            all_samples = pickle.load(f)
+
+        # Filter by dice threshold and group by dataset
+        self.dataset_samples = defaultdict(list)
+        for sample in all_samples:
+            if sample["dice"] >= dice_threshold:
+                ds_name = sample["dataset"]
+                self.dataset_samples[ds_name].append(sample)
+
+        self.dataset_names = sorted(self.dataset_samples.keys())
+
+        # Print statistics
+        total_filtered = sum(len(v) for v in self.dataset_samples.values())
+        print(f"Stratified Training Dataset:")
+        print(f"  Dice threshold: {dice_threshold}")
+        print(f"  Total samples after filtering: {total_filtered}")
+        print(f"  Number of datasets: {len(self.dataset_names)}")
+        print(f"  Samples per dataset per epoch: {samples_per_dataset}")
+        for ds_name in self.dataset_names:
+            n = len(self.dataset_samples[ds_name])
+            print(f"    {ds_name}: {n} samples")
+
+        # Build initial epoch indices
+        self._build_epoch_indices()
+
+    def _build_epoch_indices(self):
+        """Build stratified indices for one epoch."""
+        self.epoch_indices = []
+        for ds_name in self.dataset_names:
+            samples = self.dataset_samples[ds_name]
+            n = len(samples)
+            if n >= self.samples_per_dataset:
+                # Random sample without replacement
+                indices = self.rng.choice(n, size=self.samples_per_dataset, replace=False)
+            else:
+                # Random sample with replacement to reach target
+                indices = self.rng.choice(n, size=self.samples_per_dataset, replace=True)
+
+            for idx in indices:
+                self.epoch_indices.append((ds_name, idx))
+
+        # Shuffle all indices
+        self.rng.shuffle(self.epoch_indices)
+
+    def reshuffle(self, epoch: int = None):
+        """Reshuffle for a new epoch."""
+        if epoch is not None:
+            self.rng = np.random.RandomState(self.seed + epoch)
+        self._build_epoch_indices()
+
+    def __len__(self):
+        return len(self.epoch_indices)
+
+    def __getitem__(self, idx):
+        ds_name, sample_idx = self.epoch_indices[idx]
+        sample = self.dataset_samples[ds_name][sample_idx]
+
+        # Load image and mask
+        img_path = sample["img_path"]
+        mask_path = sample["mask_path"]
+        label = sample["label"]
+
+        # Read NIfTI files
+        if not HAS_SITK:
+            raise RuntimeError("SimpleITK is required for StratifiedTrainingDataset")
+
+        img_sitk = sitk.ReadImage(img_path)
+        mask_sitk = sitk.ReadImage(mask_path)
+
+        img_arr = sitk.GetArrayFromImage(img_sitk)  # (D, H, W) or (H, W)
+        mask_arr = sitk.GetArrayFromImage(mask_sitk)
+
+        # For 2D training list, img_path should be 2D or we extract slice
+        if img_arr.ndim == 3:
+            # Assume slice index is encoded or use middle slice
+            # For 2D training list, each entry should be a specific slice
+            # We'll use the slice with the label
+            slice_idx = self._find_slice_with_label(mask_arr, label)
+            img_2d = img_arr[slice_idx]
+            mask_2d = (mask_arr[slice_idx] == label).astype(np.uint8)
+        else:
+            img_2d = img_arr
+            mask_2d = (mask_arr == label).astype(np.uint8)
+
+        # Normalize image to [0, 255] uint8
+        img_2d = self._normalize_to_uint8(img_2d)
+
+        # Convert to RGB (H, W, 3)
+        if img_2d.ndim == 2:
+            img_rgb = np.stack([img_2d, img_2d, img_2d], axis=-1)
+        else:
+            img_rgb = img_2d
+
+        return img_rgb, mask_2d
+
+    def _find_slice_with_label(self, mask_arr, label):
+        """Find slice with most pixels of the given label."""
+        if mask_arr.ndim == 2:
+            return 0
+        label_mask = (mask_arr == label)
+        slice_counts = label_mask.sum(axis=(1, 2))
+        return int(np.argmax(slice_counts))
+
+    def _normalize_to_uint8(self, img, p_low=0.5, p_high=99.5):
+        """Normalize image to uint8 range."""
+        img = img.astype(np.float32)
+        lo = np.percentile(img, p_low)
+        hi = np.percentile(img, p_high)
+        if hi <= lo + 1e-6:
+            lo, hi = float(img.min()), float(img.max() + 1e-6)
+        img = np.clip((img - lo) / (hi - lo), 0.0, 1.0)
+        return (img * 255.0).astype(np.uint8)
+
+
+class StratifiedEmbDataset(Dataset):
+    """
+    Dataset for stratified training from pre-computed SAM2 embeddings.
+
+    Loads embeddings grouped by dataset and applies stratified sampling
+    (N samples per dataset per epoch, with oversampling if needed).
+
+    Args:
+        embedding_dir: Directory containing .npz embedding files
+        training_list_path: Optional path to training list for dice filtering
+        dice_threshold: Minimum dice score to include (default: 0.4)
+        samples_per_dataset: Number of samples per dataset per epoch (default: 1000)
+        seed: Random seed for reproducibility
+    """
+
+    def __init__(
+        self,
+        embedding_dir: str,
+        training_list_path: str = None,
+        dice_threshold: float = 0.4,
+        samples_per_dataset: int = 1000,
+        seed: int = 42,
+    ):
+        super().__init__()
+        self.embedding_dir = embedding_dir
+        self.dice_threshold = dice_threshold
+        self.samples_per_dataset = samples_per_dataset
+        self.seed = seed
+        self.rng = np.random.RandomState(seed)
+
+        # Find all embedding files
+        emb_files = sorted(glob(os.path.join(embedding_dir, "**/*.npz"), recursive=True))
+
+        if not emb_files:
+            raise ValueError(f"No .npz files found in {embedding_dir}")
+
+        # Build mapping of valid embeddings grouped by dataset
+        self.dataset_files = defaultdict(list)
+
+        # If training list provided, use it for filtering
+        if training_list_path is not None:
+            with open(training_list_path, "rb") as f:
+                training_list = pickle.load(f)
+
+            # Create lookup: (img_path, label) -> dice
+            dice_lookup = {}
+            for sample in training_list:
+                key = (sample["img_path"], sample["label"])
+                dice_lookup[key] = sample["dice"]
+
+            for emb_file in emb_files:
+                # Extract dataset name from path
+                rel_path = os.path.relpath(emb_file, embedding_dir)
+                parts = Path(rel_path).parts
+                ds_name = parts[0] if len(parts) > 1 else "default"
+
+                # Load metadata to check dice
+                try:
+                    data = np.load(emb_file, allow_pickle=True)
+                    img_path = str(data.get("img_path", ""))
+                    label = int(data.get("label", 1))
+
+                    # Check dice threshold
+                    dice = dice_lookup.get((img_path, label), None)
+                    if dice is not None and dice >= dice_threshold:
+                        self.dataset_files[ds_name].append(emb_file)
+                except Exception:
+                    continue
+        else:
+            # No filtering, just group by dataset
+            for emb_file in emb_files:
+                rel_path = os.path.relpath(emb_file, embedding_dir)
+                parts = Path(rel_path).parts
+                ds_name = parts[0] if len(parts) > 1 else "default"
+                self.dataset_files[ds_name].append(emb_file)
+
+        self.dataset_names = sorted(self.dataset_files.keys())
+
+        # Print statistics
+        total_files = sum(len(v) for v in self.dataset_files.values())
+        print(f"Stratified Embedding Dataset:")
+        print(f"  Embedding directory: {embedding_dir}")
+        print(f"  Dice threshold: {dice_threshold}")
+        print(f"  Total embeddings after filtering: {total_files}")
+        print(f"  Number of datasets: {len(self.dataset_names)}")
+        print(f"  Samples per dataset per epoch: {samples_per_dataset}")
+        for ds_name in self.dataset_names:
+            n = len(self.dataset_files[ds_name])
+            print(f"    {ds_name}: {n} embeddings")
+
+        # Build initial epoch indices
+        self._build_epoch_indices()
+
+    def _build_epoch_indices(self):
+        """Build stratified indices for one epoch."""
+        self.epoch_files = []
+        for ds_name in self.dataset_names:
+            files = self.dataset_files[ds_name]
+            n = len(files)
+            if n >= self.samples_per_dataset:
+                indices = self.rng.choice(n, size=self.samples_per_dataset, replace=False)
+            else:
+                indices = self.rng.choice(n, size=self.samples_per_dataset, replace=True)
+
+            for idx in indices:
+                self.epoch_files.append(files[idx])
+
+        self.rng.shuffle(self.epoch_files)
+
+    def reshuffle(self, epoch: int = None):
+        """Reshuffle for a new epoch."""
+        if epoch is not None:
+            self.rng = np.random.RandomState(self.seed + epoch)
+        self._build_epoch_indices()
+
+    def __len__(self):
+        return len(self.epoch_files)
+
+    def __getitem__(self, idx):
+        emb_file = self.epoch_files[idx]
+        data = np.load(emb_file, allow_pickle=True)
+
+        # Load embeddings
+        image_embed = torch.from_numpy(data["image_embed"])  # (256, 64, 64)
+        high_res_feat_0 = torch.from_numpy(data["high_res_feat_0"])  # (32, 256, 256)
+        high_res_feat_1 = torch.from_numpy(data["high_res_feat_1"])  # (64, 128, 128)
+
+        # Load mask
+        mask = torch.from_numpy(data["mask"])  # (H, W) or (1, H, W)
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+
+        # Load original size
+        ori_h = int(data["ori_h"])
+        ori_w = int(data["ori_w"])
+
+        return image_embed, high_res_feat_0, high_res_feat_1, mask, (ori_h, ori_w)
+
 
 def variable_size_collate_fn(batch):
     """
@@ -120,6 +440,19 @@ def variable_size_collate_fn(batch):
     images = [item[0] for item in batch]
     masks = [item[1] for item in batch]
     return images, masks
+
+
+def stratified_emb_collate_fn(batch):
+    """
+    Custom collate function for StratifiedEmbDataset.
+    Stacks tensors and collects original sizes.
+    """
+    image_embeds = torch.stack([item[0] for item in batch])
+    high_res_0 = torch.stack([item[1] for item in batch])
+    high_res_1 = torch.stack([item[2] for item in batch])
+    masks = torch.stack([item[3] for item in batch])
+    ori_sizes = ([item[4][0] for item in batch], [item[4][1] for item in batch])
+    return image_embeds, high_res_0, high_res_1, masks, ori_sizes
 
 
 def parse_args():
@@ -142,6 +475,14 @@ def parse_args():
                         help="List of training data paths (for raw image mode)")
     parser.add_argument("--val-data-paths", type=str, nargs="+", default=None,
                         help="List of validation data paths (optional)")
+
+    # Training list and filtering options
+    parser.add_argument("--training-list", type=str, default=None,
+                        help="Path to training_list_2d.pkl from gen_training_list.py")
+    parser.add_argument("--dice-threshold", type=float, default=0.4,
+                        help="Minimum dice score for filtered training (default: 0.4)")
+    parser.add_argument("--samples-per-dataset", type=int, default=1000,
+                        help="Number of samples per dataset per epoch for stratified sampling (default: 1000)")
 
     # Training configuration
     parser.add_argument("--save-path", type=str, required=True,
@@ -182,11 +523,11 @@ def parse_args():
 
     # Validate arguments
     if args.use_embeddings:
-        if args.embedding_file is None:
-            parser.error("--embedding-file is required when using --use-embeddings")
-    else:
+        if args.embedding_dir is None:
+            parser.error("--embedding-dir is required when using --use-embeddings")
+    elif args.training_list is None:
         if args.train_data_paths is None:
-            parser.error("--train-data-paths is required when not using --use-embeddings")
+            parser.error("Either --training-list or --train-data-paths is required when not using --use-embeddings")
 
     return args
 
@@ -859,8 +1200,23 @@ def main(rank, world_size, args):
     )
 
     # Setup dataset and dataloader
+    use_stratified = False
+
     if args.use_embeddings:
-        if args.sam2_embeddings:
+        if args.training_list is not None:
+            # Stratified SAM2 embedding dataset with dice filtering
+            train_dataset = StratifiedEmbDataset(
+                embedding_dir=args.embedding_dir,
+                training_list_path=args.training_list,
+                dice_threshold=args.dice_threshold,
+                samples_per_dataset=args.samples_per_dataset,
+                seed=args.seed,
+            )
+            train_fn = train_epoch_sam2_embedding
+            use_stratified = True
+            if rank == 0:
+                print("Using Stratified SAM2 embeddings with dice filtering")
+        elif args.sam2_embeddings:
             # Use SAM2-format pre-computed embeddings with high-res features
             train_dataset = SAM2EmbDataset(
                 data_root=args.embedding_dir,
@@ -883,6 +1239,18 @@ def main(rank, world_size, args):
             if rank == 0:
                 print("WARNING: Using SAMRI v1 embeddings without high-res features. "
                       "This may not work with SAM2. Consider using --sam2-embeddings.")
+    elif args.training_list is not None:
+        # Stratified training from 2D training list with dice filtering
+        train_dataset = StratifiedTrainingDataset(
+            training_list_path=args.training_list,
+            dice_threshold=args.dice_threshold,
+            samples_per_dataset=args.samples_per_dataset,
+            seed=args.seed,
+        )
+        train_fn = train_epoch
+        use_stratified = True
+        if rank == 0:
+            print("Using Stratified Training Dataset with dice filtering")
     else:
         # Use raw images
         train_dataset = NiiDataset(
@@ -893,15 +1261,27 @@ def main(rank, world_size, args):
         )
         train_fn = train_epoch
 
-    train_sampler = DistributedSampler(train_dataset)
+    # For stratified datasets, we don't use DistributedSampler since
+    # the dataset already handles stratified sampling per epoch
+    if use_stratified:
+        train_sampler = None
+        shuffle_loader = True
+    else:
+        train_sampler = DistributedSampler(train_dataset)
+        shuffle_loader = False
 
-    # Use custom collate function for raw images (variable sizes)
-    collate_fn = variable_size_collate_fn if not args.use_embeddings else None
+    # Use custom collate function based on dataset type
+    if not args.use_embeddings:
+        collate_fn = variable_size_collate_fn
+    elif use_stratified:
+        collate_fn = stratified_emb_collate_fn
+    else:
+        collate_fn = None
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=False,
+        shuffle=shuffle_loader if train_sampler is None else False,
         num_workers=args.num_workers,
         sampler=train_sampler,
         pin_memory=True,
@@ -909,7 +1289,7 @@ def main(rank, world_size, args):
     )
 
     if rank == 0:
-        print(f"Training samples: {len(train_dataset)}")
+        print(f"Training samples per epoch: {len(train_dataset)}")
 
     # Check for existing checkpoint to resume
     ckpt_name, start_epoch = get_checkpoint(args.save_path, args.ckpt_path)
@@ -924,8 +1304,14 @@ def main(rank, world_size, args):
     # Training loop
     losses = []
     for epoch in range(start_epoch, args.num_epochs):
-        print(f"Start training epoch {epoch + 1}/{args.num_epochs}")
-        train_sampler.set_epoch(epoch)
+        if rank == 0:
+            print(f"Start training epoch {epoch + 1}/{args.num_epochs}")
+
+        # Reshuffle for stratified datasets or set epoch for DistributedSampler
+        if use_stratified:
+            train_dataset.reshuffle(epoch)
+        elif train_sampler is not None:
+            train_sampler.set_epoch(epoch)
 
         epoch_loss = train_fn(
             model, train_loader, optimizer, loss_fn,
