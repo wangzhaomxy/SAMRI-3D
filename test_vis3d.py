@@ -4,54 +4,53 @@
 """
 test_vis3d.py
 
-3D SAM2 VideoPredictor evaluation script (fast: NO temp JPG frames).
+3D SAM2 VideoPredictor evaluation (single-object, iterative propagation).
+Processes each label separately, running video propagation once per label.
+For faster multi-object evaluation, use test_vis3d_multi.py instead.
+
+Features:
 - Reads 3D MRI volumes + 3D semantic GT masks from common medical formats
-- Splits volume into two “videos” around a cut slice (largest foreground slice)
-- Runs SAM2 video propagation (streaming frame loader)
-- Merges back to a 3D semantic prediction
+- Splits volume into two "videos" around cut slice (largest foreground)
+- Runs SAM2 video propagation per label (streaming frame loader)
+- Merges back to 3D semantic prediction
 - Auto-detects ALL labels from GT (excluding 0)
-- Computes per-label 3D DSC / HD / MSD
-- Saves pickle record in the SAME style as test_vis2d.py:
-    final_record: dict[str, list[dict]] = {ds_name: [case_record, ...], ...}
-  where each case_record includes:
-    img_name, mask_name, labels, pixel_count, area_percentage,
-    p_dice/b_dice/bp_dice, p_hd/b_hd/bp_hd, p_msd/b_msd/bp_msd
-  (We fill only the list corresponding to prompt-mode; other lists are empty.)
+- Computes per-label 3D DSC / HD / MSD metrics
+- Parallel data loading for improved throughput
 
-Dataset layout:
-- Image and GT are in the SAME folder with different keys:
-    "_img_" for image, "_gt_" for GT
-- Typically under each dataset folder’s /testing/ subfolder.
-- This script expects: --dataset-path points to the root that contains multiple dataset folders.
-  For each dataset folder, it will try:
-    <ds>/testing/
-  If that doesn't exist, it will scan <ds>/ directly.
-  (If your layout differs, adjust `collect_test_folders()`.)
+=== Usage ===
 
-CLI:
-python test_vis3d.py \
-  --sam2-config configs/sam2.1/sam2.1_hiera_l.yaml \
-  --ckpt-path /path/to/sam2.1_hiera_large.pt \
-  --dataset-path /path/to/SAMRI_train_test/ \
-  --save-path /path/to/save/results_3d.pkl \
-  --prompt-mode box \
-  --device cuda
-  
-python test_vis3d.py \
---sam2-config configs/sam2.1/sam2.1_hiera_l.yaml \
---ckpt-path /home/s4670484/Desktop/Scratch/samri/pretrained_ckpt/sam2.1_hiera_large.pt \
---dataset-path /home/s4670484/Desktop/Scratch/samri/Datasets/SAMRI_datasets_3D/ \
---save-path /home/s4670484/Desktop/Scratch/samri/Eval_results/SAM2/sam2_hiera_l_3d.pkl \
---prompt-mode box \
---device cuda
-  
-Available SAM2 configs/checkpoints:
+1. Basic evaluation with box prompts:
+   python test_vis3d.py \\
+       --sam2-config configs/sam2.1/sam2.1_hiera_l.yaml \\
+       --ckpt-path /path/to/sam2.1_hiera_large.pt \\
+       --dataset-path /path/to/SAMRI_train_test/ \\
+       --save-path /path/to/results_3d.pkl \\
+       --prompt-mode box
+
+2. With parallel data loading (faster I/O):
+   python test_vis3d.py \\
+       --sam2-config configs/sam2.1/sam2.1_hiera_l.yaml \\
+       --ckpt-path /path/to/sam2.1_hiera_large.pt \\
+       --dataset-path /path/to/SAMRI_train_test/ \\
+       --save-path /path/to/results_3d.pkl \\
+       --num-workers 8
+
+=== Options ===
+
+  --sam2-config     SAM2 config file (yaml)
+  --ckpt-path       SAM2 checkpoint file (.pt)
+  --dataset-path    Root path containing dataset folders with /testing/ subdirs
+  --save-path       Output pickle file path
+  --prompt-mode     Prompt type: box or mask (default: box)
+  --num-workers     Workers for parallel data loading (default: 4)
+  --device          Device to use: cuda or cpu (default: cuda)
+
+=== Available Configs/Checkpoints ===
+
     sam2.1_hiera_t.yaml     sam2.1_hiera_tiny.pt
     sam2.1_hiera_s.yaml     sam2.1_hiera_small.pt
     sam2.1_hiera_b+.yaml    sam2.1_hiera_base_plus.pt
     sam2.1_hiera_l.yaml     sam2.1_hiera_large.pt
-    SAMRI_datasets_3D/     Test_3d/
-    box / mask          
 """
 
 from __future__ import annotations
@@ -64,9 +63,10 @@ import shutil
 import inspect
 import argparse
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from glob import glob
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Callable, Any, Union
+from typing import Dict, List, Tuple, Optional, Callable, Any, Union, Generator
 
 import numpy as np
 import SimpleITK as sitk
@@ -669,6 +669,83 @@ def hd_msd_3d_sitk(
 
 
 # ----------------------------
+# Parallel data loading
+# ----------------------------
+def load_3d_case(pair: Tuple[str, str]) -> Optional[Dict[str, Any]]:
+    """
+    Load a single 3D case (image + mask) from disk.
+    Returns None if case should be skipped (empty or error).
+    """
+    img_path, gt_path = pair
+    try:
+        img_zyx, img_sitk = read_3d_image(img_path)
+        gt_zyx, _ = read_3d_image(gt_path)
+        ensure_same_shape(img_zyx, gt_zyx, img_path, gt_path)
+
+        if is_image_empty(img_zyx):
+            return None
+        labels = get_labels_from_mask(gt_zyx)
+        if not labels:
+            return None
+
+        spacing_xyz = img_sitk.GetSpacing()
+        spacing_zyx = (float(spacing_xyz[2]), float(spacing_xyz[1]), float(spacing_xyz[0]))
+
+        return {
+            "img_path": img_path,
+            "gt_path": gt_path,
+            "img_zyx": img_zyx,
+            "gt_zyx": gt_zyx,
+            "labels": labels,
+            "spacing_zyx": spacing_zyx,
+        }
+    except Exception:
+        return None
+
+
+def prefetch_data_generator(
+    pairs: List[Tuple[str, str]],
+    num_workers: int = 4,
+    prefetch_size: int = 8,
+) -> Generator[Tuple[int, Optional[Dict[str, Any]]], None, None]:
+    """
+    Generator that prefetches 3D data in parallel using a thread pool.
+    Yields (index, data_dict) pairs in order, where data_dict is None for skipped cases.
+    """
+    if num_workers <= 1:
+        for i, pair in enumerate(pairs):
+            yield i, load_3d_case(pair)
+        return
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {}
+        next_submit = 0
+        next_yield = 0
+        n = len(pairs)
+
+        # Submit initial batch
+        while next_submit < n and len(futures) < prefetch_size:
+            future = executor.submit(load_3d_case, pairs[next_submit])
+            futures[next_submit] = future
+            next_submit += 1
+
+        # Yield results in order and submit more
+        while next_yield < n:
+            if next_yield in futures:
+                result = futures.pop(next_yield).result()
+                yield next_yield, result
+                next_yield += 1
+
+                # Submit next task
+                if next_submit < n:
+                    future = executor.submit(load_3d_case, pairs[next_submit])
+                    futures[next_submit] = future
+                    next_submit += 1
+            else:
+                time.sleep(0.001)
+
+
+# ----------------------------
 # Main record function (per-case, per-label records)
 # ----------------------------
 def save_test_record_3d_single_object(
@@ -676,6 +753,7 @@ def save_test_record_3d_single_object(
     predictor,
     prompt_mode: str,
     save_path: str,
+    num_workers: int = 4,
 ) -> Dict[str, List[Dict]]:
     """
     Saves pickle:
@@ -699,30 +777,29 @@ def save_test_record_3d_single_object(
             final_record[ds_name] = []
             continue
 
-        iterator = pairs
-        if tqdm is not None:
-            iterator = tqdm(pairs, desc=f"{ds_name}", leave=True)
-
         ds_rows: List[Dict] = []
         skipped_empty = 0
         skipped_prompt = 0
         skipped_errors = 0
         kept_labels = 0
 
-        for (img_path, gt_path) in iterator:
-            try:
-                img_zyx, img_sitk = read_3d_image(img_path)
-                gt_zyx, _ = read_3d_image(gt_path)
-                ensure_same_shape(img_zyx, gt_zyx, img_path, gt_path)
+        # Use prefetch generator for parallel data loading
+        data_gen = prefetch_data_generator(pairs, num_workers=num_workers)
+        if tqdm is not None:
+            data_gen = tqdm(data_gen, total=len(pairs), desc=f"{ds_name}", leave=True)
 
-                # discard empty samples
-                if is_image_empty(img_zyx):
-                    skipped_empty += 1
-                    continue
-                labels = get_labels_from_mask(gt_zyx)
-                if not labels:
-                    skipped_empty += 1
-                    continue
+        for idx, case_data in data_gen:
+            if case_data is None:
+                skipped_empty += 1
+                continue
+
+            try:
+                img_path = case_data["img_path"]
+                gt_path = case_data["gt_path"]
+                img_zyx = case_data["img_zyx"]
+                gt_zyx = case_data["gt_zyx"]
+                labels = case_data["labels"]
+                spacing_zyx = case_data["spacing_zyx"]
 
                 # choose cut slice on shortest axis
                 primary_axis = choose_primary_axis(img_zyx.shape)
@@ -738,11 +815,6 @@ def save_test_record_3d_single_object(
 
                 # prepare reusable video sources ONCE per case
                 prepared = prepare_videos_once(predictor, vol0, v1_slices, v2_slices)
-
-                # spacing for HD/MSD
-                spacing_xyz = img_sitk.GetSpacing()  # (x,y,z)
-                spacing_zyx = (float(spacing_xyz[2]), float(spacing_xyz[1]), float(spacing_xyz[0]))
-
                 total_voxels = int(gt_zyx.size)
 
                 try:
@@ -823,6 +895,7 @@ def main():
     parser.add_argument("--save-path", type=str, required=True)
     parser.add_argument("--prompt-mode", type=str, choices=["box", "mask"], default="box")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--num-workers", type=int, default=4, help="Number of parallel workers for data loading")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -836,6 +909,7 @@ def main():
     print(f"Save path     : {args.save_path}")
     print(f"Prompt mode   : {args.prompt_mode}")
     print(f"Device        : {args.device}")
+    print(f"Num workers   : {args.num_workers}")
     print("======================================\n")
 
     t0 = time.time()
@@ -846,6 +920,7 @@ def main():
         predictor=predictor,
         prompt_mode=args.prompt_mode,
         save_path=args.save_path,
+        num_workers=args.num_workers,
     )
 
     print(f"\nSaved: {args.save_path}")
