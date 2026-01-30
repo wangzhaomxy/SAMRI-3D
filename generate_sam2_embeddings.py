@@ -3,8 +3,8 @@
 Generate SAM2-compatible embeddings from NIfTI images.
 
 This script pre-computes SAM2 image embeddings including high-resolution features
-required by the SAM2 mask decoder. Only embeddings with dice score > 0.4 are saved
-to conserve disk space.
+required by the SAM2 mask decoder. Only embeddings with dice score > threshold are
+saved to conserve disk space.
 
 Output NPZ format:
 - image_embed: (256, 64, 64) - main image embedding
@@ -13,60 +13,64 @@ Output NPZ format:
 - mask: (1, H, W) - ground truth mask
 - ori_size: (H, W) - original image size
 
-Usage:
-  1. Generate SAM2 embeddings (recommended):
-python generate_sam2_embeddings.py \
---sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
---data-paths /scratch/project/samri/Datasets/SAMRI_train_test/*/training/ \
---output-dir /scratch/project/samri/SAM2_embeddings/ \
---num-workers 12 --prefetch-size 24
---skip-existing
+Alternative: For training without pre-computing embeddings, use gen_training_list.py
+to generate a training list with dice scores, then train with FilteredNiiDataset.
+See train_stage_one_slicewise.py for workflow options.
 
-  2. Resume after crash (enabled by default, automatically skips existing embeddings):
-python generate_sam2_embeddings.py \
---sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
---data-paths /scratch/project/samri/Datasets/SAMRI_train_test/*/training/ \
---output-dir /scratch/project/samri/SAM2_embeddings/ \
---num-workers 8 --prefetch-size 16
+=== Usage ===
 
-  3. Force reprocessing all images (ignore existing embeddings):
-python generate_sam2_embeddings.py \
---sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
---data-paths /scratch/project/samri/Datasets/SAMRI_train_test/*/training/ \
---output-dir /scratch/project/samri/SAM2_embeddings/ \
---no-skip-existing \
---num-workers 8 --prefetch-size 16
+1. Generate SAM2 embeddings:
+   python generate_sam2_embeddings.py \\
+       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
+       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
+       --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/*/training/ \\
+       --output-dir /scratch/project/samri/SAM2_embeddings/ \\
+       --num-workers 12 --prefetch-size 24
 
-  4. Custom dice threshold (default is 0.4):
-python generate_sam2_embeddings.py \
---sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
---data-paths /scratch/project/samri/Datasets/SAMRI_train_test/*/training/ \
---output-dir /scratch/project/samri/SAM2_embeddings/ \
---dice-threshold 0.5 \
---num-workers 8 --prefetch-size 16
---skip-existing
+2. Resume after crash (automatically skips existing embeddings):
+   python generate_sam2_embeddings.py \\
+       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
+       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
+       --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/*/training/ \\
+       --output-dir /scratch/project/samri/SAM2_embeddings/ \\
+       --num-workers 8 --prefetch-size 16
 
-  5. Train with SAM2 embeddings (all embeddings in folder):
-python train_stage_one_slicewise.py \
---sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
---use-embeddings --sam2-embeddings \
---embedding-dir /scratch/project/samri/SAM2_embeddings/ \
---save-path /scratch/project/samri/Model_save/samri2_stage1/
+3. Custom dice threshold (default is 0.4):
+   python generate_sam2_embeddings.py \\
+       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
+       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
+       --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/*/training/ \\
+       --output-dir /scratch/project/samri/SAM2_embeddings/ \\
+       --dice-threshold 0.5 \\
+       --num-workers 8 --prefetch-size 16
 
-Performance options:
+4. Force reprocessing all images:
+   python generate_sam2_embeddings.py \\
+       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
+       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
+       --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/*/training/ \\
+       --output-dir /scratch/project/samri/SAM2_embeddings/ \\
+       --no-skip-existing
+
+5. Train with SAM2 embeddings:
+   python train_stage_one_slicewise.py \\
+       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
+       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
+       --use-embeddings --sam2-embeddings \\
+       --embedding-dir /scratch/project/samri/SAM2_embeddings/ \\
+       --save-path /scratch/project/samri/Model_save/samri2_stage1/
+
+=== Options ===
+
+Performance:
   --num-workers N      Workers for parallel file I/O (default: 4)
   --prefetch-size N    Images to prefetch in background (default: 8)
-  --no-compress        Disable NPZ compression for faster saves (~3-5x faster, larger files)
+  --no-compress        Disable NPZ compression (faster saves, larger files)
   --dice-threshold     Minimum dice score to save embedding (default: 0.4)
 
-Resume options:
-  --skip-existing      Skip images that already have embeddings (default: enabled)
-  --no-skip-existing   Force reprocessing of all images, even if embeddings exist
+Resume:
+  --skip-existing      Skip images with existing embeddings (default: enabled)
+  --no-skip-existing   Force reprocessing all images
 """
 
 import os
