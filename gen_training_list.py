@@ -37,7 +37,7 @@ python gen_training_list.py \
 --data-paths /scratch/project/samri/Datasets/SAMRI_datasets_3D/ \
 --save-path /scratch/project/samri/training_lists/training_list_3d.pkl \
 --prompt-mode box \
---num-workers 12
+--num-workers 16
 
 3. Generate both lists:
 python gen_training_list.py \
@@ -738,7 +738,6 @@ def evaluate_3d_training_samples(
         primary_axis = data['primary_axis']
 
         total_voxels = int(gt_zyx.size)
-        N, H, W = vol0.shape
 
         # Prepare video sources ONCE per case (with fallback to JPEG if needed)
         try:
@@ -748,46 +747,40 @@ def evaluate_3d_training_samples(
             pbar.update(1)
             continue
 
-        # Process each label
-        for lb in labels:
-            # Skip if label not present on cut slice
-            if np.sum(gt_cut == lb) == 0:
-                continue
+        # Multi-object prediction: process all labels at once
+        try:
+            pred0_semantic, added_labels = predict_multi_object_semantic(
+                predictor=predictor,
+                prepared=prepared,
+                gt_cut_slice=gt_cut,
+                prompt_mode=prompt_mode,
+                labels=labels,
+            )
 
-            try:
-                # Predict using video predictor
-                pred_zyx_bin = predict_one_label_3d(
-                    predictor=predictor,
-                    prepared=prepared,
-                    gt_cut=gt_cut,
-                    vol_shape=(N, H, W),
-                    prompt_mode=prompt_mode,
-                    label=lb,
-                    primary_axis=primary_axis,
-                )
+            if pred0_semantic is not None and added_labels:
+                # Restore to original axis order
+                pred_zyx_semantic = np.moveaxis(pred0_semantic, 0, primary_axis)
 
-                if pred_zyx_bin is None:
-                    continue
+                # Calculate dice for each added label
+                for lb in added_labels:
+                    gt_lb = (gt_zyx == lb).astype(np.uint8)
+                    pred_lb = (pred_zyx_semantic == lb).astype(np.uint8)
+                    dsc = dice_3d(pred_lb, gt_lb)
 
-                # Calculate dice
-                gt_lb = (gt_zyx == lb).astype(np.uint8)
-                dsc = dice_3d(pred_zyx_bin, gt_lb)
+                    vc = int(gt_lb.sum())
 
-                vc = int(gt_lb.sum())
+                    results.append({
+                        "img_path": img_path,
+                        "mask_path": gt_path,
+                        "label": int(lb),
+                        "dataset": ds_name,
+                        "dice": float(dsc),
+                        "voxel_count": vc,
+                        "voxel_percentage": vc / float(total_voxels),
+                    })
 
-                results.append({
-                    "img_path": img_path,
-                    "mask_path": gt_path,
-                    "label": int(lb),
-                    "dataset": ds_name,
-                    "dice": float(dsc),
-                    "voxel_count": vc,
-                    "voxel_percentage": vc / float(total_voxels),
-                })
-
-            except Exception as e:
-                print(f"  Warning: Failed to process label {lb} for {img_path}: {e}")
-                continue
+        except Exception as e:
+            print(f"  Warning: Failed to process {img_path}: {e}")
 
         # Clean up temp files for this case
         prepared.cleanup()
@@ -797,120 +790,187 @@ def evaluate_3d_training_samples(
     return results
 
 
-def predict_one_label_3d(
+def sample_positive_points(mask2d: np.ndarray, num_pos: int = 256) -> Tuple[np.ndarray, np.ndarray]:
+    """Sample positive points from a binary mask for mask prompt mode."""
+    ys, xs = np.where(mask2d > 0)
+    if xs.size == 0:
+        return np.zeros((0, 2), np.float32), np.zeros((0,), np.int32)
+    k = min(num_pos, xs.size)
+    idx = np.random.choice(xs.size, size=k, replace=False)
+    pts = np.stack([xs[idx], ys[idx]], axis=1).astype(np.float32)  # (x,y)
+    lbls = np.ones((k,), dtype=np.int32)
+    return pts, lbls
+
+
+def add_prompts_for_all_labels(
     predictor,
-    prepared: PreparedVideos,
-    gt_cut: np.ndarray,
-    vol_shape: Tuple[int, int, int],
+    inference_state,
     prompt_mode: str,
-    label: int,
-    primary_axis: int,
-) -> Optional[np.ndarray]:
-    """Run 3D prediction for one label using prepared video sources."""
-    lb = int(label)
-    mask_lb = (gt_cut == lb).astype(np.uint8)
+    gt_cut_slice: np.ndarray,
+    labels: List[int],
+    ann_frame_idx: int = 0,
+) -> List[int]:
+    """
+    Adds one SAM2 object per label with obj_id=label.
+    Returns labels actually added (present on cut slice).
+    """
+    added: List[int] = []
+    for lb in labels:
+        obj_id = int(lb)
+        mask_lb = (gt_cut_slice == obj_id).astype(np.uint8)
+        if mask_lb.sum() == 0:
+            continue
 
-    if mask_lb.sum() == 0:
-        return None
+        if prompt_mode == "box":
+            box = mask2d_to_bbox_xyxy(mask_lb)
+            if box is None:
+                continue
+            try:
+                predictor.add_new_points_or_box(
+                    inference_state=inference_state,
+                    frame_idx=ann_frame_idx,
+                    obj_id=obj_id,
+                    box=box,
+                )
+            except TypeError:
+                predictor.add_new_points_or_box(
+                    inference_state=inference_state,
+                    frame_idx=ann_frame_idx,
+                    obj_id=obj_id,
+                    points=None,
+                    labels=None,
+                    box=box,
+                )
+            added.append(obj_id)
 
-    # Get box prompt
-    box = mask2d_to_bbox_xyxy(mask_lb)
-    if box is None:
-        return None
+        elif prompt_mode == "mask":
+            if hasattr(predictor, "add_new_mask"):
+                predictor.add_new_mask(
+                    inference_state=inference_state,
+                    frame_idx=ann_frame_idx,
+                    obj_id=obj_id,
+                    mask=mask_lb,
+                )
+                added.append(obj_id)
+            else:
+                pts, lbls = sample_positive_points(mask_lb, num_pos=256)
+                if pts.shape[0] == 0:
+                    continue
+                predictor.add_new_points_or_box(
+                    inference_state=inference_state,
+                    frame_idx=ann_frame_idx,
+                    obj_id=obj_id,
+                    points=pts,
+                    labels=lbls,
+                )
+                added.append(obj_id)
+        else:
+            raise ValueError(f"Unknown prompt_mode: {prompt_mode}")
 
-    N, H, W = vol_shape
+    return added
 
-    # Suppress all SAM2 output (tqdm bars, prints) to keep dataset-level tqdm clean
-    with suppress_sam2_output(True):
-        # Initialize video 1
-        st1 = init_state_compat(predictor, prepared.v1_source, prepared.v1_len, prefer_streaming=prepared.use_streaming)
 
-        # Add prompt
-        try:
-            predictor.add_new_points_or_box(
-                inference_state=st1,
-                frame_idx=0,
-                obj_id=lb,
-                box=box,
-            )
-        except TypeError:
-            predictor.add_new_points_or_box(
-                inference_state=st1,
-                frame_idx=0,
-                obj_id=lb,
-                points=None,
-                labels=None,
-                box=box,
-            )
+@torch.no_grad()
+def propagate_video_multiobj(
+    predictor,
+    inference_state,
+) -> Dict[int, Dict[int, np.ndarray]]:
+    """
+    Multi-object propagation.
+    Returns: frame_idx -> {obj_id -> mask2d_uint8}
+    """
+    out: Dict[int, Dict[int, np.ndarray]] = {}
+    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
+        fi = int(out_frame_idx)
+        out[fi] = {}
+        for i, oid in enumerate(out_obj_ids):
+            oid_i = int(oid)
+            logits = out_mask_logits[i]
+            if hasattr(logits, "detach"):
+                logits = logits.detach()
+            m = (logits > 0.0)
+            if hasattr(m, "cpu"):
+                m = m.cpu().numpy()
+            out[fi][oid_i] = np.squeeze(m).astype(np.uint8)
+    return out
 
-        # Propagate video 1
-        pred1: Dict[int, np.ndarray] = {}
-        for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(st1):
-            fi = int(out_frame_idx)
-            for j, o in enumerate(out_obj_ids):
-                if int(o) == lb:
-                    logits = out_mask_logits[j]
-                    if hasattr(logits, "detach"):
-                        logits = logits.detach()
-                    m = (logits > 0.0)
-                    if hasattr(m, "cpu"):
-                        m = m.cpu().numpy()
-                    pred1[fi] = np.squeeze(m).astype(np.uint8)
-                    break
 
-        # Initialize video 2
-        st2 = init_state_compat(predictor, prepared.v2_source, prepared.v2_len, prefer_streaming=prepared.use_streaming)
-
-        try:
-            predictor.add_new_points_or_box(
-                inference_state=st2,
-                frame_idx=0,
-                obj_id=lb,
-                box=box,
-            )
-        except TypeError:
-            predictor.add_new_points_or_box(
-                inference_state=st2,
-                frame_idx=0,
-                obj_id=lb,
-                points=None,
-                labels=None,
-                box=box,
-            )
-
-        # Propagate video 2
-        pred2: Dict[int, np.ndarray] = {}
-        for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(st2):
-            fi = int(out_frame_idx)
-            for j, o in enumerate(out_obj_ids):
-                if int(o) == lb:
-                    logits = out_mask_logits[j]
-                    if hasattr(logits, "detach"):
-                        logits = logits.detach()
-                    m = (logits > 0.0)
-                    if hasattr(m, "cpu"):
-                        m = m.cpu().numpy()
-                    pred2[fi] = np.squeeze(m).astype(np.uint8)
-                    break
-
-    # Merge predictions
-    pred0 = np.zeros((N, H, W), dtype=np.uint8)
+def merge_two_videos_to_semantic_volume(
+    N: int,
+    H: int,
+    W: int,
+    v1_slices: List[int],
+    v2_slices: List[int],
+    v1_pred: Dict[int, Dict[int, np.ndarray]],
+    v2_pred: Dict[int, Dict[int, np.ndarray]],
+    labels: List[int],
+) -> np.ndarray:
+    """
+    Merge predictions back to a semantic label volume [S,H,W] (int32), background=0.
+    Overlap resolution: later writes override earlier ones.
+    """
+    pred = np.zeros((N, H, W), dtype=np.int32)
     written = set()
 
-    for fidx, m in pred1.items():
-        z = prepared.v1_slices[fidx]
-        pred0[z] = (m > 0).astype(np.uint8)
+    def write_slice(z: int, obj_to_mask: Dict[int, np.ndarray]):
+        for lb in labels:
+            oid = int(lb)
+            if oid not in obj_to_mask:
+                continue
+            pred[z][obj_to_mask[oid] > 0] = oid
+
+    for fidx, objm in v1_pred.items():
+        z = v1_slices[fidx]
+        write_slice(z, objm)
         written.add(z)
 
-    for fidx, m in pred2.items():
-        z = prepared.v2_slices[fidx]
-        if z not in written:
-            pred0[z] = (m > 0).astype(np.uint8)
-            written.add(z)
+    for fidx, objm in v2_pred.items():
+        z = v2_slices[fidx]
+        if z in written:
+            continue
+        write_slice(z, objm)
+        written.add(z)
 
-    # Restore to original axis order
-    pred_zyx = np.moveaxis(pred0, 0, primary_axis)
-    return pred_zyx
+    return pred
+
+
+def predict_multi_object_semantic(
+    predictor,
+    prepared: PreparedVideos,
+    gt_cut_slice: np.ndarray,
+    prompt_mode: str,
+    labels: List[int],
+) -> Tuple[Optional[np.ndarray], List[int]]:
+    """
+    Multi-object inference once per video; returns:
+      pred0_semantic: [S,H,W] int32 (axis-0 orientation)
+      added_labels: labels that were actually prompted (present in cut slice)
+    """
+    # Suppress all SAM2 output (tqdm bars, prints) to keep dataset-level tqdm clean
+    with suppress_sam2_output(True):
+        # video1
+        st1 = init_state_compat(predictor, prepared.v1_source, prepared.v1_len, prefer_streaming=prepared.use_streaming)
+        added = add_prompts_for_all_labels(predictor, st1, prompt_mode, gt_cut_slice, labels, ann_frame_idx=0)
+        if not added:
+            return None, []
+        pred1 = propagate_video_multiobj(predictor, st1)
+
+        # video2
+        st2 = init_state_compat(predictor, prepared.v2_source, prepared.v2_len, prefer_streaming=prepared.use_streaming)
+        _ = add_prompts_for_all_labels(predictor, st2, prompt_mode, gt_cut_slice, added, ann_frame_idx=0)
+        pred2 = propagate_video_multiobj(predictor, st2)
+
+    N = len(prepared.v1_slices) + (len(prepared.v2_slices) - 1)
+    H, W = gt_cut_slice.shape
+    pred0 = merge_two_videos_to_semantic_volume(
+        N=N, H=H, W=W,
+        v1_slices=prepared.v1_slices,
+        v2_slices=prepared.v2_slices,
+        v1_pred=pred1,
+        v2_pred=pred2,
+        labels=added,
+    )
+    return pred0, added
 
 
 # =============================================================================
