@@ -8,62 +8,85 @@ This script trains only the mask decoder while freezing all other components:
 - Memory encoder (frozen)
 - Memory attention (frozen)
 
-Supports two data modes:
-1. Raw images (NiiDataset): Load NIfTI images and compute embeddings on-the-fly
-2. Pre-computed embeddings (SAM2EmbDataset): Load pre-computed embeddings for faster training
+Supports three data modes:
+1. Pre-computed embeddings (SAM2EmbDataset): Fastest, load pre-computed embeddings
+2. Filtered images (FilteredNiiDataset): Load images filtered by dice score from training list
+3. Raw images (NiiDataset): Slowest, compute embeddings on-the-fly
 
 Based on SAMRI v1 training approach adapted for SAM2 architecture.
 
-=== Workflow ===
+=== Workflow Options ===
 
-Step 1: Generate embeddings (only dice > 0.4 are saved):
-  python generate_sam2_embeddings.py \\
-      --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-      --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
-      --data-paths /scratch/project/samri/Datasets/*/training/ \\
-      --output-dir /scratch/project/samri/SAM2_embeddings/ \\
-      --num-workers 8 --prefetch-size 16
+Option A: Pre-computed Embeddings (recommended for large-scale training)
+  Step 1: Generate embeddings (only dice > 0.4 are saved)
+    python generate_sam2_embeddings.py \\
+        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
+        --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
+        --data-paths /scratch/project/samri/Datasets/*/training/ \\
+        --output-dir /scratch/project/samri/SAM2_embeddings/ \\
+        --num-workers 8 --prefetch-size 16
 
-Step 2: Train on embeddings (this script):
-  python train_stage_one_slicewise.py \\
-      --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-      --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
-      --use-embeddings --sam2-embeddings \\
-      --embedding-dir /scratch/project/samri/SAM2_embeddings/ \\
-      --save-path /scratch/project/samri/Model_save/samri2_stage1/
+  Step 2: Train on embeddings
+    python train_stage_one_slicewise.py \\
+        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
+        --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
+        --use-embeddings --sam2-embeddings \\
+        --embedding-dir /scratch/project/samri/SAM2_embeddings/ \\
+        --save-path /scratch/project/samri/Model_save/samri2_stage1/
+
+Option B: Filtered Training List (recommended for flexible filtering)
+  Step 1: Generate training list with dice scores
+    python gen_training_list.py \\
+        --mode 2d \\
+        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
+        --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
+        --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/ \\
+        --save-path /scratch/project/samri/training_lists/training_list_2d.pkl \\
+        --num-workers 8
+
+  Step 2: Train with filtered samples
+    python train_stage_one_slicewise.py \\
+        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
+        --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
+        --training-list /scratch/project/samri/training_lists/training_list_2d.pkl \\
+        --dice-threshold 0.4 \\
+        --save-path /scratch/project/samri/Model_save/samri2_filtered/
 
 === CLI Examples ===
 
-1. Training from Pre-computed Embeddings (recommended, faster):
-   Note: Embeddings are pre-filtered (dice > 0.4) during generation
-
+1. Training from Pre-computed Embeddings (fastest):
    python train_stage_one_slicewise.py \\
        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
        --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
        --use-embeddings --sam2-embeddings \\
        --embedding-dir /scratch/project/samri/SAM2_embeddings/ \\
        --save-path /scratch/project/samri/Model_save/samri2_stage1_emb/ \\
-       --num-epochs 100 \\
-       --batch-size 8
+       --num-epochs 100 --batch-size 8
 
-2. Training from Raw Images (compute embeddings on-the-fly):
-   Note: Slower but doesn't require pre-computed embeddings
+2. Training from Filtered Training List:
+   python train_stage_one_slicewise.py \\
+       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
+       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
+       --training-list /scratch/project/samri/training_lists/training_list_2d.pkl \\
+       --dice-threshold 0.4 \\
+       --save-path /scratch/project/samri/Model_save/samri2_filtered/ \\
+       --num-epochs 100 --batch-size 4
 
+3. Training from Raw Images (slowest, no pre-filtering):
    python train_stage_one_slicewise.py \\
        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
        --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
        --train-data-paths /scratch/project/samri/Datasets/Dataset1/training/ \\
                           /scratch/project/samri/Datasets/Dataset2/training/ \\
        --save-path /scratch/project/samri/Model_save/samri2_stage1_raw/ \\
-       --num-epochs 100 \\
-       --batch-size 4 \\
-       --lr 1e-5 \\
-       --prompt-mode mixed
+       --num-epochs 100 --batch-size 4 --lr 1e-5 --prompt-mode mixed
 
 Key Arguments:
-  --use-embeddings      Use pre-computed embeddings instead of raw images
+  --use-embeddings      Use pre-computed embeddings (requires --embedding-dir)
   --sam2-embeddings     Use SAM2-format embeddings with high-res features
-  --embedding-dir       Directory containing .npz embedding files (scanned recursively)
+  --embedding-dir       Directory containing .npz embedding files
+  --training-list       Path to training_list_2d.pkl from gen_training_list.py
+  --dice-threshold      Minimum dice score for filtered training (default: 0.4)
   --train-data-paths    List of NIfTI data paths (for raw image mode)
   --prompt-mode         Prompt type: "point", "box", or "mixed" (default: box)
   --batch-size          Batch size per GPU (default: 4)
