@@ -21,40 +21,41 @@ for training on samples filtered by dice score threshold.
 === Usage ===
 
 1. Generate 2D training list (for slice-wise training):
-   python gen_training_list.py \\
-       --mode 2d \\
-       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
-       --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/ \\
-       --save-path /scratch/project/samri/training_lists/training_list_2d.pkl \\
-       --num-workers 8
+python gen_training_list.py \
+--mode 2d \
+--sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+--ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+--data-paths /scratch/project/samri/Datasets/SAMRI_train_test/ \
+--save-path /scratch/project/samri/training_lists/training_list_2d.pkl \
+--num-workers 12
 
 2. Generate 3D training list (for volume training):
-   python gen_training_list.py \\
-       --mode 3d \\
-       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
-       --data-paths /scratch/project/samri/Datasets/SAMRI_datasets_3D/ \\
-       --save-path /scratch/project/samri/training_lists/training_list_3d.pkl \\
-       --prompt-mode box \\
-       --num-workers 4
+python gen_training_list.py \
+--mode 3d \
+--sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+--ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+--data-paths /scratch/project/samri/Datasets/SAMRI_datasets_3D/ \
+--save-path /scratch/project/samri/training_lists/training_list_3d.pkl \
+--prompt-mode box \
+--num-workers 12
 
 3. Generate both lists:
-   python gen_training_list.py \\
-       --mode both \\
-       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
-       --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/ \\
-       --save-dir /scratch/project/samri/training_lists/
+python gen_training_list.py \
+--mode both \
+--sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+--ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+--data-paths /scratch/project/samri/Datasets/SAMRI_train_test/ \
+--save-dir /scratch/project/samri/training_lists/ \
+--num-workers 16
 
 === Training with Filtered Samples ===
 
 After generating the training list, use with train_stage_one_slicewise.py:
-   python train_stage_one_slicewise.py \\
-       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \\
-       --training-list /scratch/project/samri/training_lists/training_list_2d.pkl \\
-       --dice-threshold 0.4 \\
+   python train_stage_one_slicewise.py \
+       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+       --training-list /scratch/project/samri/training_lists/training_list_2d.pkl \
+       --dice-threshold 0.4 \
        --save-path /scratch/project/samri/Model_save/samri2_filtered/
 
 === Options ===
@@ -74,9 +75,13 @@ import sys
 import time
 import pickle
 import argparse
+import contextlib
+import tempfile
+import shutil
+import inspect
 from glob import glob
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 
 import numpy as np
 import torch
@@ -402,6 +407,157 @@ def build_two_videos_indices(N: int, n: int) -> Tuple[List[int], List[int]]:
     return v1, v2
 
 
+# =============================================================================
+# SAM2 Video Predictor Compatibility Helpers
+# =============================================================================
+
+@contextlib.contextmanager
+def suppress_sam2_output(enabled: bool = True):
+    """Suppress stdout/stderr (SAM2 prints + tqdm bars) inside the context."""
+    if not enabled:
+        yield
+        return
+
+    old_env = os.environ.get("TQDM_DISABLE", None)
+    os.environ["TQDM_DISABLE"] = "1"
+
+    devnull = open(os.devnull, "w")
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    try:
+        sys.stdout = devnull
+        sys.stderr = devnull
+        yield
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+        devnull.close()
+        if old_env is None:
+            os.environ.pop("TQDM_DISABLE", None)
+        else:
+            os.environ["TQDM_DISABLE"] = old_env
+
+
+def get_fast_tmp_root() -> Optional[str]:
+    """Get fast tmp directory (/dev/shm if available)."""
+    if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
+        return "/dev/shm"
+    return None
+
+
+def write_video_frames_to_dir(vol_shw: np.ndarray, slice_indices: List[int], out_dir: str) -> str:
+    """Write volume slices as JPEG frames to a directory."""
+    os.makedirs(out_dir, exist_ok=True)
+    for i, z in enumerate(slice_indices):
+        s2d = normalize_to_uint8(vol_shw[z])
+        rgb = np.stack([s2d, s2d, s2d], axis=-1)
+        Image.fromarray(rgb).save(os.path.join(out_dir, f"{i:05d}.jpg"), quality=95)
+    return out_dir
+
+
+def init_state_compat(predictor, video_source: Any, num_frames: int, prefer_streaming: bool = True):
+    """
+    Version-compatible init_state:
+    - Newer SAM2: may accept frame_load_config
+    - Mid SAM2: may accept callable video_path but no frame_load_config
+    - Older SAM2: requires directory of jpg frames
+    """
+    sig = inspect.signature(predictor.init_state)
+    params = sig.parameters
+
+    if prefer_streaming and callable(video_source):
+        kwargs = {"video_path": video_source}
+        if "frame_load_config" in params:
+            kwargs["frame_load_config"] = {"max_frames": int(num_frames), "first_frame_num": 0}
+        elif "max_frames" in params:
+            kwargs["max_frames"] = int(num_frames)
+        elif "num_frames" in params:
+            kwargs["num_frames"] = int(num_frames)
+        try:
+            return predictor.init_state(**kwargs)
+        except TypeError:
+            pass
+
+    if not isinstance(video_source, str):
+        raise TypeError("Fallback init_state requires a directory path (str) as video_source.")
+    return predictor.init_state(video_path=video_source)
+
+
+class PreparedVideos:
+    """Prepared per-case video sources for video1 and video2."""
+    def __init__(
+        self,
+        v1_source: Any,
+        v2_source: Any,
+        v1_len: int,
+        v2_len: int,
+        v1_slices: List[int],
+        v2_slices: List[int],
+        tmp_base: Optional[str],
+        use_streaming: bool,
+    ):
+        self.v1_source = v1_source
+        self.v2_source = v2_source
+        self.v1_len = v1_len
+        self.v2_len = v2_len
+        self.v1_slices = v1_slices
+        self.v2_slices = v2_slices
+        self.tmp_base = tmp_base
+        self.use_streaming = use_streaming
+
+    def cleanup(self):
+        if self.tmp_base:
+            shutil.rmtree(self.tmp_base, ignore_errors=True)
+
+
+def prepare_videos_once(
+    predictor,
+    vol0: np.ndarray,
+    v1_slices: List[int],
+    v2_slices: List[int],
+) -> PreparedVideos:
+    """
+    Prepare video sources ONCE per case:
+    - Try streaming callables first
+    - If SAM2 rejects callables, write both videos to jpg dirs ONCE and reuse
+    """
+    loader1, num1 = make_pil_loader_from_volume(vol0, v1_slices)
+    loader2, num2 = make_pil_loader_from_volume(vol0, v2_slices)
+
+    # Try streaming sanity check (init_state once and immediately discard state)
+    try:
+        with suppress_sam2_output(True):
+            _st = init_state_compat(predictor, loader1, num1, prefer_streaming=True)
+        # If it succeeded, assume streaming works
+        return PreparedVideos(
+            v1_source=loader1,
+            v2_source=loader2,
+            v1_len=num1,
+            v2_len=num2,
+            v1_slices=v1_slices,
+            v2_slices=v2_slices,
+            tmp_base=None,
+            use_streaming=True,
+        )
+    except Exception:
+        # Fallback to jpg dirs (write once)
+        fast_tmp = get_fast_tmp_root()
+        tmp_base = tempfile.mkdtemp(prefix="sam2_3d_gen_", dir=fast_tmp)
+        v1_dir = os.path.join(tmp_base, "video1")
+        v2_dir = os.path.join(tmp_base, "video2")
+        write_video_frames_to_dir(vol0, v1_slices, v1_dir)
+        write_video_frames_to_dir(vol0, v2_slices, v2_dir)
+        return PreparedVideos(
+            v1_source=v1_dir,
+            v2_source=v2_dir,
+            v1_len=num1,
+            v2_len=num2,
+            v1_slices=v1_slices,
+            v2_slices=v2_slices,
+            tmp_base=tmp_base,
+            use_streaming=False,
+        )
+
+
 def load_3d_case(args_tuple):
     """
     Load and preprocess a 3D case for parallel loading.
@@ -582,6 +738,15 @@ def evaluate_3d_training_samples(
         primary_axis = data['primary_axis']
 
         total_voxels = int(gt_zyx.size)
+        N, H, W = vol0.shape
+
+        # Prepare video sources ONCE per case (with fallback to JPEG if needed)
+        try:
+            prepared = prepare_videos_once(predictor, vol0, v1_slices, v2_slices)
+        except Exception as e:
+            print(f"  Warning: Failed to prepare videos for {img_path}: {e}")
+            pbar.update(1)
+            continue
 
         # Process each label
         for lb in labels:
@@ -593,10 +758,9 @@ def evaluate_3d_training_samples(
                 # Predict using video predictor
                 pred_zyx_bin = predict_one_label_3d(
                     predictor=predictor,
-                    vol0=vol0,
+                    prepared=prepared,
                     gt_cut=gt_cut,
-                    v1_slices=v1_slices,
-                    v2_slices=v2_slices,
+                    vol_shape=(N, H, W),
                     prompt_mode=prompt_mode,
                     label=lb,
                     primary_axis=primary_axis,
@@ -625,6 +789,8 @@ def evaluate_3d_training_samples(
                 print(f"  Warning: Failed to process label {lb} for {img_path}: {e}")
                 continue
 
+        # Clean up temp files for this case
+        prepared.cleanup()
         pbar.update(1)
 
     pbar.close()
@@ -633,17 +799,14 @@ def evaluate_3d_training_samples(
 
 def predict_one_label_3d(
     predictor,
-    vol0: np.ndarray,
+    prepared: PreparedVideos,
     gt_cut: np.ndarray,
-    v1_slices: List[int],
-    v2_slices: List[int],
+    vol_shape: Tuple[int, int, int],
     prompt_mode: str,
     label: int,
     primary_axis: int,
 ) -> Optional[np.ndarray]:
-    """Run 3D prediction for one label."""
-    import inspect
-
+    """Run 3D prediction for one label using prepared video sources."""
     lb = int(label)
     mask_lb = (gt_cut == lb).astype(np.uint8)
 
@@ -655,23 +818,11 @@ def predict_one_label_3d(
     if box is None:
         return None
 
-    N, H, W = vol0.shape
-
-    # Create video loaders
-    loader1, num1 = make_pil_loader_from_volume(vol0, v1_slices)
-    loader2, num2 = make_pil_loader_from_volume(vol0, v2_slices)
+    N, H, W = vol_shape
 
     # Initialize and propagate video 1
-    sig = inspect.signature(predictor.init_state)
-    params = sig.parameters
-
-    kwargs = {"video_path": loader1}
-    if "frame_load_config" in params:
-        kwargs["frame_load_config"] = {"max_frames": int(num1), "first_frame_num": 0}
-    elif "max_frames" in params:
-        kwargs["max_frames"] = int(num1)
-
-    st1 = predictor.init_state(**kwargs)
+    with suppress_sam2_output(True):
+        st1 = init_state_compat(predictor, prepared.v1_source, prepared.v1_len, prefer_streaming=prepared.use_streaming)
 
     # Add prompt
     try:
@@ -707,13 +858,8 @@ def predict_one_label_3d(
                 break
 
     # Initialize and propagate video 2
-    kwargs2 = {"video_path": loader2}
-    if "frame_load_config" in params:
-        kwargs2["frame_load_config"] = {"max_frames": int(num2), "first_frame_num": 0}
-    elif "max_frames" in params:
-        kwargs2["max_frames"] = int(num2)
-
-    st2 = predictor.init_state(**kwargs2)
+    with suppress_sam2_output(True):
+        st2 = init_state_compat(predictor, prepared.v2_source, prepared.v2_len, prefer_streaming=prepared.use_streaming)
 
     try:
         predictor.add_new_points_or_box(
@@ -752,12 +898,12 @@ def predict_one_label_3d(
     written = set()
 
     for fidx, m in pred1.items():
-        z = v1_slices[fidx]
+        z = prepared.v1_slices[fidx]
         pred0[z] = (m > 0).astype(np.uint8)
         written.add(z)
 
     for fidx, m in pred2.items():
-        z = v2_slices[fidx]
+        z = prepared.v2_slices[fidx]
         if z not in written:
             pred0[z] = (m > 0).astype(np.uint8)
             written.add(z)
