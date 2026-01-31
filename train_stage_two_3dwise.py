@@ -964,9 +964,11 @@ def process_video_with_memory(
         num_slices: Number of slices processed
     """
     if len(slice_indices) == 0:
-        return torch.tensor(0.0, device=device), 0
+        return torch.tensor(0.0, device=device, requires_grad=True), 0
 
-    total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    # Accumulate losses as a list, then sum at the end
+    # This is more memory efficient than += on tensors
+    losses = []
     num_slices = 0
 
     # Memory bank for tracking
@@ -1081,24 +1083,28 @@ def process_video_with_memory(
             loss = loss_fn(pred_resized, gt_resized)
 
             if not torch.isnan(loss):
-                total_loss = total_loss + loss
+                losses.append(loss)
                 num_slices += 1
 
             # Encode memory for next frames
+            # IMPORTANT: Detach memory features to prevent gradient accumulation
+            # through the entire video. We only train on current frame's prediction,
+            # using memory as frozen context. This prevents OOM on long sequences.
             if model.num_maskmem > 0:
-                maskmem_features, maskmem_pos_enc = model._encode_new_memory(
-                    current_vision_feats=vision_feats,
-                    feat_sizes=feat_sizes,
-                    pred_masks_high_res=high_res_masks,
-                    object_score_logits=object_score_logits,
-                    is_mask_from_pts=(point_inputs is not None),
-                )
+                with torch.no_grad():
+                    maskmem_features, maskmem_pos_enc = model._encode_new_memory(
+                        current_vision_feats=[v.detach() for v in vision_feats],
+                        feat_sizes=feat_sizes,
+                        pred_masks_high_res=high_res_masks.detach(),
+                        object_score_logits=object_score_logits.detach(),
+                        is_mask_from_pts=(point_inputs is not None),
+                    )
 
                 current_out = {
                     "maskmem_features": maskmem_features,
                     "maskmem_pos_enc": maskmem_pos_enc,
-                    "pred_masks": low_res_masks,
-                    "obj_ptr": obj_ptr,
+                    "pred_masks": low_res_masks.detach(),
+                    "obj_ptr": obj_ptr.detach(),
                 }
 
                 if is_init_cond_frame:
@@ -1106,7 +1112,11 @@ def process_video_with_memory(
                 else:
                     output_dict["non_cond_frame_outputs"][frame_idx] = current_out
 
-    return total_loss, num_slices
+    # Sum all losses at the end (more memory efficient)
+    if losses:
+        total_loss = torch.stack(losses).sum()
+        return total_loss, num_slices
+    return torch.tensor(0.0, device=device, requires_grad=True), 0
 
 
 def train_3d_sample_with_memory(
@@ -1142,7 +1152,23 @@ def train_3d_sample_with_memory(
     # Get base model (unwrap DDP if needed)
     base_model = model.module if hasattr(model, 'module') else model
 
-    total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    # Get max slices per video (default to 32 if not set)
+    max_slices_per_video = getattr(args, 'max_slices_per_video', 32)
+
+    # Subsample video slices if too long to prevent OOM
+    def subsample_slices(slices: List[int], max_len: int) -> List[int]:
+        if len(slices) <= max_len:
+            return slices
+        # Always keep first slice (prompted frame), subsample the rest
+        step = max(1, (len(slices) - 1) // (max_len - 1))
+        subsampled = [slices[0]] + slices[1::step][:max_len - 1]
+        return subsampled
+
+    v1_slices_train = subsample_slices(v1_slices, max_slices_per_video)
+    v2_slices_train = subsample_slices(v2_slices, max_slices_per_video)
+
+    # Accumulate losses as a list for memory efficiency
+    all_losses = []
     total_slices = 0
 
     # Process each label
@@ -1153,25 +1179,25 @@ def train_3d_sample_with_memory(
             continue
 
         # Process video 1 (cut -> 0)
-        if len(v1_slices) > 0:
+        if len(v1_slices_train) > 0:
             loss1, n1 = process_video_with_memory(
                 model=base_model,
                 transforms=transforms,
                 img_vol=vol_normalized,
                 mask_vol=mask_vol,
-                slice_indices=v1_slices,
+                slice_indices=v1_slices_train,
                 label=label,
                 loss_fn=loss_fn,
                 device=device,
                 use_amp=args.use_amp,
             )
-            if n1 > 0:
-                total_loss = total_loss + loss1
+            if n1 > 0 and loss1.requires_grad:
+                all_losses.append(loss1)
                 total_slices += n1
 
         # Process video 2 (cut -> end), skip cut slice (already in v1)
-        if len(v2_slices) > 1:
-            v2_remaining = v2_slices[1:]  # Skip cut slice
+        if len(v2_slices_train) > 1:
+            v2_remaining = v2_slices_train[1:]  # Skip cut slice
             loss2, n2 = process_video_with_memory(
                 model=base_model,
                 transforms=transforms,
@@ -1183,12 +1209,17 @@ def train_3d_sample_with_memory(
                 device=device,
                 use_amp=args.use_amp,
             )
-            if n2 > 0:
-                total_loss = total_loss + loss2
+            if n2 > 0 and loss2.requires_grad:
+                all_losses.append(loss2)
                 total_slices += n2
 
-    if total_slices > 0:
-        return total_loss / total_slices
+    # Clear GPU cache after processing each 3D volume
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    if all_losses and total_slices > 0:
+        total_loss = torch.stack(all_losses).sum() / total_slices
+        return total_loss
     return torch.tensor(0.0, device=device, requires_grad=True)
 
 
@@ -1325,6 +1356,9 @@ def parse_args():
                         help="3D volumes per dataset per epoch (default: 100)")
     parser.add_argument("--max-slices", type=int, default=64,
                         help="Max slices per 3D volume (default: 64)")
+    parser.add_argument("--max-slices-per-video", type=int, default=32,
+                        help="Max slices per video sequence during training (default: 32). "
+                             "Reduces memory usage by subsampling long sequences.")
 
     # Training configuration
     parser.add_argument("--save-path", type=str, required=True,

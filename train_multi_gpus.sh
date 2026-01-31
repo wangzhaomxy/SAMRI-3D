@@ -80,6 +80,7 @@ DICE_THRESHOLD_3D=0.2
 SAMPLES_PER_DATASET_2D=500
 SAMPLES_PER_DATASET_3D=100
 MAX_SLICES=64
+MAX_SLICES_PER_VIDEO=32  # Limits memory usage during training
 SAVE_EVERY_S2=1
 NUM_WORKERS_S2=32
 
@@ -162,6 +163,7 @@ elif [ "$TRAINING_STAGE" == "2" ]; then
         --lr ${LR_S2} \
         --num-epochs ${NUM_EPOCHS_S2} \
         --max-slices ${MAX_SLICES} \
+        --max-slices-per-video ${MAX_SLICES_PER_VIDEO} \
         --num-workers ${NUM_WORKERS_S2} \
         --use-amp \
         --save-every ${SAVE_EVERY_S2}
