@@ -102,7 +102,6 @@ Key Arguments:
   --sam2-embeddings       Use SAM2-format embeddings with high-res features
   --embedding-dir         Directory containing .npz embedding files
   --training-list         Path to training_list_2d.pkl from gen_training_list.py
-  --val-list              Path to validation_list_2d.pkl for validation (optional)
   --dice-threshold        Minimum dice score for filtered training (default: 0.4)
   --samples-per-dataset   Samples per dataset per epoch for stratified sampling (default: 1000)
   --train-data-paths      List of NIfTI data paths (for raw image mode)
@@ -119,11 +118,11 @@ Stratified Sampling Strategy:
   - If a dataset has fewer than N samples, it oversamples with replacement
   - This ensures balanced representation across datasets regardless of their size
 
-Validation and Logging:
-  - If --val-list is provided, validation loss is computed after each training epoch
-  - Training and validation losses are logged to training_log.csv in --save-path
-  - CSV format: epoch, train_loss, val_loss (val_loss empty if no validation)
+Logging:
+  - Training loss is logged to training_log.csv in --save-path every epoch
+  - CSV format: epoch, train_loss
   - CSV is appended when resuming training from checkpoint
+  - For validation, use val_log.py separately after training
 """
 
 import os
@@ -490,8 +489,6 @@ def parse_args():
     # Training list and filtering options
     parser.add_argument("--training-list", type=str, default=None,
                         help="Path to training_list_2d.pkl from gen_training_list.py")
-    parser.add_argument("--val-list", type=str, default=None,
-                        help="Path to validation_list_2d.pkl for validation (optional)")
     parser.add_argument("--dice-threshold", type=float, default=0.4,
                         help="Minimum dice score for filtered training (default: 0.4)")
     parser.add_argument("--samples-per-dataset", type=int, default=1000,
@@ -1138,220 +1135,6 @@ def train_epoch_sam2_embedding(model, dataloader, optimizer, loss_fn, transforms
     return epoch_loss / max(num_batches, 1)
 
 
-# =============================================================================
-# Validation Epoch Functions
-# =============================================================================
-
-@torch.no_grad()
-def validate_epoch(model, dataloader, loss_fn, transforms, args, device, rank):
-    """
-    Validate for one epoch (raw image mode).
-
-    Args:
-        model: SAM2 model (DDP wrapped)
-        dataloader: Validation data loader
-        loss_fn: Loss function
-        transforms: SAM2Transforms
-        args: Command line arguments
-        device: Target device
-        rank: Process rank for DDP
-
-    Returns:
-        Average epoch validation loss
-    """
-    model.eval()
-    epoch_loss = 0.0
-    num_batches = 0
-
-    pbar = tqdm(dataloader, desc="Validation", disable=(rank != 0))
-    for images_list, masks_list in pbar:
-        batch_size = len(images_list)
-        batch_loss = 0.0
-        valid_samples = 0
-
-        for i in range(batch_size):
-            image = images_list[i]
-            mask = masks_list[i]
-
-            if isinstance(image, np.ndarray):
-                orig_hw = (image.shape[0], image.shape[1])
-            else:
-                orig_hw = (image.shape[0], image.shape[1])
-                image = image.numpy()
-
-            image_tensor = transforms(image).unsqueeze(0).to(device)
-
-            if isinstance(mask, np.ndarray):
-                mask = torch.from_numpy(mask)
-            if mask.dim() == 2:
-                mask = mask.unsqueeze(0)
-            mask = mask.unsqueeze(0).float().to(device)
-
-            mask_resized = torch.nn.functional.interpolate(
-                mask, size=(256, 256), mode="nearest"
-            )
-
-            point_coords, point_labels, boxes = prepare_prompts(
-                mask, args.prompt_mode, args.jitter, device, transforms, orig_hw
-            )
-
-            with torch.cuda.amp.autocast(enabled=False):
-                low_res_mask = forward_sam2_image(
-                    model.module if hasattr(model, 'module') else model,
-                    image_tensor, point_coords, point_labels, boxes,
-                    transforms, orig_hw
-                )
-
-                if torch.isnan(low_res_mask).any():
-                    continue
-
-                sample_loss = loss_fn(low_res_mask, mask_resized)
-
-                if torch.isnan(sample_loss):
-                    continue
-
-                batch_loss += sample_loss.item()
-                valid_samples += 1
-
-        if valid_samples > 0:
-            epoch_loss += batch_loss / valid_samples
-            num_batches += 1
-
-            if rank == 0:
-                pbar.set_postfix({"val_loss": f"{batch_loss / valid_samples:.4f}"})
-
-    return epoch_loss / max(num_batches, 1)
-
-
-@torch.no_grad()
-def validate_epoch_embedding(model, dataloader, loss_fn, transforms, args, device, rank):
-    """
-    Validate for one epoch using SAMRI v1 pre-computed embeddings.
-
-    Args:
-        model: SAM2 model (DDP wrapped)
-        dataloader: Validation data loader (BalancedEmbDataset)
-        loss_fn: Loss function
-        transforms: SAM2Transforms
-        args: Command line arguments
-        device: Target device
-        rank: Process rank for DDP
-
-    Returns:
-        Average epoch validation loss
-    """
-    model.eval()
-    epoch_loss = 0.0
-    num_batches = 0
-
-    pbar = tqdm(dataloader, desc="Validation", disable=(rank != 0))
-    for image_embed, masks, ori_sizes in pbar:
-        batch_size = image_embed.shape[0]
-        orig_hw_list = [(int(ori_sizes[0][i]), int(ori_sizes[1][i])) for i in range(batch_size)]
-
-        image_embed = image_embed.float().to(device)
-
-        if masks.dim() == 3:
-            masks = masks.unsqueeze(1)
-        masks = masks.float().to(device)
-
-        masks_resized = torch.nn.functional.interpolate(
-            masks, size=(256, 256), mode="nearest"
-        )
-
-        point_coords, point_labels, boxes = prepare_prompts_from_embedding(
-            masks, args.prompt_mode, args.jitter, device, transforms, orig_hw_list
-        )
-
-        with torch.cuda.amp.autocast(enabled=False):
-            low_res_masks = forward_sam2_embedding(
-                model.module if hasattr(model, 'module') else model,
-                image_embed, point_coords, point_labels, boxes, device
-            )
-
-            if torch.isnan(low_res_masks).any():
-                continue
-
-            loss = loss_fn(low_res_masks, masks_resized)
-
-            if torch.isnan(loss):
-                continue
-
-        epoch_loss += loss.item()
-        num_batches += 1
-
-        if rank == 0:
-            pbar.set_postfix({"val_loss": f"{loss.item():.4f}"})
-
-    return epoch_loss / max(num_batches, 1)
-
-
-@torch.no_grad()
-def validate_epoch_sam2_embedding(model, dataloader, loss_fn, transforms, args, device, rank):
-    """
-    Validate for one epoch using SAM2 pre-computed embeddings with high-res features.
-
-    Args:
-        model: SAM2 model (DDP wrapped)
-        dataloader: Validation data loader (SAM2EmbDataset or StratifiedEmbDataset)
-        loss_fn: Loss function
-        transforms: SAM2Transforms
-        args: Command line arguments
-        device: Target device
-        rank: Process rank for DDP
-
-    Returns:
-        Average epoch validation loss
-    """
-    model.eval()
-    epoch_loss = 0.0
-    num_batches = 0
-
-    pbar = tqdm(dataloader, desc="Validation", disable=(rank != 0))
-    for image_embed, high_res_feat_0, high_res_feat_1, masks, ori_sizes in pbar:
-        batch_size = image_embed.shape[0]
-        orig_hw_list = [(int(ori_sizes[0][i]), int(ori_sizes[1][i])) for i in range(batch_size)]
-
-        image_embed = image_embed.float().to(device)
-        high_res_feat_0 = high_res_feat_0.float().to(device)
-        high_res_feat_1 = high_res_feat_1.float().to(device)
-
-        if masks.dim() == 3:
-            masks = masks.unsqueeze(1)
-        masks = masks.float().to(device)
-
-        masks_resized = torch.nn.functional.interpolate(
-            masks, size=(256, 256), mode="nearest"
-        )
-
-        point_coords, point_labels, boxes = prepare_prompts_from_embedding(
-            masks, args.prompt_mode, args.jitter, device, transforms, orig_hw_list
-        )
-
-        with torch.cuda.amp.autocast(enabled=False):
-            low_res_masks = forward_sam2_embedding(
-                model.module if hasattr(model, 'module') else model,
-                image_embed, point_coords, point_labels, boxes, device,
-                high_res_feats=(high_res_feat_0, high_res_feat_1)
-            )
-
-            if torch.isnan(low_res_masks).any():
-                continue
-
-            loss = loss_fn(low_res_masks, masks_resized)
-
-            if torch.isnan(loss):
-                continue
-
-        epoch_loss += loss.item()
-        num_batches += 1
-
-        if rank == 0:
-            pbar.set_postfix({"val_loss": f"{loss.item():.4f}"})
-
-    return epoch_loss / max(num_batches, 1)
-
-
 def main(rank, world_size, args):
     """
     Main training function for each process.
@@ -1518,47 +1301,6 @@ def main(rank, world_size, args):
     if rank == 0:
         print(f"Training samples per epoch: {len(train_dataset)}")
 
-    # Setup validation dataset and dataloader (if provided)
-    val_loader = None
-    val_fn = None
-    if args.val_list is not None:
-        if rank == 0:
-            print(f"\nSetting up validation dataset from: {args.val_list}")
-
-        if args.use_embeddings:
-            # Stratified validation from embeddings
-            val_dataset = StratifiedEmbDataset(
-                embedding_dir=args.embedding_dir,
-                training_list_path=args.val_list,
-                dice_threshold=args.dice_threshold,
-                samples_per_dataset=args.samples_per_dataset,
-                seed=args.seed + 1000,  # Different seed for validation
-            )
-            val_fn = validate_epoch_sam2_embedding
-            val_collate_fn = stratified_emb_collate_fn
-        else:
-            # Stratified validation from images
-            val_dataset = StratifiedTrainingDataset(
-                training_list_path=args.val_list,
-                dice_threshold=args.dice_threshold,
-                samples_per_dataset=args.samples_per_dataset,
-                seed=args.seed + 1000,
-            )
-            val_fn = validate_epoch
-            val_collate_fn = variable_size_collate_fn
-
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            collate_fn=val_collate_fn,
-        )
-
-        if rank == 0:
-            print(f"Validation samples: {len(val_dataset)}")
-
     # Check for existing checkpoint to resume
     ckpt_name, start_epoch = get_checkpoint(args.save_path, args.ckpt_path)
     if start_epoch > 0 and rank == 0:
@@ -1580,13 +1322,12 @@ def main(rank, world_size, args):
         csv_writer = csv.writer(csv_file)
         if not csv_exists:
             # Write header
-            csv_writer.writerow(["epoch", "train_loss", "val_loss"])
+            csv_writer.writerow(["epoch", "train_loss"])
             csv_file.flush()
         print(f"Logging to: {csv_path}")
 
     # Training loop
     losses = []
-    val_losses = []
     for epoch in range(start_epoch, args.num_epochs):
         if rank == 0:
             print(f"\nStart training epoch {epoch + 1}/{args.num_epochs}")
@@ -1604,29 +1345,12 @@ def main(rank, world_size, args):
 
         losses.append(epoch_loss)
 
-        # Validation
-        val_loss = None
-        if val_loader is not None and val_fn is not None:
-            if rank == 0:
-                print(f"Running validation...")
-            val_loss = val_fn(
-                model, val_loader, loss_fn,
-                transforms, args, f"cuda:{rank}", rank
-            )
-            val_losses.append(val_loss)
-            if rank == 0:
-                print(f"Epoch {epoch + 1}: Train Loss: {epoch_loss:.4f}, Val Loss: {val_loss:.4f}")
-        else:
-            if rank == 0:
-                print(f"Epoch {epoch + 1}: Train Loss: {epoch_loss:.4f}")
+        if rank == 0:
+            print(f"Epoch {epoch + 1}: Train Loss: {epoch_loss:.4f}")
 
         # Log to CSV (every epoch)
         if rank == 0 and csv_writer is not None:
-            csv_writer.writerow([
-                epoch + 1,
-                f"{epoch_loss:.6f}",
-                f"{val_loss:.6f}" if val_loss is not None else ""
-            ])
+            csv_writer.writerow([epoch + 1, f"{epoch_loss:.6f}"])
             csv_file.flush()
 
         # Save checkpoint
