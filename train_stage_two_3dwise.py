@@ -146,7 +146,7 @@ except ImportError:
 _THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_THIS_DIR))
 
-from sam2.build_sam import build_sam2, build_sam2_video_predictor
+from sam2.build_sam import build_sam2
 from sam2.utils.transforms import SAM2Transforms
 from utils.losses import DiceFocalLoss
 
@@ -900,7 +900,7 @@ def train_2d_sample(
     # Forward pass
     base_model = model.module if hasattr(model, 'module') else model
 
-    with torch.cuda.amp.autocast(enabled=args.use_amp):
+    with torch.amp.autocast("cuda", enabled=args.use_amp):
         # Get image embeddings
         backbone_out = base_model.forward_image(image_tensor)
         _, vision_feats, vision_pos_embeds, feat_sizes = base_model._prepare_backbone_features(backbone_out)
@@ -932,17 +932,200 @@ def train_2d_sample(
     return loss
 
 
+def process_video_with_memory(
+    model,
+    transforms,
+    img_vol: np.ndarray,
+    mask_vol: np.ndarray,
+    slice_indices: List[int],
+    label: int,
+    loss_fn,
+    device,
+    use_amp: bool = False,
+) -> Tuple[torch.Tensor, int]:
+    """
+    Process a sequence of slices with memory bank, computing loss at each frame.
+
+    This function uses the model directly (not video_predictor) to maintain gradients.
+
+    Args:
+        model: SAM2 model (unwrapped from DDP)
+        transforms: SAM2Transforms for image preprocessing
+        img_vol: [N, H, W] normalized uint8 volume
+        mask_vol: [N, H, W] label mask volume
+        slice_indices: List of slice indices to process in order
+        label: Target label to segment
+        loss_fn: Loss function
+        device: Torch device
+        use_amp: Whether to use automatic mixed precision
+
+    Returns:
+        total_loss: Accumulated loss over all slices
+        num_slices: Number of slices processed
+    """
+    if len(slice_indices) == 0:
+        return torch.tensor(0.0, device=device), 0
+
+    total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    num_slices = 0
+
+    # Memory bank for tracking
+    output_dict = {
+        "cond_frame_outputs": {},
+        "non_cond_frame_outputs": {},
+    }
+
+    num_frames = len(slice_indices)
+
+    for frame_idx, slice_z in enumerate(slice_indices):
+        is_init_cond_frame = (frame_idx == 0)
+
+        # Get current slice image and mask
+        img_2d = img_vol[slice_z]
+        mask_2d = (mask_vol[slice_z] == label).astype(np.float32)
+
+        # Skip if no foreground
+        if mask_2d.sum() == 0 and not is_init_cond_frame:
+            continue
+
+        # Prepare image tensor
+        img_rgb = np.stack([img_2d, img_2d, img_2d], axis=-1)
+        img_tensor = transforms(img_rgb).unsqueeze(0).to(device)  # [1, 3, H, W]
+
+        # Prepare ground truth mask
+        gt_tensor = torch.from_numpy(mask_2d).float().unsqueeze(0).unsqueeze(0).to(device)
+        gt_resized = F.interpolate(gt_tensor, size=(256, 256), mode="nearest")
+
+        # Get prompt (box) for initial frame
+        point_inputs = None
+        mask_inputs = None
+
+        if is_init_cond_frame:
+            # Get bounding box prompt
+            box = mask2d_to_bbox_xyxy(mask_2d.astype(np.uint8))
+            if box is None:
+                return torch.tensor(0.0, device=device), 0
+
+            # Scale box to image coordinates
+            orig_h, orig_w = img_2d.shape
+            scale_x = transforms.resolution / orig_w
+            scale_y = transforms.resolution / orig_h
+
+            # Convert box to points format for SAM2
+            # Box is [x0, y0, x1, y1], convert to corner points
+            box_scaled = box.copy()
+            box_scaled[0] *= scale_x
+            box_scaled[2] *= scale_x
+            box_scaled[1] *= scale_y
+            box_scaled[3] *= scale_y
+
+            # SAM2 uses point format: top-left (label=2) and bottom-right (label=3) for box
+            points = torch.tensor([[
+                [box_scaled[0], box_scaled[1]],  # top-left
+                [box_scaled[2], box_scaled[3]],  # bottom-right
+            ]], dtype=torch.float32, device=device)
+            labels = torch.tensor([[2, 3]], dtype=torch.int32, device=device)  # box corner labels
+
+            point_inputs = {
+                "point_coords": points,
+                "point_labels": labels,
+            }
+
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            # Forward image through backbone
+            backbone_out = model.forward_image(img_tensor)
+
+            # Prepare backbone features
+            _, vision_feats, vision_pos_embeds, feat_sizes = model._prepare_backbone_features(backbone_out)
+
+            # Get high-res features for SAM head
+            if len(vision_feats) > 1:
+                high_res_features = [
+                    x.permute(1, 2, 0).view(x.size(1), x.size(2), *s)
+                    for x, s in zip(vision_feats[:-1], feat_sizes[:-1])
+                ]
+            else:
+                high_res_features = None
+
+            # Prepare memory-conditioned features
+            pix_feat_with_mem = model._prepare_memory_conditioned_features(
+                frame_idx=frame_idx,
+                is_init_cond_frame=is_init_cond_frame,
+                current_vision_feats=vision_feats[-1:],
+                current_vision_pos_embeds=vision_pos_embeds[-1:],
+                feat_sizes=feat_sizes[-1:],
+                output_dict=output_dict,
+                num_frames=num_frames,
+                track_in_reverse=False,
+            )
+
+            # Forward through SAM heads
+            (
+                low_res_multimasks,
+                high_res_multimasks,
+                ious,
+                low_res_masks,
+                high_res_masks,
+                obj_ptr,
+                object_score_logits,
+            ) = model._forward_sam_heads(
+                backbone_features=pix_feat_with_mem,
+                point_inputs=point_inputs,
+                mask_inputs=mask_inputs,
+                high_res_features=high_res_features,
+                multimask_output=False,
+            )
+
+            # Compute loss
+            pred_resized = F.interpolate(low_res_masks, size=(256, 256), mode="bilinear", align_corners=False)
+            loss = loss_fn(pred_resized, gt_resized)
+
+            if not torch.isnan(loss):
+                total_loss = total_loss + loss
+                num_slices += 1
+
+            # Encode memory for next frames
+            if model.num_maskmem > 0:
+                maskmem_features, maskmem_pos_enc = model._encode_new_memory(
+                    current_vision_feats=vision_feats,
+                    feat_sizes=feat_sizes,
+                    pred_masks_high_res=high_res_masks,
+                    object_score_logits=object_score_logits,
+                    is_mask_from_pts=(point_inputs is not None),
+                )
+
+                current_out = {
+                    "maskmem_features": maskmem_features,
+                    "maskmem_pos_enc": maskmem_pos_enc,
+                    "pred_masks": low_res_masks,
+                    "obj_ptr": obj_ptr,
+                }
+
+                if is_init_cond_frame:
+                    output_dict["cond_frame_outputs"][frame_idx] = current_out
+                else:
+                    output_dict["non_cond_frame_outputs"][frame_idx] = current_out
+
+    return total_loss, num_slices
+
+
 def train_3d_sample_with_memory(
     model,
-    video_predictor,
     sample: Dict,
     loss_fn,
+    transforms,
     args,
     device,
 ) -> torch.Tensor:
     """
-    Train on a 3D volume using video predictor with memory.
-    Processes slices sequentially, accumulating losses.
+    Train on a 3D volume using memory bank.
+    Processes slices sequentially with proper gradient flow.
+
+    The volume is split into two "videos":
+    - Video 1: cut_idx -> 0 (reverse order)
+    - Video 2: cut_idx -> N-1 (forward order)
+
+    Each video is processed independently with its own memory bank.
     """
     img_vol = sample["image_volume"]  # [N, H, W] numpy
     mask_vol = sample["mask_volume"]  # [N, H, W] numpy
@@ -953,140 +1136,64 @@ def train_3d_sample_with_memory(
 
     N, H, W = img_vol.shape
 
-    # Normalize volume
+    # Normalize volume to uint8
     vol_normalized = np.stack([normalize_to_uint8(img_vol[z]) for z in range(N)])
 
-    # Prepare videos
-    try:
-        prepared = prepare_videos_once(video_predictor, vol_normalized, v1_slices, v2_slices)
-    except Exception as e:
-        return torch.tensor(0.0, device=device)
+    # Get base model (unwrap DDP if needed)
+    base_model = model.module if hasattr(model, 'module') else model
 
-    total_loss = torch.tensor(0.0, device=device)
-    num_slices = 0
+    total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    total_slices = 0
 
-    try:
-        # Process video 1 (cut -> 0)
-        with suppress_sam2_output(True):
-            state1 = init_state_compat(
-                video_predictor, prepared.v1_source, prepared.v1_len,
-                prefer_streaming=prepared.use_streaming
-            )
-
-        # Add prompts for all labels on frame 0 (cut slice)
+    # Process each label
+    for label in labels:
+        # Check if label exists in cut slice
         gt_cut = mask_vol[cut_idx]
-        for lb in labels:
-            mask_lb = (gt_cut == lb).astype(np.uint8)
-            if mask_lb.sum() == 0:
-                continue
+        if (gt_cut == label).sum() == 0:
+            continue
 
-            box = mask2d_to_bbox_xyxy(mask_lb)
-            if box is None:
-                continue
-
-            try:
-                video_predictor.add_new_points_or_box(
-                    inference_state=state1,
-                    frame_idx=0,
-                    obj_id=int(lb),
-                    box=box,
-                )
-            except TypeError:
-                video_predictor.add_new_points_or_box(
-                    inference_state=state1,
-                    frame_idx=0,
-                    obj_id=int(lb),
-                    points=None,
-                    labels=None,
-                    box=box,
-                )
-
-        # Propagate and compute loss for video 1
-        for frame_idx, obj_ids, mask_logits in video_predictor.propagate_in_video(state1):
-            slice_z = v1_slices[frame_idx]
-            gt_slice = mask_vol[slice_z]
-
-            for i, obj_id in enumerate(obj_ids):
-                gt_lb = (gt_slice == obj_id).astype(np.float32)
-                gt_tensor = torch.from_numpy(gt_lb).unsqueeze(0).unsqueeze(0).to(device)
-                gt_resized = F.interpolate(gt_tensor, size=(256, 256), mode="nearest")
-
-                pred_logits = mask_logits[i:i+1]  # [1, 1, H, W]
-                pred_resized = F.interpolate(pred_logits, size=(256, 256), mode="bilinear", align_corners=False)
-
-                loss = loss_fn(pred_resized, gt_resized)
-                if not torch.isnan(loss):
-                    total_loss = total_loss + loss
-                    num_slices += 1
-
-        # Process video 2 (cut -> end)
-        with suppress_sam2_output(True):
-            state2 = init_state_compat(
-                video_predictor, prepared.v2_source, prepared.v2_len,
-                prefer_streaming=prepared.use_streaming
+        # Process video 1 (cut -> 0)
+        if len(v1_slices) > 0:
+            loss1, n1 = process_video_with_memory(
+                model=base_model,
+                transforms=transforms,
+                img_vol=vol_normalized,
+                mask_vol=mask_vol,
+                slice_indices=v1_slices,
+                label=label,
+                loss_fn=loss_fn,
+                device=device,
+                use_amp=args.use_amp,
             )
+            if n1 > 0:
+                total_loss = total_loss + loss1
+                total_slices += n1
 
-        # Add prompts for video 2
-        for lb in labels:
-            mask_lb = (gt_cut == lb).astype(np.uint8)
-            if mask_lb.sum() == 0:
-                continue
+        # Process video 2 (cut -> end), skip cut slice (already in v1)
+        if len(v2_slices) > 1:
+            v2_remaining = v2_slices[1:]  # Skip cut slice
+            loss2, n2 = process_video_with_memory(
+                model=base_model,
+                transforms=transforms,
+                img_vol=vol_normalized,
+                mask_vol=mask_vol,
+                slice_indices=v2_remaining,
+                label=label,
+                loss_fn=loss_fn,
+                device=device,
+                use_amp=args.use_amp,
+            )
+            if n2 > 0:
+                total_loss = total_loss + loss2
+                total_slices += n2
 
-            box = mask2d_to_bbox_xyxy(mask_lb)
-            if box is None:
-                continue
-
-            try:
-                video_predictor.add_new_points_or_box(
-                    inference_state=state2,
-                    frame_idx=0,
-                    obj_id=int(lb),
-                    box=box,
-                )
-            except TypeError:
-                video_predictor.add_new_points_or_box(
-                    inference_state=state2,
-                    frame_idx=0,
-                    obj_id=int(lb),
-                    points=None,
-                    labels=None,
-                    box=box,
-                )
-
-        # Propagate and compute loss for video 2 (skip frame 0 as it's the cut slice)
-        processed_slices = set([cut_idx])
-        for frame_idx, obj_ids, mask_logits in video_predictor.propagate_in_video(state2):
-            slice_z = v2_slices[frame_idx]
-            if slice_z in processed_slices:
-                continue
-            processed_slices.add(slice_z)
-
-            gt_slice = mask_vol[slice_z]
-
-            for i, obj_id in enumerate(obj_ids):
-                gt_lb = (gt_slice == obj_id).astype(np.float32)
-                gt_tensor = torch.from_numpy(gt_lb).unsqueeze(0).unsqueeze(0).to(device)
-                gt_resized = F.interpolate(gt_tensor, size=(256, 256), mode="nearest")
-
-                pred_logits = mask_logits[i:i+1]
-                pred_resized = F.interpolate(pred_logits, size=(256, 256), mode="bilinear", align_corners=False)
-
-                loss = loss_fn(pred_resized, gt_resized)
-                if not torch.isnan(loss):
-                    total_loss = total_loss + loss
-                    num_slices += 1
-
-    finally:
-        prepared.cleanup()
-
-    if num_slices > 0:
-        return total_loss / num_slices
-    return torch.tensor(0.0, device=device)
+    if total_slices > 0:
+        return total_loss / total_slices
+    return torch.tensor(0.0, device=device, requires_grad=True)
 
 
 def train_epoch(
     model,
-    video_predictor,
     dataloader,
     optimizer,
     loss_fn,
@@ -1098,10 +1205,6 @@ def train_epoch(
 ):
     """Train for one epoch on mixed 2D/3D data."""
     model.train()
-
-    # Set video predictor model to the same as our training model
-    # (they share the same underlying SAM2 model)
-    base_model = model.module if hasattr(model, 'module') else model
 
     epoch_loss = 0.0
     loss_2d_total = 0.0
@@ -1115,7 +1218,7 @@ def train_epoch(
         samples_2d = batch["samples_2d"]
         samples_3d = batch["samples_3d"]
 
-        batch_loss = torch.tensor(0.0, device=device)
+        batch_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
         # Process 2D samples
         for sample in samples_2d:
@@ -1128,7 +1231,7 @@ def train_epoch(
         # Process 3D samples
         for sample in samples_3d:
             loss = train_3d_sample_with_memory(
-                model, video_predictor, sample, loss_fn, args, device
+                model, sample, loss_fn, transforms, args, device
             )
             if not torch.isnan(loss) and loss.item() > 0:
                 batch_loss = batch_loss + loss
@@ -1286,20 +1389,15 @@ def main(rank, world_size, args):
         else:
             print(f"Starting fresh training from stage 1 checkpoint: {ckpt_path}")
 
-    # Build SAM2 model for 2D training
+    # Build SAM2 model for training
+    # Note: We use the model directly for both 2D and 3D training
+    # (not video_predictor, which is for inference only with @torch.no_grad())
     model = build_sam2(
         config_file=args.sam2_config,
         ckpt_path=ckpt_path,
         device=device,
         mode="train",
         apply_postprocessing=False,
-    )
-
-    # Build video predictor for 3D training (shares model with main)
-    video_predictor = build_sam2_video_predictor(
-        config_file=args.sam2_config,
-        ckpt_path=ckpt_path,
-        device=device,
     )
 
     # Freeze appropriate components
@@ -1345,8 +1443,8 @@ def main(rank, world_size, args):
         mask_threshold=0.0,
     )
 
-    # Setup AMP scaler
-    scaler = torch.cuda.amp.GradScaler() if args.use_amp else None
+    # Setup AMP scaler (use new API to avoid deprecation warning)
+    scaler = torch.amp.GradScaler(device) if args.use_amp else None
 
     # Setup datasets
     if rank == 0:
@@ -1421,7 +1519,6 @@ def main(rank, world_size, args):
         # Train epoch
         avg_loss, avg_loss_2d, avg_loss_3d = train_epoch(
             model=model,
-            video_predictor=video_predictor,
             dataloader=train_loader,
             optimizer=optimizer,
             loss_fn=loss_fn,
