@@ -451,6 +451,8 @@ def prepare_videos_once(
             use_streaming=False,
         )
 
+def volume_sample_factory():
+    return {"labels": [], "dices": []}
 
 # =============================================================================
 # Stratified Datasets
@@ -596,7 +598,7 @@ class Stratified3DDataset(Dataset):
 
         # Group samples by (img_path, dataset) and filter by dice
         # For 3D, we group all labels of a volume together
-        self.volume_samples = defaultdict(lambda: {"labels": [], "dices": []})
+        self.volume_samples = defaultdict(volume_sample_factory)
         for sample in all_samples:
             if sample["dice"] >= dice_threshold:
                 key = (sample["img_path"], sample["mask_path"], sample["dataset"])
