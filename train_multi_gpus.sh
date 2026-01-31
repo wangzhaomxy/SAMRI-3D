@@ -63,7 +63,7 @@ NUM_WORKERS_S1=16
 # Stage 2 Configuration
 # ============================================================================
 # Stage 1 checkpoint (required for stage 2)
-STAGE1_CKPT="/scratch/project/samri/Model_save/samri2_stage1/sam2_maskdecoder_epoch_100.pth"
+STAGE1_CKPT="/scratch/project/samri/Model_save/samri2_stratified/sam2_maskdecoder_epoch_50.pth"
 
 # Training lists (required for stage 2)
 TRAINING_LIST_3D="/scratch/project/samri/training_lists/training_list_3d.pkl"
