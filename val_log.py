@@ -14,17 +14,17 @@ Validation datasets are expected in "validation" subfolders within each dataset 
 === CLI Examples ===
 
 1. Validate all checkpoints on 2D validation data:
-   python val_log.py \
-       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-       --ckpt-folder /scratch/project/samri/Model_save/samri2_stage1/ \
-       --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/ \
-       --mode 2d \
-       --output-path /scratch/project/samri/validation_results/ \
-       --prompt-mode box \
-       --device cuda:0 \
-       --io-workers 8 \
-       --max-samples-per-dataset 1000 \
-       --sample-seed 42
+python val_log.py \
+--sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+--ckpt-folder /scratch/project/samri/Model_save/samri2_stage1/ \
+--data-paths /scratch/project/samri/Datasets/SAMRI_train_test/ \
+--mode 2d \
+--output-path /scratch/project/samri/validation_results/ \
+--prompt-mode box \
+--device cuda \
+--io-workers 8 \
+--max-samples-per-dataset 1000 \
+--sample-seed 42
 
 2. Validate all checkpoints on 3D validation data:
    python val_log.py \
@@ -279,18 +279,26 @@ def validate_2d_sample(
     Returns:
         Dice score
     """
-    # Prepare image
+    img_rgb = prepare_image_rgb(img_2d)
+    predictor.set_image(img_rgb)
+    return predict_dice_for_label_on_set_image(predictor, mask_2d, prompt_mode)
+
+
+def prepare_image_rgb(img_2d: np.ndarray) -> np.ndarray:
+    """Prepare 2D image into uint8 RGB."""
     if img_2d.ndim == 2:
         img_rgb = np.stack([img_2d, img_2d, img_2d], axis=-1)
     else:
         img_rgb = img_2d
+    return normalize_to_uint8(img_rgb)
 
-    img_rgb = normalize_to_uint8(img_rgb)
 
-    # Set image
-    predictor.set_image(img_rgb)
-
-    # Prepare prompt
+def predict_dice_for_label_on_set_image(
+    predictor: SAM2ImagePredictor,
+    mask_2d: np.ndarray,
+    prompt_mode: str,
+) -> float:
+    """Predict dice for a single label assuming predictor.set_image was already called."""
     if prompt_mode == "box":
         box = mask2d_to_bbox_xyxy(mask_2d)
         if box is None:
@@ -315,7 +323,6 @@ def validate_2d_sample(
             multimask_output=False,
         )
 
-    # Get best mask
     pred_mask = masks[0] > 0
     return dice_score(pred_mask, mask_2d)
 
@@ -353,31 +360,33 @@ def validate_2d_volume_from_arrays(
     """Validate all slices in a 3D volume for 2D evaluation (arrays)."""
 
     results = []
-    labels = np.unique(mask_arr)
-    labels = labels[labels > 0]  # Exclude background
+    if mask_arr.ndim == 3:
+        slice_indices = np.where(mask_arr.sum(axis=(1, 2)) > 0)[0]
+    else:
+        slice_indices = [0] if mask_arr.sum() > 0 else []
 
-    for label in labels:
-        label_mask = (mask_arr == label).astype(np.uint8)
-
-        # Find slices with this label
-        if label_mask.ndim == 3:
-            slice_counts = label_mask.sum(axis=(1, 2))
-            valid_slices = np.where(slice_counts > 0)[0]
+    for slice_idx in slice_indices:
+        if img_arr.ndim == 3:
+            img_2d = img_arr[slice_idx]
+            mask_2d = mask_arr[slice_idx]
         else:
-            valid_slices = [0] if label_mask.sum() > 0 else []
+            img_2d = img_arr
+            mask_2d = mask_arr
 
-        for slice_idx in valid_slices:
-            if img_arr.ndim == 3:
-                img_2d = img_arr[slice_idx]
-                mask_2d = label_mask[slice_idx]
-            else:
-                img_2d = img_arr
-                mask_2d = label_mask
+        labels = np.unique(mask_2d)
+        labels = labels[labels > 0]
+        if labels.size == 0:
+            continue
 
-            if mask_2d.sum() < 10:  # Skip very small masks
+        img_rgb = prepare_image_rgb(img_2d)
+        predictor.set_image(img_rgb)
+
+        for label in labels:
+            label_mask = (mask_2d == label).astype(np.uint8)
+            if label_mask.sum() < 10:  # Skip very small masks
                 continue
 
-            dice = validate_2d_sample(predictor, img_2d, mask_2d, prompt_mode)
+            dice = predict_dice_for_label_on_set_image(predictor, label_mask, prompt_mode)
             results.append({
                 "slice_idx": int(slice_idx),
                 "label": int(label),
