@@ -71,9 +71,9 @@ TRAINING_LIST_3D="/scratch/project/samri/training_lists/training_list_3d.pkl"
 # Stage 2 hyperparameters
 SAVE_PATH_S2="/scratch/project/samri/Model_save/samri2_stage2/"
 NUM_EPOCHS_S2=50
-BATCH_SIZE_S2=4            # Increased from 2 (GPU mem underutilized)
+BATCH_SIZE_S2=2            # Increased from 2 (GPU mem underutilized)
 LR_S2=2e-5                 # Scale LR with batch size (sqrt scaling)
-GRAD_ACCUM=1               # Reduced from 2 (larger batch already)
+GRAD_ACCUM=2               # Reduced from 2 (larger batch already)
 MIX_RATIO_3D=0.8
 DICE_THRESHOLD_2D=0.4
 DICE_THRESHOLD_3D=0.2
