@@ -132,6 +132,15 @@ def normalize_to_uint8(arr: np.ndarray, p_low: float = 0.5, p_high: float = 99.5
     return (arr * 255.0).astype(np.uint8)
 
 
+def normalize_to_uint8_with_bounds(arr: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """Normalize array to uint8 range [0, 255] using provided bounds."""
+    arr = arr.astype(np.float32)
+    if hi <= lo + 1e-6:
+        lo, hi = float(arr.min()), float(arr.max() + 1e-6)
+    arr = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+    return (arr * 255.0).astype(np.uint8)
+
+
 def dice_score(pred: np.ndarray, gt: np.ndarray) -> float:
     """Compute Dice score between two binary masks."""
     pred = pred.astype(bool)
@@ -305,12 +314,19 @@ def validate_2d_sample(
     return predict_dice_for_label_on_set_image(predictor, mask_2d, prompt_mode)
 
 
-def prepare_image_rgb(img_2d: np.ndarray) -> np.ndarray:
+def prepare_image_rgb(
+    img_2d: np.ndarray,
+    norm_bounds: Optional[Tuple[float, float]] = None,
+) -> np.ndarray:
     """Prepare 2D image into uint8 RGB."""
     if img_2d.ndim == 2:
         img_rgb = np.stack([img_2d, img_2d, img_2d], axis=-1)
     else:
         img_rgb = img_2d
+    if img_rgb.dtype == np.uint8 and img_rgb.ndim == 3 and img_rgb.shape[-1] == 3:
+        return img_rgb
+    if norm_bounds is not None:
+        return normalize_to_uint8_with_bounds(img_rgb, norm_bounds[0], norm_bounds[1])
     return normalize_to_uint8(img_rgb)
 
 
@@ -385,6 +401,15 @@ def validate_2d_volume_from_arrays(
     """Validate all slices in a 3D volume for 2D evaluation (arrays)."""
 
     results = []
+    norm_bounds = None
+    if img_arr.dtype != np.uint8:
+        arr = img_arr.astype(np.float32)
+        lo = np.percentile(arr, 0.5)
+        hi = np.percentile(arr, 99.5)
+        if hi <= lo + 1e-6:
+            lo, hi = float(arr.min()), float(arr.max() + 1e-6)
+        norm_bounds = (lo, hi)
+
     if mask_arr.ndim == 3:
         slice_indices = np.where(mask_arr.sum(axis=(1, 2)) > 0)[0]
     else:
@@ -403,7 +428,7 @@ def validate_2d_volume_from_arrays(
         if labels.size == 0:
             continue
 
-        img_rgb = prepare_image_rgb(img_2d)
+        img_rgb = prepare_image_rgb(img_2d, norm_bounds=norm_bounds)
         t0 = time.perf_counter()
         predictor.set_image(img_rgb)
         if timing is not None:
@@ -462,6 +487,7 @@ def validate_2d_dataset(
     max_samples_per_dataset: Optional[int] = None,
     sample_seed: int = 42,
     timing_enabled: bool = False,
+    use_dataloader_2d: bool = False,
 ) -> List[Dict]:
     """
     Validate a checkpoint on 2D validation datasets.
@@ -476,6 +502,17 @@ def validate_2d_dataset(
     all_results = []
 
     timing = TimingStats() if timing_enabled else None
+
+    if use_dataloader_2d:
+        return validate_2d_dataset_dataloader(
+            predictor=predictor,
+            val_folders=val_folders,
+            prompt_mode=prompt_mode,
+            io_workers=io_workers,
+            max_samples_per_dataset=max_samples_per_dataset,
+            sample_seed=sample_seed,
+            timing=timing,
+        )
 
     for ds_name, val_folder in val_folders.items():
         pairs = find_image_mask_pairs(val_folder)
@@ -516,6 +553,87 @@ def validate_2d_dataset(
     if timing is not None:
         if io_workers and io_workers > 0:
             print("Timing note: load_volume timing is not captured when io_workers > 0.")
+        timing.report("2D timing summary:")
+
+    return all_results
+
+
+def validate_2d_dataset_dataloader(
+    predictor: SAM2ImagePredictor,
+    val_folders: Dict[str, str],
+    prompt_mode: str,
+    io_workers: int = 0,
+    max_samples_per_dataset: Optional[int] = None,
+    sample_seed: int = 42,
+    timing: Optional[TimingStats] = None,
+) -> List[Dict]:
+    """Validate 2D datasets using NiiDataset/DataLoader for faster IO."""
+    from torch.utils.data import DataLoader, Subset
+    from utils.dataloader import NiiDataset
+
+    all_results: List[Dict] = []
+
+    for ds_name, val_folder in val_folders.items():
+        val_root = os.path.join(val_folder, "")
+        dataset = NiiDataset([val_root], multi_mask=True, with_name=True)
+        indices = np.arange(len(dataset))
+        rng = np.random.RandomState(sample_seed)
+        if max_samples_per_dataset and len(indices) > max_samples_per_dataset:
+            indices = rng.choice(indices, size=max_samples_per_dataset, replace=False)
+            dataset = Subset(dataset, indices.tolist())
+
+        loader = DataLoader(
+            dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=io_workers,
+        )
+
+        for image, mask, img_fullpath, mask_fullpath in tqdm(loader, desc=f"2D {ds_name}", leave=False):
+            image = image.squeeze(0).detach().cpu().numpy()
+            mask = mask.squeeze(0).detach().cpu().numpy()
+            if mask.ndim == 2:
+                mask = mask[None, :, :]
+
+            if isinstance(img_fullpath, (list, tuple)):
+                img_path = img_fullpath[0]
+            else:
+                img_path = img_fullpath
+            if isinstance(mask_fullpath, (list, tuple)):
+                mask_path = mask_fullpath[0]
+            else:
+                mask_path = mask_fullpath
+
+            img_rgb = prepare_image_rgb(image)
+            t0 = time.perf_counter()
+            predictor.set_image(img_rgb)
+            if timing is not None:
+                timing.add("set_image", time.perf_counter() - t0)
+                timing.add("slices", 0.0, n=1)
+
+            mask_2d = mask[0]
+            labels = np.unique(mask_2d)
+            labels = labels[labels > 0]
+            for label in labels:
+                label_mask = (mask_2d == label).astype(np.uint8)
+                if label_mask.sum() < 10:
+                    continue
+                t1 = time.perf_counter()
+                dice = predict_dice_for_label_on_set_image(predictor, label_mask, prompt_mode)
+                if timing is not None:
+                    timing.add("predict", time.perf_counter() - t1)
+                    timing.add("labels", 0.0, n=1)
+
+                all_results.append({
+                    "slice_idx": 0,
+                    "label": int(label),
+                    "dice": float(dice),
+                    "dataset": ds_name,
+                    "img_path": img_path,
+                    "mask_path": mask_path,
+                })
+
+    if timing is not None:
         timing.report("2D timing summary:")
 
     return all_results
@@ -994,6 +1112,7 @@ def validate_checkpoint(
     max_samples_per_dataset: Optional[int] = None,
     sample_seed: int = 42,
     timing_enabled: bool = False,
+    use_dataloader_2d: bool = False,
 ) -> Tuple[List[Dict], List[Dict]]:
     """
     Validate a single checkpoint.
@@ -1015,6 +1134,7 @@ def validate_checkpoint(
             max_samples_per_dataset=max_samples_per_dataset,
             sample_seed=sample_seed,
             timing_enabled=timing_enabled,
+            use_dataloader_2d=use_dataloader_2d,
         )
 
     if mode in ["3d", "both"]:
@@ -1082,6 +1202,7 @@ def validate_checkpoint_worker(
     max_samples_per_dataset: Optional[int],
     sample_seed: int,
     timing_enabled: bool,
+    use_dataloader_2d: bool,
 ) -> Tuple[str, List[Dict], List[Dict], List[Dict]]:
     """Worker wrapper for checkpoint validation (for multiprocessing)."""
     ckpt_name = os.path.basename(ckpt_path)
@@ -1096,6 +1217,7 @@ def validate_checkpoint_worker(
         max_samples_per_dataset=max_samples_per_dataset,
         sample_seed=sample_seed,
         timing_enabled=timing_enabled,
+        use_dataloader_2d=use_dataloader_2d,
     )
 
     for r in results_2d:
@@ -1212,6 +1334,8 @@ def parse_args():
                         help="Random seed for dataset sampling (default: 42)")
     parser.add_argument("--timing", action="store_true",
                         help="Print timing breakdown for 2D validation")
+    parser.add_argument("--use-dataloader-2d", action="store_true",
+                        help="Use NiiDataset/DataLoader for 2D validation")
 
     args = parser.parse_args()
 
@@ -1290,6 +1414,7 @@ def main():
                     max_samples_per_dataset=args.max_samples_per_dataset,
                     sample_seed=args.sample_seed,
                     timing_enabled=args.timing,
+                    use_dataloader_2d=args.use_dataloader_2d,
                 )
 
                 # Add checkpoint name to results
@@ -1348,6 +1473,7 @@ def main():
                     args.max_samples_per_dataset,
                     args.sample_seed,
                     args.timing,
+                    args.use_dataloader_2d,
                 ))
 
             for fut in tqdm(as_completed(futures), total=len(futures), desc="Checkpoints"):
