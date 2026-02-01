@@ -1076,6 +1076,48 @@ def save_results_to_csv(results: List[Dict], csv_path: str):
         writer.writerows(results)
 
 
+def append_results_to_csv(results: List[Dict], csv_path: str):
+    """Append results to CSV file, creating it with a header if missing."""
+    if not results:
+        return
+
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    keys = list(results[0].keys())
+    file_exists = os.path.exists(csv_path)
+    write_header = (not file_exists) or os.path.getsize(csv_path) == 0
+
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(results)
+
+
+def load_existing_checkpoints(output_path: str) -> set:
+    """Load checkpoint names already present in result/summary CSVs."""
+    existing = set()
+    csv_paths = [
+        os.path.join(output_path, "validation_summary.csv"),
+        os.path.join(output_path, "validation_results_2d.csv"),
+        os.path.join(output_path, "validation_results_3d.csv"),
+    ]
+    for csv_path in csv_paths:
+        if not os.path.exists(csv_path):
+            continue
+        try:
+            with open(csv_path, "r", newline="") as f:
+                reader = csv.DictReader(f)
+                if "checkpoint" not in (reader.fieldnames or []):
+                    continue
+                for row in reader:
+                    ckpt = row.get("checkpoint")
+                    if ckpt:
+                        existing.add(ckpt)
+        except Exception as e:
+            print(f"  Warning: Failed to read {csv_path}: {e}")
+    return existing
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Validate multiple checkpoints on 2D and/or 3D validation datasets"
@@ -1161,10 +1203,22 @@ def main():
     # Create output directory
     os.makedirs(args.output_path, exist_ok=True)
 
-    # Results accumulators
-    all_results_2d = []
-    all_results_3d = []
-    all_summaries = []
+    # Resume support: skip checkpoints already present in CSVs
+    existing_ckpts = load_existing_checkpoints(args.output_path)
+    if existing_ckpts:
+        before = len(ckpt_paths)
+        ckpt_paths = [p for p in ckpt_paths if os.path.basename(p) not in existing_ckpts]
+        skipped = before - len(ckpt_paths)
+        if skipped > 0:
+            print(f"\nSkipping {skipped} checkpoints already in CSVs.")
+        if not ckpt_paths:
+            print("\nAll checkpoints already validated. Nothing to do.")
+            return
+
+    # Results counters
+    new_results_2d = 0
+    new_results_3d = 0
+    new_summaries = 0
 
     devices = args.devices if args.devices else [args.device]
     max_workers = min(max(1, args.num_workers), len(ckpt_paths), len(devices))
@@ -1194,12 +1248,24 @@ def main():
                 for r in results_3d:
                     r["checkpoint"] = ckpt_name
 
-                all_results_2d.extend(results_2d)
-                all_results_3d.extend(results_3d)
-
                 # Compute summary
                 summary = compute_summary(results_2d, results_3d, ckpt_name)
-                all_summaries.extend(summary)
+
+                # Append results immediately so interrupted runs can resume safely.
+                if results_2d:
+                    csv_path = os.path.join(args.output_path, "validation_results_2d.csv")
+                    append_results_to_csv(results_2d, csv_path)
+                    new_results_2d += len(results_2d)
+
+                if results_3d:
+                    csv_path = os.path.join(args.output_path, "validation_results_3d.csv")
+                    append_results_to_csv(results_3d, csv_path)
+                    new_results_3d += len(results_3d)
+
+                if summary:
+                    csv_path = os.path.join(args.output_path, "validation_summary.csv")
+                    append_results_to_csv(summary, csv_path)
+                    new_summaries += len(summary)
 
                 # Print summary for this checkpoint
                 if summary:
@@ -1238,9 +1304,20 @@ def main():
                     ckpt_path, results_2d, results_3d, summary = fut.result()
                     ckpt_name = os.path.basename(ckpt_path)
 
-                    all_results_2d.extend(results_2d)
-                    all_results_3d.extend(results_3d)
-                    all_summaries.extend(summary)
+                    if results_2d:
+                        csv_path = os.path.join(args.output_path, "validation_results_2d.csv")
+                        append_results_to_csv(results_2d, csv_path)
+                        new_results_2d += len(results_2d)
+
+                    if results_3d:
+                        csv_path = os.path.join(args.output_path, "validation_results_3d.csv")
+                        append_results_to_csv(results_3d, csv_path)
+                        new_results_3d += len(results_3d)
+
+                    if summary:
+                        csv_path = os.path.join(args.output_path, "validation_summary.csv")
+                        append_results_to_csv(summary, csv_path)
+                        new_summaries += len(summary)
 
                     if summary:
                         print(f"  Results for {ckpt_name}:")
@@ -1251,23 +1328,18 @@ def main():
                 except Exception as e:
                     print(f"  Error validating checkpoint: {e}")
 
-    # Save results
-    print("\nSaving results...")
-
-    if all_results_2d:
-        csv_path = os.path.join(args.output_path, "validation_results_2d.csv")
-        save_results_to_csv(all_results_2d, csv_path)
-        print(f"  2D results: {csv_path} ({len(all_results_2d)} samples)")
-
-    if all_results_3d:
-        csv_path = os.path.join(args.output_path, "validation_results_3d.csv")
-        save_results_to_csv(all_results_3d, csv_path)
-        print(f"  3D results: {csv_path} ({len(all_results_3d)} samples)")
-
-    if all_summaries:
-        csv_path = os.path.join(args.output_path, "validation_summary.csv")
-        save_results_to_csv(all_summaries, csv_path)
-        print(f"  Summary: {csv_path} ({len(all_summaries)} entries)")
+    # Results already appended incrementally
+    if new_results_2d or new_results_3d or new_summaries:
+        print("\nAppended results:")
+        if new_results_2d:
+            csv_path = os.path.join(args.output_path, "validation_results_2d.csv")
+            print(f"  2D results: {csv_path} (+{new_results_2d} samples)")
+        if new_results_3d:
+            csv_path = os.path.join(args.output_path, "validation_results_3d.csv")
+            print(f"  3D results: {csv_path} (+{new_results_3d} samples)")
+        if new_summaries:
+            csv_path = os.path.join(args.output_path, "validation_summary.csv")
+            print(f"  Summary: {csv_path} (+{new_summaries} entries)")
 
     print(f"\nTotal elapsed time: {time.time() - t0:.2f}s")
     print("Done!")
