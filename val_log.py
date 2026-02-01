@@ -14,17 +14,19 @@ Validation datasets are expected in "validation" subfolders within each dataset 
 === CLI Examples ===
 
 1. Validate all checkpoints on 2D validation data:
-python val_log.py \
---sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-folder /scratch/project/samri/Model_save/samri2_stage1/ \
---data-paths /scratch/project/samri/Datasets/SAMRI_train_test/ \
---mode 2d \
---output-path /scratch/project/samri/validation_results/ \
---prompt-mode box \
---device cuda \
---io-workers 8 \
---max-samples-per-dataset 1000 \
---sample-seed 42
+   python val_log.py \
+       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+       --ckpt-folder /scratch/project/samri/Model_save/samri2_stage1/ \
+       --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/ \
+       --mode 2d \
+       --output-path /scratch/project/samri/validation_results/ \
+       --prompt-mode box \
+       --device cuda:0 \
+       --io-workers 8 \
+       --use-dataloader-2d \
+       --timing \
+       --max-samples-per-dataset 1000 \
+       --sample-seed 42
 
 2. Validate all checkpoints on 3D validation data:
    python val_log.py \
@@ -61,6 +63,7 @@ python val_log.py \
        --output-path /scratch/project/samri/validation_results/ \
        --device cuda:0 \
        --io-workers 8 \
+       --use-dataloader-2d \
        --max-samples-per-dataset 1000 \
        --sample-seed 42
 
