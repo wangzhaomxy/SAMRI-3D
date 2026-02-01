@@ -16,7 +16,7 @@ Folder layout expected:
       └── visual.py            # NOT used here (it imports SamPredictor)
 
 Example:
-  python test_vis.py \
+  python test_vis2d.py \
     --sam2-config configs/sam2.1/sam2.1_hiera_l.yaml \
     --ckpt-path /path/to/sam2_checkpoint.pt \
     --save-path /path/to/save/results.pkl \
@@ -24,10 +24,10 @@ Example:
     --device cuda
     
     
-python test_vis.py \
---sam2-config configs/sam2.1/sam2.1_hiera_l.yaml \
---ckpt-path /home/s4670484/Desktop/Scratch/samri/pretrained_ckpt/sam2.1_hiera_large.pt \
---save-path /home/s4670484/Desktop/Scratch/samri/Eval_results/SAM2/sam2_hiera_l.pkl \
+python test_vis2d.py \
+--sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+--ckpt-path /home/s4670484/Desktop/Scratch/samri/Model_save/samri2_stage1/sam2_maskdecoder_epoch_50.pth \
+--save-path /home/s4670484/Desktop/Scratch/samri/Eval_results/SAM2/sam2_maskdecoder_epoch_50.pkl \
 --test-file-paths /home/s4670484/Desktop/Scratch/samri/Datasets/SAMRI_train_test/ \
 --device cuda
     
