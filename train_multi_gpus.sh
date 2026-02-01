@@ -1,12 +1,12 @@
 #!/bin/bash --login
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=512G
+#SBATCH --cpus-per-task=96
+#SBATCH --mem=1024G
 #SBATCH --job-name=SAMRI2
-#SBATCH --time=2-00:00:00
+#SBATCH --time=7-00:00:00
 #SBATCH --partition=gpu_rocm        # gpu_rocm      gpu_rocm    gpu_cuda
-#SBATCH --gres=gpu:mi300x:2         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2
+#SBATCH --gres=gpu:mi300x:4         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2
 #SBATCH --account=a_ai_collab
 #SBATCH --qos=gpu                   # sdf           gpu         gpu
 #SBATCH -o /home/s4670484/Documents/SAMRI2_log/slurm-samri2-%j.output
@@ -71,18 +71,19 @@ TRAINING_LIST_3D="/scratch/project/samri/training_lists/training_list_3d.pkl"
 # Stage 2 hyperparameters
 SAVE_PATH_S2="/scratch/project/samri/Model_save/samri2_stage2/"
 NUM_EPOCHS_S2=50
-BATCH_SIZE_S2=2
-LR_S2=5e-6
-GRAD_ACCUM=2
+BATCH_SIZE_S2=8            # Increased from 2 (GPU mem underutilized)
+LR_S2=2e-5                 # Scale LR with batch size (sqrt scaling)
+GRAD_ACCUM=1               # Reduced from 2 (larger batch already)
 MIX_RATIO_3D=0.8
 DICE_THRESHOLD_2D=0.4
 DICE_THRESHOLD_3D=0.2
-SAMPLES_PER_DATASET_2D=500
-SAMPLES_PER_DATASET_3D=100
+SAMPLES_PER_DATASET_2D=50
+SAMPLES_PER_DATASET_3D=10
 MAX_SLICES=64
-MAX_SLICES_PER_VIDEO=32  # Limits memory usage during training
+MAX_SLICES_PER_VIDEO=48    # Increased from 32 (more GPU mem available)
 SAVE_EVERY_S2=1
-NUM_WORKERS_S2=32
+NUM_WORKERS_S2=64          # Increased from 32 (more CPU available)
+PREFETCH_FACTOR=4          # New: prefetch more batches
 
 # ============================================================================
 # Training Execution
