@@ -257,6 +257,27 @@ def suppress_sam2_output(enabled: bool = True):
             os.environ["TQDM_DISABLE"] = old_env
 
 
+class TimingStats:
+    """Lightweight timing stats accumulator."""
+    def __init__(self) -> None:
+        self.times = defaultdict(float)
+        self.counts = defaultdict(int)
+
+    def add(self, key: str, dt: float, n: int = 1) -> None:
+        self.times[key] += dt
+        self.counts[key] += n
+
+    def report(self, prefix: str) -> None:
+        if not self.times:
+            return
+        print(prefix)
+        for key in sorted(self.times.keys()):
+            total = self.times[key]
+            n = self.counts.get(key, 0)
+            avg = total / n if n else 0.0
+            print(f"  {key}: total={total:.2f}s avg={avg:.6f}s n={n}")
+
+
 # =============================================================================
 # 2D Validation
 # =============================================================================
@@ -332,6 +353,7 @@ def validate_2d_volume(
     img_path: str,
     mask_path: str,
     prompt_mode: str,
+    timing: Optional[TimingStats] = None,
 ) -> List[Dict]:
     """
     Validate all slices in a 3D volume for 2D evaluation.
@@ -342,13 +364,15 @@ def validate_2d_volume(
     if not HAS_SITK:
         raise RuntimeError("SimpleITK required for 2D validation")
 
+    t0 = time.perf_counter()
     img_sitk = sitk.ReadImage(img_path)
     mask_sitk = sitk.ReadImage(mask_path)
-
     img_arr = sitk.GetArrayFromImage(img_sitk)
     mask_arr = sitk.GetArrayFromImage(mask_sitk)
+    if timing is not None:
+        timing.add("load_volume", time.perf_counter() - t0)
 
-    return validate_2d_volume_from_arrays(predictor, img_arr, mask_arr, prompt_mode)
+    return validate_2d_volume_from_arrays(predictor, img_arr, mask_arr, prompt_mode, timing=timing)
 
 
 def validate_2d_volume_from_arrays(
@@ -356,6 +380,7 @@ def validate_2d_volume_from_arrays(
     img_arr: np.ndarray,
     mask_arr: np.ndarray,
     prompt_mode: str,
+    timing: Optional[TimingStats] = None,
 ) -> List[Dict]:
     """Validate all slices in a 3D volume for 2D evaluation (arrays)."""
 
@@ -379,14 +404,22 @@ def validate_2d_volume_from_arrays(
             continue
 
         img_rgb = prepare_image_rgb(img_2d)
+        t0 = time.perf_counter()
         predictor.set_image(img_rgb)
+        if timing is not None:
+            timing.add("set_image", time.perf_counter() - t0)
+            timing.add("slices", 0.0, n=1)
 
         for label in labels:
             label_mask = (mask_2d == label).astype(np.uint8)
             if label_mask.sum() < 10:  # Skip very small masks
                 continue
 
+            t1 = time.perf_counter()
             dice = predict_dice_for_label_on_set_image(predictor, label_mask, prompt_mode)
+            if timing is not None:
+                timing.add("predict", time.perf_counter() - t1)
+                timing.add("labels", 0.0, n=1)
             results.append({
                 "slice_idx": int(slice_idx),
                 "label": int(label),
@@ -428,6 +461,7 @@ def validate_2d_dataset(
     io_workers: int = 0,
     max_samples_per_dataset: Optional[int] = None,
     sample_seed: int = 42,
+    timing_enabled: bool = False,
 ) -> List[Dict]:
     """
     Validate a checkpoint on 2D validation datasets.
@@ -440,6 +474,8 @@ def validate_2d_dataset(
     predictor = SAM2ImagePredictor(model)
 
     all_results = []
+
+    timing = TimingStats() if timing_enabled else None
 
     for ds_name, val_folder in val_folders.items():
         pairs = find_image_mask_pairs(val_folder)
@@ -454,7 +490,7 @@ def validate_2d_dataset(
                     try:
                         img_path, mask_path, img_arr, mask_arr = fut.result()
                         slice_results = validate_2d_volume_from_arrays(
-                            predictor, img_arr, mask_arr, prompt_mode
+                            predictor, img_arr, mask_arr, prompt_mode, timing=timing
                         )
                         for r in slice_results:
                             r["dataset"] = ds_name
@@ -466,7 +502,9 @@ def validate_2d_dataset(
         else:
             for img_path, mask_path in tqdm(pairs, desc=f"2D {ds_name}", leave=False):
                 try:
-                    slice_results = validate_2d_volume(predictor, img_path, mask_path, prompt_mode)
+                    slice_results = validate_2d_volume(
+                        predictor, img_path, mask_path, prompt_mode, timing=timing
+                    )
                     for r in slice_results:
                         r["dataset"] = ds_name
                         r["img_path"] = img_path
@@ -474,6 +512,11 @@ def validate_2d_dataset(
                     all_results.extend(slice_results)
                 except Exception as e:
                     print(f"  Warning: Failed to process {img_path}: {e}")
+
+    if timing is not None:
+        if io_workers and io_workers > 0:
+            print("Timing note: load_volume timing is not captured when io_workers > 0.")
+        timing.report("2D timing summary:")
 
     return all_results
 
@@ -950,6 +993,7 @@ def validate_checkpoint(
     io_workers: int = 0,
     max_samples_per_dataset: Optional[int] = None,
     sample_seed: int = 42,
+    timing_enabled: bool = False,
 ) -> Tuple[List[Dict], List[Dict]]:
     """
     Validate a single checkpoint.
@@ -970,6 +1014,7 @@ def validate_checkpoint(
             io_workers=io_workers,
             max_samples_per_dataset=max_samples_per_dataset,
             sample_seed=sample_seed,
+            timing_enabled=timing_enabled,
         )
 
     if mode in ["3d", "both"]:
@@ -1036,6 +1081,7 @@ def validate_checkpoint_worker(
     io_workers: int,
     max_samples_per_dataset: Optional[int],
     sample_seed: int,
+    timing_enabled: bool,
 ) -> Tuple[str, List[Dict], List[Dict], List[Dict]]:
     """Worker wrapper for checkpoint validation (for multiprocessing)."""
     ckpt_name = os.path.basename(ckpt_path)
@@ -1049,6 +1095,7 @@ def validate_checkpoint_worker(
         io_workers=io_workers,
         max_samples_per_dataset=max_samples_per_dataset,
         sample_seed=sample_seed,
+        timing_enabled=timing_enabled,
     )
 
     for r in results_2d:
@@ -1163,6 +1210,8 @@ def parse_args():
                         help="Max image-mask pairs per dataset (default: 1000)")
     parser.add_argument("--sample-seed", type=int, default=42,
                         help="Random seed for dataset sampling (default: 42)")
+    parser.add_argument("--timing", action="store_true",
+                        help="Print timing breakdown for 2D validation")
 
     args = parser.parse_args()
 
@@ -1240,6 +1289,7 @@ def main():
                     io_workers=args.io_workers,
                     max_samples_per_dataset=args.max_samples_per_dataset,
                     sample_seed=args.sample_seed,
+                    timing_enabled=args.timing,
                 )
 
                 # Add checkpoint name to results
@@ -1297,6 +1347,7 @@ def main():
                     args.io_workers,
                     args.max_samples_per_dataset,
                     args.sample_seed,
+                    args.timing,
                 ))
 
             for fut in tqdm(as_completed(futures), total=len(futures), desc="Checkpoints"):
