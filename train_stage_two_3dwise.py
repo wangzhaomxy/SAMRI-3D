@@ -1509,11 +1509,26 @@ def main(rank, world_size, args):
         seed=args.seed,
     )
 
-    # Dataloader (no sampler for stratified dataset)
+    # Create DistributedSampler to split data across GPUs
+    train_sampler = DistributedSampler(
+        mixed_dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True,
+        seed=args.seed,
+    )
+
+    if rank == 0:
+        total_samples = len(mixed_dataset)
+        samples_per_gpu = len(train_sampler)
+        print(f"Total samples: {total_samples}, samples per GPU: {samples_per_gpu}")
+
+    # Dataloader with DistributedSampler for proper DDP distribution
     train_loader = DataLoader(
         mixed_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=False,  # Sampler handles shuffling
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
         collate_fn=mixed_collate_fn,
@@ -1542,12 +1557,15 @@ def main(rank, world_size, args):
             print(f"\nStarting training for {args.num_epochs} epochs...")
 
     for epoch in range(start_epoch, args.num_epochs):
+        # Set epoch for DistributedSampler to ensure different shuffling each epoch
+        train_sampler.set_epoch(epoch)
+
         if rank == 0:
             print(f"\n{'='*60}")
             print(f"Epoch {epoch + 1}/{args.num_epochs}")
             print(f"{'='*60}")
 
-        # Reshuffle dataset
+        # Reshuffle dataset (for internal ordering within each GPU's subset)
         mixed_dataset.reshuffle(epoch)
 
         # Train epoch
