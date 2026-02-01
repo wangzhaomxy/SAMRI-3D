@@ -20,7 +20,11 @@ Validation datasets are expected in "validation" subfolders within each dataset 
        --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/ \
        --mode 2d \
        --output-path /scratch/project/samri/validation_results/ \
-       --prompt-mode box
+       --prompt-mode box \
+       --device cuda:0 \
+       --io-workers 8 \
+       --max-samples-per-dataset 1000 \
+       --sample-seed 42
 
 2. Validate all checkpoints on 3D validation data:
    python val_log.py \
@@ -29,7 +33,11 @@ Validation datasets are expected in "validation" subfolders within each dataset 
        --data-paths /scratch/project/samri/Datasets/SAMRI_datasets_3D/ \
        --mode 3d \
        --output-path /scratch/project/samri/validation_results/ \
-       --prompt-mode box
+       --prompt-mode box \
+       --device cuda:0 \
+       --io-workers 8 \
+       --max-samples-per-dataset 1000 \
+       --sample-seed 42
 
 3. Validate on both 2D and 3D:
    python val_log.py \
@@ -38,7 +46,11 @@ Validation datasets are expected in "validation" subfolders within each dataset 
        --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/ \
        --mode both \
        --output-path /scratch/project/samri/validation_results/ \
-       --prompt-mode box
+       --prompt-mode box \
+       --device cuda:0 \
+       --io-workers 8 \
+       --max-samples-per-dataset 1000 \
+       --sample-seed 42
 
 4. Validate a single checkpoint:
    python val_log.py \
@@ -46,7 +58,11 @@ Validation datasets are expected in "validation" subfolders within each dataset 
        --ckpt-path /scratch/project/samri/Model_save/samri2_stage1/sam2_maskdecoder_epoch_50.pth \
        --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/ \
        --mode both \
-       --output-path /scratch/project/samri/validation_results/
+       --output-path /scratch/project/samri/validation_results/ \
+       --device cuda:0 \
+       --io-workers 8 \
+       --max-samples-per-dataset 1000 \
+       --sample-seed 42
 
 Key Arguments:
   --ckpt-folder         Folder containing multiple checkpoint .pth files
@@ -74,6 +90,7 @@ import contextlib
 import tempfile
 import shutil
 import inspect
+import multiprocessing as mp
 from glob import glob
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
@@ -324,6 +341,17 @@ def validate_2d_volume(
     img_arr = sitk.GetArrayFromImage(img_sitk)
     mask_arr = sitk.GetArrayFromImage(mask_sitk)
 
+    return validate_2d_volume_from_arrays(predictor, img_arr, mask_arr, prompt_mode)
+
+
+def validate_2d_volume_from_arrays(
+    predictor: SAM2ImagePredictor,
+    img_arr: np.ndarray,
+    mask_arr: np.ndarray,
+    prompt_mode: str,
+) -> List[Dict]:
+    """Validate all slices in a 3D volume for 2D evaluation (arrays)."""
+
     results = []
     labels = np.unique(mask_arr)
     labels = labels[labels > 0]  # Exclude background
@@ -359,12 +387,38 @@ def validate_2d_volume(
     return results
 
 
+def load_volume_pair(img_path: str, mask_path: str) -> Tuple[str, str, np.ndarray, np.ndarray]:
+    """Load image/mask arrays for a pair path."""
+    if not HAS_SITK:
+        raise RuntimeError("SimpleITK required for validation")
+    img_sitk = sitk.ReadImage(img_path)
+    mask_sitk = sitk.ReadImage(mask_path)
+    img_arr = sitk.GetArrayFromImage(img_sitk)
+    mask_arr = sitk.GetArrayFromImage(mask_sitk)
+    return img_path, mask_path, img_arr, mask_arr
+
+
+def maybe_sample_pairs(
+    pairs: List[Tuple[str, str]],
+    max_samples: Optional[int],
+    rng: np.random.RandomState,
+) -> List[Tuple[str, str]]:
+    """Limit number of pairs with deterministic random sampling."""
+    if not max_samples or len(pairs) <= max_samples:
+        return pairs
+    idx = rng.choice(len(pairs), size=max_samples, replace=False)
+    return [pairs[i] for i in idx]
+
+
 def validate_2d_dataset(
     sam2_config: str,
     ckpt_path: str,
     val_folders: Dict[str, str],
     prompt_mode: str,
     device: str = "cuda:0",
+    io_workers: int = 0,
+    max_samples_per_dataset: Optional[int] = None,
+    sample_seed: int = 42,
 ) -> List[Dict]:
     """
     Validate a checkpoint on 2D validation datasets.
@@ -380,17 +434,37 @@ def validate_2d_dataset(
 
     for ds_name, val_folder in val_folders.items():
         pairs = find_image_mask_pairs(val_folder)
+        rng = np.random.RandomState(sample_seed)
+        pairs = maybe_sample_pairs(pairs, max_samples_per_dataset, rng)
 
-        for img_path, mask_path in tqdm(pairs, desc=f"2D {ds_name}", leave=False):
-            try:
-                slice_results = validate_2d_volume(predictor, img_path, mask_path, prompt_mode)
-                for r in slice_results:
-                    r["dataset"] = ds_name
-                    r["img_path"] = img_path
-                    r["mask_path"] = mask_path
-                all_results.extend(slice_results)
-            except Exception as e:
-                print(f"  Warning: Failed to process {img_path}: {e}")
+        if io_workers and io_workers > 0:
+            ctx = mp.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=io_workers, mp_context=ctx) as executor:
+                futures = [executor.submit(load_volume_pair, p[0], p[1]) for p in pairs]
+                for fut in tqdm(as_completed(futures), total=len(futures), desc=f"2D {ds_name}", leave=False):
+                    try:
+                        img_path, mask_path, img_arr, mask_arr = fut.result()
+                        slice_results = validate_2d_volume_from_arrays(
+                            predictor, img_arr, mask_arr, prompt_mode
+                        )
+                        for r in slice_results:
+                            r["dataset"] = ds_name
+                            r["img_path"] = img_path
+                            r["mask_path"] = mask_path
+                        all_results.extend(slice_results)
+                    except Exception as e:
+                        print(f"  Warning: Failed to process {ds_name}: {e}")
+        else:
+            for img_path, mask_path in tqdm(pairs, desc=f"2D {ds_name}", leave=False):
+                try:
+                    slice_results = validate_2d_volume(predictor, img_path, mask_path, prompt_mode)
+                    for r in slice_results:
+                        r["dataset"] = ds_name
+                        r["img_path"] = img_path
+                        r["mask_path"] = mask_path
+                    all_results.extend(slice_results)
+                except Exception as e:
+                    print(f"  Warning: Failed to process {img_path}: {e}")
 
     return all_results
 
@@ -706,6 +780,17 @@ def validate_3d_volume(
     img_arr = sitk.GetArrayFromImage(img_sitk)
     mask_arr = sitk.GetArrayFromImage(mask_sitk)
 
+    return validate_3d_volume_from_arrays(predictor, img_arr, mask_arr, prompt_mode)
+
+
+def validate_3d_volume_from_arrays(
+    predictor: SAM2VideoPredictor,
+    img_arr: np.ndarray,
+    mask_arr: np.ndarray,
+    prompt_mode: str,
+) -> List[Dict]:
+    """Validate a 3D volume using multi-object inference (arrays)."""
+
     # Find cut slice and labels
     cut_idx, labels, primary_axis = find_cut_slice_and_labels(mask_arr)
 
@@ -789,6 +874,9 @@ def validate_3d_dataset(
     val_folders: Dict[str, str],
     prompt_mode: str,
     device: str = "cuda:0",
+    io_workers: int = 0,
+    max_samples_per_dataset: Optional[int] = None,
+    sample_seed: int = 42,
 ) -> List[Dict]:
     """
     Validate a checkpoint on 3D validation datasets.
@@ -804,17 +892,37 @@ def validate_3d_dataset(
 
     for ds_name, val_folder in val_folders.items():
         pairs = find_image_mask_pairs(val_folder)
+        rng = np.random.RandomState(sample_seed)
+        pairs = maybe_sample_pairs(pairs, max_samples_per_dataset, rng)
 
-        for img_path, mask_path in tqdm(pairs, desc=f"3D {ds_name}", leave=False):
-            try:
-                vol_results = validate_3d_volume(predictor, img_path, mask_path, prompt_mode)
-                for r in vol_results:
-                    r["dataset"] = ds_name
-                    r["img_path"] = img_path
-                    r["mask_path"] = mask_path
-                all_results.extend(vol_results)
-            except Exception as e:
-                print(f"  Warning: Failed to process {img_path}: {e}")
+        if io_workers and io_workers > 0:
+            ctx = mp.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=io_workers, mp_context=ctx) as executor:
+                futures = [executor.submit(load_volume_pair, p[0], p[1]) for p in pairs]
+                for fut in tqdm(as_completed(futures), total=len(futures), desc=f"3D {ds_name}", leave=False):
+                    try:
+                        img_path, mask_path, img_arr, mask_arr = fut.result()
+                        vol_results = validate_3d_volume_from_arrays(
+                            predictor, img_arr, mask_arr, prompt_mode
+                        )
+                        for r in vol_results:
+                            r["dataset"] = ds_name
+                            r["img_path"] = img_path
+                            r["mask_path"] = mask_path
+                        all_results.extend(vol_results)
+                    except Exception as e:
+                        print(f"  Warning: Failed to process {ds_name}: {e}")
+        else:
+            for img_path, mask_path in tqdm(pairs, desc=f"3D {ds_name}", leave=False):
+                try:
+                    vol_results = validate_3d_volume(predictor, img_path, mask_path, prompt_mode)
+                    for r in vol_results:
+                        r["dataset"] = ds_name
+                        r["img_path"] = img_path
+                        r["mask_path"] = mask_path
+                    all_results.extend(vol_results)
+                except Exception as e:
+                    print(f"  Warning: Failed to process {img_path}: {e}")
 
     return all_results
 
@@ -830,6 +938,9 @@ def validate_checkpoint(
     mode: str,
     prompt_mode: str,
     device: str = "cuda:0",
+    io_workers: int = 0,
+    max_samples_per_dataset: Optional[int] = None,
+    sample_seed: int = 42,
 ) -> Tuple[List[Dict], List[Dict]]:
     """
     Validate a single checkpoint.
@@ -841,10 +952,28 @@ def validate_checkpoint(
     results_3d = []
 
     if mode in ["2d", "both"]:
-        results_2d = validate_2d_dataset(sam2_config, ckpt_path, val_folders, prompt_mode, device)
+        results_2d = validate_2d_dataset(
+            sam2_config,
+            ckpt_path,
+            val_folders,
+            prompt_mode,
+            device,
+            io_workers=io_workers,
+            max_samples_per_dataset=max_samples_per_dataset,
+            sample_seed=sample_seed,
+        )
 
     if mode in ["3d", "both"]:
-        results_3d = validate_3d_dataset(sam2_config, ckpt_path, val_folders, prompt_mode, device)
+        results_3d = validate_3d_dataset(
+            sam2_config,
+            ckpt_path,
+            val_folders,
+            prompt_mode,
+            device,
+            io_workers=io_workers,
+            max_samples_per_dataset=max_samples_per_dataset,
+            sample_seed=sample_seed,
+        )
 
     return results_2d, results_3d
 
@@ -886,6 +1015,40 @@ def compute_summary(results_2d: List[Dict], results_3d: List[Dict], ckpt_name: s
             })
 
     return summary
+
+
+def validate_checkpoint_worker(
+    sam2_config: str,
+    ckpt_path: str,
+    val_folders: Dict[str, str],
+    mode: str,
+    prompt_mode: str,
+    device: str,
+    io_workers: int,
+    max_samples_per_dataset: Optional[int],
+    sample_seed: int,
+) -> Tuple[str, List[Dict], List[Dict], List[Dict]]:
+    """Worker wrapper for checkpoint validation (for multiprocessing)."""
+    ckpt_name = os.path.basename(ckpt_path)
+    results_2d, results_3d = validate_checkpoint(
+        sam2_config=sam2_config,
+        ckpt_path=ckpt_path,
+        val_folders=val_folders,
+        mode=mode,
+        prompt_mode=prompt_mode,
+        device=device,
+        io_workers=io_workers,
+        max_samples_per_dataset=max_samples_per_dataset,
+        sample_seed=sample_seed,
+    )
+
+    for r in results_2d:
+        r["checkpoint"] = ckpt_name
+    for r in results_3d:
+        r["checkpoint"] = ckpt_name
+
+    summary = compute_summary(results_2d, results_3d, ckpt_name)
+    return ckpt_path, results_2d, results_3d, summary
 
 
 def save_results_to_csv(results: List[Dict], csv_path: str):
@@ -938,8 +1101,17 @@ def parse_args():
     # Other
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="Device to use (default: cuda:0)")
+    parser.add_argument("--devices", type=str, nargs="+", default=None,
+                        help="Device list for parallel validation (e.g., cuda:0 cuda:1). "
+                             "Overrides --device when provided. Use repeats to oversubscribe.")
     parser.add_argument("--num-workers", type=int, default=8,
-                        help="Number of parallel workers (not yet implemented)")
+                        help="Number of parallel workers for checkpoint-level validation")
+    parser.add_argument("--io-workers", type=int, default=4,
+                        help="Number of CPU workers for IO/preprocessing (default: 4)")
+    parser.add_argument("--max-samples-per-dataset", type=int, default=1000,
+                        help="Max image-mask pairs per dataset (default: 1000)")
+    parser.add_argument("--sample-seed", type=int, default=42,
+                        help="Random seed for dataset sampling (default: 42)")
 
     args = parser.parse_args()
 
@@ -985,44 +1157,90 @@ def main():
     all_results_3d = []
     all_summaries = []
 
-    # Validate each checkpoint
-    for ckpt_path in tqdm(ckpt_paths, desc="Checkpoints"):
-        ckpt_name = os.path.basename(ckpt_path)
-        print(f"\nValidating: {ckpt_name}")
+    devices = args.devices if args.devices else [args.device]
+    max_workers = min(max(1, args.num_workers), len(ckpt_paths), len(devices))
 
-        try:
-            results_2d, results_3d = validate_checkpoint(
-                sam2_config=args.sam2_config,
-                ckpt_path=ckpt_path,
-                val_folders=val_folders,
-                mode=args.mode,
-                prompt_mode=args.prompt_mode,
-                device=args.device,
-            )
+    if max_workers == 1:
+        # Validate each checkpoint sequentially
+        for ckpt_path in tqdm(ckpt_paths, desc="Checkpoints"):
+            ckpt_name = os.path.basename(ckpt_path)
+            print(f"\nValidating: {ckpt_name}")
 
-            # Add checkpoint name to results
-            for r in results_2d:
-                r["checkpoint"] = ckpt_name
-            for r in results_3d:
-                r["checkpoint"] = ckpt_name
+            try:
+                results_2d, results_3d = validate_checkpoint(
+                    sam2_config=args.sam2_config,
+                    ckpt_path=ckpt_path,
+                    val_folders=val_folders,
+                    mode=args.mode,
+                    prompt_mode=args.prompt_mode,
+                    device=devices[0],
+                    io_workers=args.io_workers,
+                    max_samples_per_dataset=args.max_samples_per_dataset,
+                    sample_seed=args.sample_seed,
+                )
 
-            all_results_2d.extend(results_2d)
-            all_results_3d.extend(results_3d)
+                # Add checkpoint name to results
+                for r in results_2d:
+                    r["checkpoint"] = ckpt_name
+                for r in results_3d:
+                    r["checkpoint"] = ckpt_name
 
-            # Compute summary
-            summary = compute_summary(results_2d, results_3d, ckpt_name)
-            all_summaries.extend(summary)
+                all_results_2d.extend(results_2d)
+                all_results_3d.extend(results_3d)
 
-            # Print summary for this checkpoint
-            if summary:
-                print(f"  Results for {ckpt_name}:")
-                for s in summary:
-                    print(f"    {s['dataset']} ({s['mode']}): "
-                          f"mean_dice={s['mean_dice']:.4f} +/- {s['std_dice']:.4f} "
-                          f"(n={s['num_samples']})")
+                # Compute summary
+                summary = compute_summary(results_2d, results_3d, ckpt_name)
+                all_summaries.extend(summary)
 
-        except Exception as e:
-            print(f"  Error validating {ckpt_name}: {e}")
+                # Print summary for this checkpoint
+                if summary:
+                    print(f"  Results for {ckpt_name}:")
+                    for s in summary:
+                        print(f"    {s['dataset']} ({s['mode']}): "
+                              f"mean_dice={s['mean_dice']:.4f} +/- {s['std_dice']:.4f} "
+                              f"(n={s['num_samples']})")
+
+            except Exception as e:
+                print(f"  Error validating {ckpt_name}: {e}")
+    else:
+        print(f"\nValidating checkpoints in parallel with {max_workers} workers...")
+        ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
+            futures = []
+            for idx, ckpt_path in enumerate(ckpt_paths):
+                device = devices[idx % len(devices)]
+                ckpt_name = os.path.basename(ckpt_path)
+                print(f"\nQueued: {ckpt_name} on {device}")
+                futures.append(executor.submit(
+                    validate_checkpoint_worker,
+                    args.sam2_config,
+                    ckpt_path,
+                    val_folders,
+                    args.mode,
+                    args.prompt_mode,
+                    device,
+                    args.io_workers,
+                    args.max_samples_per_dataset,
+                    args.sample_seed,
+                ))
+
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="Checkpoints"):
+                try:
+                    ckpt_path, results_2d, results_3d, summary = fut.result()
+                    ckpt_name = os.path.basename(ckpt_path)
+
+                    all_results_2d.extend(results_2d)
+                    all_results_3d.extend(results_3d)
+                    all_summaries.extend(summary)
+
+                    if summary:
+                        print(f"  Results for {ckpt_name}:")
+                        for s in summary:
+                            print(f"    {s['dataset']} ({s['mode']}): "
+                                  f"mean_dice={s['mean_dice']:.4f} +/- {s['std_dice']:.4f} "
+                                  f"(n={s['num_samples']})")
+                except Exception as e:
+                    print(f"  Error validating checkpoint: {e}")
 
     # Save results
     print("\nSaving results...")
