@@ -2,7 +2,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=96
-#SBATCH --mem=1024G
+#SBATCH --mem=512G
 #SBATCH --job-name=SAMRI2
 #SBATCH --time=7-00:00:00
 #SBATCH --partition=gpu_rocm        # gpu_rocm      gpu_rocm    gpu_cuda
@@ -80,7 +80,7 @@ DICE_THRESHOLD_3D=0.2
 SAMPLES_PER_DATASET_2D=50
 SAMPLES_PER_DATASET_3D=10
 MAX_SLICES=64
-MAX_SLICES_PER_VIDEO=48    # Increased from 32 (more GPU mem available)
+MAX_SLICES_PER_VIDEO=32    # Increased from 32 (more GPU mem available)
 SAVE_EVERY_S2=1
 NUM_WORKERS_S2=64          # Increased from 32 (more CPU available)
 PREFETCH_FACTOR=4          # New: prefetch more batches
