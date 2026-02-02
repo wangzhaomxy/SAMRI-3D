@@ -273,8 +273,8 @@ class StratifiedTrainingDataset(Dataset):
             img_2d = img_arr
             mask_2d = (mask_arr == label).astype(np.uint8)
 
-        # Normalize image to [0, 255] uint8
-        img_2d = self._normalize_to_uint8(img_2d)
+        # Normalize image to [0, 255] uint8 (match NiiDataset)
+        img_2d = self._preprocess_minmax_uint8(img_2d)
 
         # Convert to RGB (H, W, 3)
         if img_2d.ndim == 2:
@@ -292,15 +292,12 @@ class StratifiedTrainingDataset(Dataset):
         slice_counts = label_mask.sum(axis=(1, 2))
         return int(np.argmax(slice_counts))
 
-    def _normalize_to_uint8(self, img, p_low=0.5, p_high=99.5):
-        """Normalize image to uint8 range."""
+    def _preprocess_minmax_uint8(self, img):
+        """Normalize image to uint8 range using min-max scaling."""
         img = img.astype(np.float32)
-        lo = np.percentile(img, p_low)
-        hi = np.percentile(img, p_high)
-        if hi <= lo + 1e-6:
-            lo, hi = float(img.min()), float(img.max() + 1e-6)
-        img = np.clip((img - lo) / (hi - lo), 0.0, 1.0)
-        return (img * 255.0).astype(np.uint8)
+        img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+        img = np.round(img * 255.0)
+        return img.astype(np.uint8)
 
 
 class StratifiedEmbDataset(Dataset):
