@@ -288,6 +288,16 @@ def read_3d_image(path: str) -> Tuple[np.ndarray, Any]:
     return arr, img
 
 
+def choose_primary_axis(shape: Tuple[int, int, int]) -> int:
+    """
+    Choose primary axis as the shortest dimension.
+    This matches test_vis3d_multi.py behavior for consistent video ordering.
+    """
+    m = min(shape)
+    axes = [i for i, s in enumerate(shape) if s == m]
+    return axes[0] if axes else 0
+
+
 def find_cut_slice_and_labels(gt_arr: np.ndarray) -> Tuple[int, List[int], int]:
     """
     Find the cut slice (slice with largest foreground) and unique labels.
@@ -295,10 +305,10 @@ def find_cut_slice_and_labels(gt_arr: np.ndarray) -> Tuple[int, List[int], int]:
     Returns:
         cut_idx: Index of the cut slice
         labels: List of unique non-zero labels
-        primary_axis: Axis with most slices (for reorientation)
+        primary_axis: Shortest axis (for slicing, matches test_vis3d_multi.py)
     """
-    # Find axis with most slices
-    primary_axis = int(np.argmax(gt_arr.shape))
+    # Find shortest axis (matches test_vis3d_multi.py)
+    primary_axis = choose_primary_axis(gt_arr.shape)
 
     # Move primary axis to front
     gt_reoriented = np.moveaxis(gt_arr, primary_axis, 0)
