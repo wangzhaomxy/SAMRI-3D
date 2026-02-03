@@ -221,14 +221,17 @@ def get_latest_checkpoint(save_path: str, initial_ckpt: str) -> Tuple[str, int]:
     return latest_ckpt, latest_epoch
 
 
-def normalize_to_uint8(img: np.ndarray, p_low: float = 0.5, p_high: float = 99.5) -> np.ndarray:
-    """Normalize image to uint8 range using percentile clipping."""
+def normalize_to_uint8(img: np.ndarray) -> np.ndarray:
+    """Normalize image to uint8 range using plain min-max scaling.
+
+    This matches SAM2's expected preprocessing: images should be normalized
+    to [0, 255] uint8 before being passed through SAM2Transforms.
+    """
     img = img.astype(np.float32)
-    lo = np.percentile(img, p_low)
-    hi = np.percentile(img, p_high)
-    if hi <= lo + 1e-6:
-        lo, hi = float(img.min()), float(img.max() + 1e-6)
-    img = np.clip((img - lo) / (hi - lo), 0.0, 1.0)
+    img_min, img_max = img.min(), img.max()
+    if img_max - img_min < 1e-8:
+        img_max = img_min + 1e-8
+    img = (img - img_min) / (img_max - img_min)
     return (img * 255.0).astype(np.uint8)
 
 

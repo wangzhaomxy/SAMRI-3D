@@ -125,6 +125,33 @@ python training/train.py \
 - `box` - Bounding box prompts derived from ground truth
 - `mask` - Dense point sampling from ground truth masks
 
+### Image Preprocessing (IMPORTANT)
+All images must be normalized using **plain min-max scaling** before being fed into SAM2:
+
+```python
+def normalize_to_uint8(img: np.ndarray) -> np.ndarray:
+    """Normalize image to uint8 range using plain min-max scaling."""
+    img = img.astype(np.float32)
+    img_min, img_max = img.min(), img.max()
+    if img_max - img_min < 1e-8:
+        img_max = img_min + 1e-8
+    img = (img - img_min) / (img_max - img_min)
+    return (img * 255.0).astype(np.uint8)
+```
+
+**Why plain min-max?**
+- SAM2's `SAM2Transforms` expects uint8 [0, 255] input, then applies `ToTensor()` (scales to [0,1]) followed by ImageNet normalization
+- Using percentile-based normalization (e.g., clipping at 0.5th and 99.5th percentiles) creates inconsistency between training and inference
+- All SAMRI2 scripts use plain min-max to ensure consistency across training, validation, and inference
+
+**Do NOT use percentile-based normalization** like:
+```python
+# WRONG - do not use this
+lo = np.percentile(img, 0.5)
+hi = np.percentile(img, 99.5)
+img = np.clip((img - lo) / (hi - lo), 0.0, 1.0)
+```
+
 ## Reference Materials (backup/)
 
 The `backup/` folder contains Meta's original SAM2 files as reference examples. This folder will be removed after project finalization.

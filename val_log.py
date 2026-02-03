@@ -123,23 +123,30 @@ from sam2.sam2_video_predictor import SAM2VideoPredictor
 # Utility Functions
 # =============================================================================
 
-def normalize_to_uint8(arr: np.ndarray, p_low: float = 0.5, p_high: float = 99.5) -> np.ndarray:
-    """Normalize array to uint8 range [0, 255]."""
+def normalize_to_uint8(arr: np.ndarray) -> np.ndarray:
+    """Normalize array to uint8 range [0, 255] using plain min-max scaling.
+
+    This matches SAM2's expected preprocessing: images should be normalized
+    to [0, 255] uint8 before being passed through SAM2Transforms.
+    """
     arr = arr.astype(np.float32)
-    lo = np.percentile(arr, p_low)
-    hi = np.percentile(arr, p_high)
-    if hi <= lo + 1e-6:
-        lo, hi = float(arr.min()), float(arr.max() + 1e-6)
-    arr = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+    arr_min, arr_max = arr.min(), arr.max()
+    if arr_max - arr_min < 1e-8:
+        arr_max = arr_min + 1e-8
+    arr = (arr - arr_min) / (arr_max - arr_min)
     return (arr * 255.0).astype(np.uint8)
 
 
 def normalize_to_uint8_with_bounds(arr: np.ndarray, lo: float, hi: float) -> np.ndarray:
-    """Normalize array to uint8 range [0, 255] using provided bounds."""
+    """Normalize array to uint8 range [0, 255] using provided min-max bounds.
+
+    Used for consistent normalization across slices in a 3D volume.
+    """
     arr = arr.astype(np.float32)
-    if hi <= lo + 1e-6:
-        lo, hi = float(arr.min()), float(arr.max() + 1e-6)
-    arr = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+    if hi - lo < 1e-8:
+        hi = lo + 1e-8
+    arr = (arr - lo) / (hi - lo)
+    arr = np.clip(arr, 0.0, 1.0)
     return (arr * 255.0).astype(np.uint8)
 
 
@@ -406,10 +413,9 @@ def validate_2d_volume_from_arrays(
     norm_bounds = None
     if img_arr.dtype != np.uint8:
         arr = img_arr.astype(np.float32)
-        lo = np.percentile(arr, 0.5)
-        hi = np.percentile(arr, 99.5)
-        if hi <= lo + 1e-6:
-            lo, hi = float(arr.min()), float(arr.max() + 1e-6)
+        lo, hi = float(arr.min()), float(arr.max())
+        if hi - lo < 1e-8:
+            hi = lo + 1e-8
         norm_bounds = (lo, hi)
 
     if mask_arr.ndim == 3:

@@ -229,13 +229,17 @@ def build_two_videos_indices(N: int, n: int) -> Tuple[List[int], List[int]]:
 # ----------------------------
 # Frame adapters: streaming callable (preferred) + jpg fallback
 # ----------------------------
-def normalize_to_uint8(slice2d: np.ndarray, p_low: float = 0.5, p_high: float = 99.5) -> np.ndarray:
+def normalize_to_uint8(slice2d: np.ndarray) -> np.ndarray:
+    """Normalize slice to uint8 range using plain min-max scaling.
+
+    This matches SAM2's expected preprocessing: images should be normalized
+    to [0, 255] uint8 before being passed through SAM2Transforms.
+    """
     sl = slice2d.astype(np.float32)
-    lo = np.percentile(sl, p_low)
-    hi = np.percentile(sl, p_high)
-    if hi <= lo + 1e-6:
-        lo, hi = float(sl.min()), float(sl.max() + 1e-6)
-    sl = np.clip((sl - lo) / (hi - lo), 0.0, 1.0)
+    sl_min, sl_max = sl.min(), sl.max()
+    if sl_max - sl_min < 1e-8:
+        sl_max = sl_min + 1e-8
+    sl = (sl - sl_min) / (sl_max - sl_min)
     return (sl * 255.0).astype(np.uint8)
 
 
