@@ -26,8 +26,8 @@ Example:
     
 python test_vis2d.py \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-path /home/s4670484/Desktop/Scratch/samri/Model_save/samri2_stage1/sam2_maskdecoder_epoch_50.pth \
---save-path /home/s4670484/Desktop/Scratch/samri/Eval_results/SAM2/sam2_maskdecoder_epoch_50.pkl \
+--ckpt-path /home/s4670484/Desktop/Scratch/samri/Model_save/samri2_stage2/sam2_stage2_epoch_5.pth \
+--save-path /home/s4670484/Desktop/Scratch/samri/Eval_results/SAM2/sam2_stage2_epoch_5_2d.pkl \
 --test-file-paths /home/s4670484/Desktop/Scratch/samri/Datasets/SAMRI_train_test/ \
 --device cuda
     

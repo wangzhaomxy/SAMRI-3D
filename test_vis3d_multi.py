@@ -19,19 +19,19 @@ Features:
 === Usage ===
 
 1. Basic evaluation with box prompts:
-   python test_vis3d_multi.py \\
-       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-       --ckpt-path /path/to/sam2.1_hiera_small.pt \\
-       --dataset-path /path/to/Datasets/Test_3d/ \\
-       --save-path /path/to/results_multi.pkl \\
+   python test_vis3d_multi.py \
+       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+       --ckpt-path /path/to/sam2.1_hiera_small.pt \
+       --dataset-path /path/to/Datasets/Test_3d/ \
+       --save-path /path/to/results_multi.pkl \
        --prompt-mode box
 
 2. With parallel data loading (faster I/O):
-   python test_vis3d_multi.py \\
-       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-       --ckpt-path /path/to/sam2.1_hiera_small.pt \\
-       --dataset-path /path/to/Datasets/Test_3d/ \\
-       --save-path /path/to/results_multi.pkl \\
+   python test_vis3d_multi.py \
+       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+       --ckpt-path /path/to/sam2.1_hiera_small.pt \
+       --dataset-path /path/to/Datasets/Test_3d/ \
+       --save-path /path/to/results_multi.pkl \
        --num-workers 8
 
 === Options ===
@@ -50,6 +50,14 @@ Features:
     sam2.1_hiera_s.yaml     sam2.1_hiera_small.pt
     sam2.1_hiera_b+.yaml    sam2.1_hiera_base_plus.pt
     sam2.1_hiera_l.yaml     sam2.1_hiera_large.pt
+
+Examples:    
+python test_vis3d_multi.py \
+--sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+--ckpt-path /scratch/project/samri/Model_save/samri2_stage2/sam2_stage2_epoch_10.pth \
+--dataset-path /scratch/project/samri/Datasets/SAMRI_datasets_3D/ \
+--save-path /scratch/project/samri/Eval_results/SAM2/sam2_stage2_epoch_10_3d.pkl \
+--num-workers 12
 """
 
 from __future__ import annotations
@@ -327,7 +335,9 @@ def init_state_compat(predictor, video_source: Any, num_frames: int, prefer_stre
             kwargs["num_frames"] = int(num_frames)
         try:
             return predictor.init_state(**kwargs)
-        except TypeError:
+        except Exception:
+            # Catch all exceptions (TypeError, ValueError, RuntimeError, etc.)
+            # when streaming fails, fallback to JPEG directory mode
             pass
 
     if not isinstance(video_source, str):

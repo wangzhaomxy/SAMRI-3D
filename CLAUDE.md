@@ -16,21 +16,23 @@ python setup_sam2.py install        # Install SAM2 with CUDA extensions
 
 ### Running Evaluation
 ```bash
-# 3D single-object evaluation
+# 3D single-object evaluation (iterative, per-label)
 python test_vis3d.py \
   --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
   --ckpt-path /path/to/checkpoint.pt \
   --dataset-path /path/to/dataset/ \
   --save-path /path/to/results.pkl \
-  --prompt-mode box
+  --prompt-mode box \
+  --num-workers 8
 
-# 3D multi-object evaluation
+# 3D multi-object evaluation (faster, all labels at once)
 python test_vis3d_multi.py \
   --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
   --ckpt-path /path/to/checkpoint.pt \
   --dataset-path /path/to/dataset/ \
   --save-path /path/to/results.pkl \
-  --prompt-mode box
+  --prompt-mode box \
+  --num-workers 8
 
 # 3D inference without metrics
 python 3d_inference.py \
@@ -39,6 +41,27 @@ python 3d_inference.py \
   --dataset-path /path/to/dataset/ \
   --save-root /path/to/output/ \
   --prompt-mode box
+```
+
+### Generating Training Lists (for filtered training)
+```bash
+# Generate 2D training list with dice scores
+python gen_training_list.py \
+  --mode 2d \
+  --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+  --ckpt-path /path/to/checkpoint.pt \
+  --data-paths /path/to/datasets/ \
+  --save-path /path/to/training_list_2d.pkl \
+  --num-workers 12
+
+# Generate 3D training list with dice scores
+python gen_training_list.py \
+  --mode 3d \
+  --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+  --ckpt-path /path/to/checkpoint.pt \
+  --data-paths /path/to/datasets/ \
+  --save-path /path/to/training_list_3d.pkl \
+  --num-workers 16
 ```
 
 ### Training
@@ -71,6 +94,9 @@ python training/train.py \
 - `test_vis3d.py` - 3D evaluation (single object per run, iterative)
 - `test_vis3d_multi.py` - 3D evaluation (all objects simultaneously, higher accuracy)
 - `test_vis2d.py` - 2D slice evaluation
+- `gen_training_list.py` - Generate training lists with dice scores for filtered training
+- `generate_sam2_embeddings.py` - Pre-compute SAM2 image embeddings for faster training
+- `train_stage_one_slicewise.py` - Stage 1 training on 2D slices (mask decoder only)
 
 **sam2/** - Meta's SAM2 package with:
 - `modeling/` - Hiera backbone, memory attention, mask decoder
@@ -83,7 +109,10 @@ python training/train.py \
 - `dataset/` - VOSDataset loaders for video object segmentation
 
 **utils/** - SAMRI-specific utilities:
-- `dataloader.py` - NiiDataset for NIfTI file loading
+- `dataloader.py` - Dataset classes:
+  - `NiiDataset` - Load NIfTI files for 2D slice training
+  - `FilteredNiiDataset` - Load filtered 2D samples by dice threshold
+  - `Filtered3DNiiDataset` - Load filtered 3D volumes by dice threshold
 - `losses.py` - Dice, Hausdorff Distance, Mean Surface Distance metrics
 
 ### Dataset Conventions
@@ -146,6 +175,11 @@ Reference implementation for decoder-only training on pre-computed embeddings:
 **Recommended training stages:**
 - **Stage 1 (Image)**: Train mask decoder on 2D slices to match SAMRI v1 performance
 - **Stage 2 (Joint)**: Add memory encoder + memory attention training with mixed image/video batches
+
+**Training data options (train_stage_one_slicewise.py):**
+1. **Pre-computed embeddings** (fastest): Use `--embedding-path` with `generate_sam2_embeddings.py` output
+2. **Filtered training list** (flexible): Use `--training-list` with `gen_training_list.py` output and `--dice-threshold`
+3. **Raw images** (slowest): Use `--data-paths` directly
 
 **Key differences from natural video:**
 - Less motion between MRI slices (more consistency)

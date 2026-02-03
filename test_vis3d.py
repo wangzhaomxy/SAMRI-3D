@@ -329,7 +329,9 @@ def init_state_compat(predictor, video_source: Any, num_frames: int, prefer_stre
             kwargs["num_frames"] = int(num_frames)
         try:
             return predictor.init_state(**kwargs)
-        except TypeError:
+        except Exception:
+            # Catch all exceptions (TypeError, ValueError, RuntimeError, etc.)
+            # when streaming fails, fallback to JPEG directory mode
             pass
 
     if not isinstance(video_source, str):
