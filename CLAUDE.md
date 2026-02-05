@@ -152,6 +152,45 @@ hi = np.percentile(img, 99.5)
 img = np.clip((img - lo) / (hi - lo), 0.0, 1.0)
 ```
 
+### Single-Object Evaluation State-Reuse Pattern (test_vis3d.py)
+
+`test_vis3d.py` runs one propagation per label (single-object mode).  Naively
+this means calling `init_state` 2×K times per volume (K = label count).  Two
+SAM2 internals make a much faster pattern possible:
+
+1. **`reset_state()` preserves image data.**  It clears all object/tracking
+   state (`obj_ids`, `output_dict_per_obj`, etc.) but does **not** touch
+   `cached_features` or `images`.  The same state can be re-prompted after a
+   `reset_state` call.
+
+2. **`_get_image_feature` is a 1-entry LRU cache** — each cache miss
+   *replaces* the entire `cached_features` dict.  After propagation only the
+   last frame's features survive.  To keep all frames cached across labels,
+   pre-fill the cache before the label loop:
+
+```python
+# Pre-fill: runs forward_image once per frame; persists through reset_state
+for i in range(num_frames):
+    image = state["images"][i].to(device).float().unsqueeze(0)
+    backbone_out = predictor.forward_image(image)
+    cache[i] = (image, backbone_out)
+state["cached_features"] = cache
+```
+
+The resulting per-case loop is:
+```
+init_state  ×2  (video1 + video2)
+prefill     ×2  (only when K > 1)
+for each label:
+    add_prompt  →  propagate  →  reset_state   (×2 per label)
+```
+
+Image encoding cost: **N** forward_image calls total (not N×K).
+`init_state` / `load_video_frames` cost: **2** calls total (not 2K).
+
+> **Do not** skip `prefill` when K > 1.  Without it every label re-encodes
+> all frames because the 1-entry cache is destroyed during propagation.
+
 ## Reference Materials (backup/)
 
 The `backup/` folder contains Meta's original SAM2 files as reference examples. This folder will be removed after project finalization.
