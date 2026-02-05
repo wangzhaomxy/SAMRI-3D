@@ -54,9 +54,9 @@ Features:
 Examples:    
 python test_vis3d_multi.py \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-path /scratch/project/samri/Model_save/samri2_stage2/sam2_stage2_epoch_10.pth \
---dataset-path /scratch/project/samri/Datasets/SAMRI_datasets_3D/ \
---save-path /scratch/project/samri/Eval_results/SAM2/sam2_stage2_epoch_10_3d.pkl \
+--ckpt-path /scratch/user/s4670484//Model_save/samri2_stage2/sam2_stage2_epoch_15.pth \
+--dataset-path /scratch/user/s4670484//Datasets/SAMRI_datasets_3D/ \
+--save-path /scratch/user/s4670484/Eval_results/SAM2/sam2_stage2_epoch_15_3d.pkl \
 --num-workers 12
 """
 

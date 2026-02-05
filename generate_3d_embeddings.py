@@ -35,7 +35,7 @@ Output NPZ format (one file per volume):
        --training-list /path/to/training_list_3d.pkl \\
        --output-dir /path/to/3D_embeddings/ \\
        --dice-threshold 0.2 \\
-       --num-workers 8
+       --num-workers 16
 
 2. Generate from raw data paths (no filtering):
    python generate_3d_embeddings.py \\
@@ -61,6 +61,16 @@ Output NPZ format (one file per volume):
        --embedding-dir /path/to/3D_embeddings/ \\
        --save-path /path/to/stage2_checkpoints/ \\
        --batch-size 2 --num-epochs 50
+
+Example command to generate 3D embeddings:       
+python generate_3d_embeddings.py \
+--sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+--ckpt-path /scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt \
+--training-list /scratch/user/s4670484/training_lists/training_list_3d.pkl \
+--output-dir /scratch/user/s4670484/SAM2_embeddings/ \
+--dice-threshold 0.2 \
+--num-workers 16       
+
 """
 
 import os
