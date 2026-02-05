@@ -63,7 +63,7 @@ import shutil
 import inspect
 import argparse
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from glob import glob
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Callable, Any, Union, Generator
@@ -289,11 +289,15 @@ def make_pil_loader_from_volume(
     vol_shw: np.ndarray,        # [S,H,W]
     slice_indices: List[int],   # maps frame_idx -> slice_idx
 ) -> Tuple[Callable[[int], Image.Image], int]:
-    def loader_func(frame_idx: int) -> Image.Image:
-        z = slice_indices[frame_idx]
+    # Pre-compute all PIL frames so the loader is a simple lookup
+    frames: List[Image.Image] = []
+    for z in slice_indices:
         s2d = normalize_to_uint8(vol_shw[z])
         rgb = np.stack([s2d, s2d, s2d], axis=-1)
-        return Image.fromarray(rgb)
+        frames.append(Image.fromarray(rgb))
+
+    def loader_func(frame_idx: int) -> Image.Image:
+        return frames[frame_idx]
 
     return loader_func, len(slice_indices)
 
@@ -374,6 +378,10 @@ class PreparedVideos:
             shutil.rmtree(self.tmp_base, ignore_errors=True)
 
 
+# Cached across cases: None = untested, True/False = result from first probe
+_streaming_works: Optional[bool] = None
+
+
 def prepare_videos_once(
     predictor,
     vol0: np.ndarray,            # [S,H,W]
@@ -382,17 +390,17 @@ def prepare_videos_once(
 ) -> PreparedVideos:
     """
     Prepare video sources ONCE per case:
-    - Try streaming callables first
-    - If SAM2 rejects callables, write both videos to jpg dirs ONCE and reuse
+    - Try streaming callables first (probe only on the very first case;
+      result is cached for the rest of the run)
+    - If SAM2 rejects callables, write both videos to jpg dirs and reuse
     """
+    global _streaming_works
+
     loader1, num1 = make_pil_loader_from_volume(vol0, v1_slices)
     loader2, num2 = make_pil_loader_from_volume(vol0, v2_slices)
 
-    # Try streaming sanity check (init_state once and immediately discard state)
-    try:
-        with suppress_sam2_output(True):
-            _st = init_state_compat(predictor, loader1, num1, prefer_streaming=True)
-        # If it succeeded, assume streaming works
+    # Fast path: streaming decision already cached from a previous case
+    if _streaming_works is True:
         return PreparedVideos(
             v1_source=loader1,
             v2_source=loader2,
@@ -403,24 +411,43 @@ def prepare_videos_once(
             tmp_base=None,
             use_streaming=True,
         )
-    except Exception:
-        # Fallback to jpg dirs (write once)
-        fast_tmp = get_fast_tmp_root()
-        tmp_base = tempfile.mkdtemp(prefix="sam2_3d_case_", dir=fast_tmp)
-        v1_dir = os.path.join(tmp_base, "video1")
-        v2_dir = os.path.join(tmp_base, "video2")
-        write_video_frames_to_dir(vol0, v1_slices, v1_dir)
-        write_video_frames_to_dir(vol0, v2_slices, v2_dir)
-        return PreparedVideos(
-            v1_source=v1_dir,
-            v2_source=v2_dir,
-            v1_len=num1,
-            v2_len=num2,
-            v1_slices=v1_slices,
-            v2_slices=v2_slices,
-            tmp_base=tmp_base,
-            use_streaming=False,
-        )
+
+    if _streaming_works is None:
+        # First case only: probe streaming with one init_state call
+        try:
+            with suppress_sam2_output(True):
+                _ = init_state_compat(predictor, loader1, num1, prefer_streaming=True)
+            _streaming_works = True
+            return PreparedVideos(
+                v1_source=loader1,
+                v2_source=loader2,
+                v1_len=num1,
+                v2_len=num2,
+                v1_slices=v1_slices,
+                v2_slices=v2_slices,
+                tmp_base=None,
+                use_streaming=True,
+            )
+        except Exception:
+            _streaming_works = False
+
+    # _streaming_works is False: fallback to jpg dirs
+    fast_tmp = get_fast_tmp_root()
+    tmp_base = tempfile.mkdtemp(prefix="sam2_3d_case_", dir=fast_tmp)
+    v1_dir = os.path.join(tmp_base, "video1")
+    v2_dir = os.path.join(tmp_base, "video2")
+    write_video_frames_to_dir(vol0, v1_slices, v1_dir)
+    write_video_frames_to_dir(vol0, v2_slices, v2_dir)
+    return PreparedVideos(
+        v1_source=v1_dir,
+        v2_source=v2_dir,
+        v1_len=num1,
+        v2_len=num2,
+        v1_slices=v1_slices,
+        v2_slices=v2_slices,
+        tmp_base=tmp_base,
+        use_streaming=False,
+    )
 
 
 # ----------------------------
@@ -575,46 +602,100 @@ def merge_two_videos_single_label(
     return pred
 
 
-def predict_one_label(
+@torch.no_grad()
+def prefill_image_features(predictor, inference_state) -> None:
+    """Pre-fill backbone feature cache for all frames.
+
+    SAM2's _get_image_feature uses a 1-entry cache that is replaced on every
+    miss.  Pre-computing all frames here means every propagate call hits the
+    cache and forward_image is never called again.  reset_state() does not
+    touch cached_features, so the pre-fill persists across labels.
+    """
+    num_frames = inference_state["num_frames"]
+    device = inference_state["device"]
+    cache = {}
+    for i in range(num_frames):
+        image = inference_state["images"][i].to(device).float().unsqueeze(0)
+        backbone_out = predictor.forward_image(image)
+        cache[i] = (image, backbone_out)
+    inference_state["cached_features"] = cache
+
+
+def predict_all_labels_reuse_state(
     predictor,
     prepared: PreparedVideos,
     gt_cut_slice: np.ndarray,   # [H,W]
     prompt_mode: str,
-    label: int,
-) -> Optional[np.ndarray]:
+    labels: List[int],
+) -> Dict[int, Optional[np.ndarray]]:
     """
-    Run single-object inference for one label on prepared videos.
-    Returns pred0 binary [S,H,W] (uint8) or None if cannot prompt.
+    Run single-object inference for every label, reusing inference states.
+
+    init_state is called once per video.  When K > 1 image features are
+    pre-filled so that reset_state (which preserves cached_features) lets each
+    subsequent label propagate without re-encoding.
+
+    Returns {label: pred0 [S,H,W] uint8 | None}.  Labels not present on the
+    cut slice are absent from the dict.
     """
-    lb = int(label)
+    results: Dict[int, Optional[np.ndarray]] = {}
+    N = len(prepared.v1_slices) + (len(prepared.v2_slices) - 1)
+    H, W = gt_cut_slice.shape
 
-    # video1
+    # Filter to labels visible on cut slice
+    promptable = [int(lb) for lb in labels if np.sum(gt_cut_slice == int(lb)) > 0]
+    if not promptable:
+        return results
+
     with suppress_sam2_output(True):
-        st1 = init_state_compat(predictor, prepared.v1_source, prepared.v1_len, prefer_streaming=prepared.use_streaming)
-        ok = add_prompt_single_label(predictor, st1, prompt_mode, gt_cut_slice, lb, ann_frame_idx=0)
-        if not ok:
-            return None
-        pred1 = propagate_video_singleobj(predictor, st1, obj_id=lb)
+        # --- init states once per case ---
+        st1 = init_state_compat(predictor, prepared.v1_source, prepared.v1_len,
+                                prefer_streaming=prepared.use_streaming)
+        st2 = init_state_compat(predictor, prepared.v2_source, prepared.v2_len,
+                                prefer_streaming=prepared.use_streaming)
 
-    # video2
-    with suppress_sam2_output(True):
-        st2 = init_state_compat(predictor, prepared.v2_source, prepared.v2_len, prefer_streaming=prepared.use_streaming)
-        ok2 = add_prompt_single_label(predictor, st2, prompt_mode, gt_cut_slice, lb, ann_frame_idx=0)
-        if not ok2:
-            return None
-        pred2 = propagate_video_singleobj(predictor, st2, obj_id=lb)
+        # Pre-fill image features when multiple labels and API is available
+        if len(promptable) > 1 and hasattr(predictor, "forward_image"):
+            prefill_image_features(predictor, st1)
+            prefill_image_features(predictor, st2)
 
-    # merge
-    pred0 = merge_two_videos_single_label(
-        N=len(prepared.v1_slices) + (len(prepared.v2_slices) - 1),  # N is original S
-        H=gt_cut_slice.shape[0],
-        W=gt_cut_slice.shape[1],
-        v1_slices=prepared.v1_slices,
-        v2_slices=prepared.v2_slices,
-        v1_pred=pred1,
-        v2_pred=pred2,
-    )
-    return pred0
+        for lb in promptable:
+            # --- video1 ---
+            ok1 = add_prompt_single_label(predictor, st1, prompt_mode,
+                                          gt_cut_slice, lb, ann_frame_idx=0)
+            if ok1:
+                pred1 = propagate_video_singleobj(predictor, st1, obj_id=lb)
+            else:
+                pred1 = {}
+            predictor.reset_state(st1)
+
+            if not ok1:
+                results[lb] = None
+                continue
+
+            # --- video2 ---
+            ok2 = add_prompt_single_label(predictor, st2, prompt_mode,
+                                          gt_cut_slice, lb, ann_frame_idx=0)
+            if ok2:
+                pred2 = propagate_video_singleobj(predictor, st2, obj_id=lb)
+            else:
+                pred2 = {}
+            predictor.reset_state(st2)
+
+            if not ok2:
+                results[lb] = None
+                continue
+
+            # --- merge ---
+            results[lb] = merge_two_videos_single_label(
+                N=N, H=H, W=W,
+                v1_slices=prepared.v1_slices,
+                v2_slices=prepared.v2_slices,
+                v1_pred=pred1,
+                v2_pred=pred2,
+            )
+
+    return results
 
 
 # ----------------------------
@@ -824,20 +905,20 @@ def save_test_record_3d_single_object(
                 total_voxels = int(gt_zyx.size)
 
                 try:
+                    # single-object inference for all labels, states reused
+                    label_preds = predict_all_labels_reuse_state(
+                        predictor=predictor,
+                        prepared=prepared,
+                        gt_cut_slice=gt_cut,
+                        prompt_mode=prompt_mode,
+                        labels=labels,
+                    )
+
                     for lb in labels:
-                        # if label cannot be prompted from cut slice, skip it (requested: discard)
-                        if np.sum(gt_cut == lb) == 0:
+                        if lb not in label_preds:
                             skipped_prompt += 1
                             continue
-
-                        # run single-object inference (binary in axis-0)
-                        pred0 = predict_one_label(
-                            predictor=predictor,
-                            prepared=prepared,
-                            gt_cut_slice=gt_cut,
-                            prompt_mode=prompt_mode,
-                            label=lb,
-                        )
+                        pred0 = label_preds[lb]
                         if pred0 is None:
                             skipped_prompt += 1
                             continue
