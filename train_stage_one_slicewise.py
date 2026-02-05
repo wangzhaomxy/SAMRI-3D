@@ -21,59 +21,59 @@ Option A: Pre-computed Embeddings (recommended for large-scale training)
   Step 1: Generate embeddings (only dice > 0.4 are saved)
     python generate_sam2_embeddings.py \
         --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-        --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
-        --data-paths /scratch/project/samri/Datasets/*/training/ \
-        --output-dir /scratch/project/samri/SAM2_embeddings/ \
+        --ckpt-path /scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt \
+        --data-paths /scratch/user/s4670484/Datasets/*/training/ \
+        --output-dir /scratch/user/s4670484/SAM2_embeddings/ \
         --num-workers 8 --prefetch-size 16
 
   Step 2: Train on embeddings
     python train_stage_one_slicewise.py \
         --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-        --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+        --ckpt-path /scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt \
         --use-embeddings --sam2-embeddings \
-        --embedding-dir /scratch/project/samri/SAM2_embeddings/ \
-        --save-path /scratch/project/samri/Model_save/samri2_stage1/
+        --embedding-dir /scratch/user/s4670484/SAM2_embeddings/ \
+        --save-path /scratch/user/s4670484/Model_save/samri2_stage1/
 
 Option B: Filtered Training List (recommended for flexible filtering)
   Step 1: Generate training list with dice scores
     python gen_training_list.py \
         --mode 2d \
         --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-        --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
-        --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/ \
-        --save-path /scratch/project/samri/training_lists/training_list_2d.pkl \
+        --ckpt-path /scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt \
+        --data-paths /scratch/user/s4670484/Datasets/SAMRI_train_test/ \
+        --save-path /scratch/user/s4670484/training_lists/training_list_2d.pkl \
         --num-workers 8
 
   Step 2: Train with filtered samples
     python train_stage_one_slicewise.py \
         --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-        --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
-        --training-list /scratch/project/samri/training_lists/training_list_2d.pkl \
+        --ckpt-path /scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt \
+        --training-list /scratch/user/s4670484/training_lists/training_list_2d.pkl \
         --dice-threshold 0.4 \
-        --save-path /scratch/project/samri/Model_save/samri2_filtered/
+        --save-path /scratch/user/s4670484/Model_save/samri2_filtered/
 
 === CLI Examples ===
 
 1. Stratified Training from Embeddings with Dice Filtering (RECOMMENDED):
    python train_stage_one_slicewise.py \
        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+       --ckpt-path /scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt \
        --use-embeddings \
-       --embedding-dir /scratch/project/samri/SAM2_embeddings/ \
-       --training-list /scratch/project/samri/training_lists/training_list_2d.pkl \
+       --embedding-dir /scratch/user/s4670484/SAM2_embeddings/ \
+       --training-list /scratch/user/s4670484/training_lists/training_list_2d.pkl \
        --dice-threshold 0.4 \
        --samples-per-dataset 1000 \
-       --save-path /scratch/project/samri/Model_save/samri2_stratified/ \
+       --save-path /scratch/user/s4670484/Model_save/samri2_stratified/ \
        --num-epochs 100 --batch-size 256
 
 2. Stratified Training from 2D Training List (images):
 python train_stage_one_slicewise.py \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
---training-list /scratch/project/samri/training_lists/training_list_2d.pkl \
+--ckpt-path /scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt \
+--training-list /scratch/user/s4670484/training_lists/training_list_2d.pkl \
 --dice-threshold 0.4 \
 --samples-per-dataset 1024 \
---save-path /scratch/project/samri/Model_save/samri2_stratified/ \
+--save-path /scratch/user/s4670484/Model_save/samri2_stratified/ \
 --num-epochs 100 --batch-size 512 \
 --prompt-mode mixed \
 --num-workers 16 \
@@ -82,19 +82,19 @@ python train_stage_one_slicewise.py \
 3. Training from Pre-computed Embeddings (all samples, no stratification):
    python train_stage_one_slicewise.py \
        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
+       --ckpt-path /scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt \
        --use-embeddings --sam2-embeddings \
-       --embedding-dir /scratch/project/samri/SAM2_embeddings/ \
-       --save-path /scratch/project/samri/Model_save/samri2_stage1_emb/ \
+       --embedding-dir /scratch/user/s4670484/SAM2_embeddings/ \
+       --save-path /scratch/user/s4670484/Model_save/samri2_stage1_emb/ \
        --num-epochs 100 --batch-size 8
 
 4. Training from Raw Images (slowest, no pre-filtering):
    python train_stage_one_slicewise.py \
        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
-       --train-data-paths /scratch/project/samri/Datasets/Dataset1/training/ \
-                          /scratch/project/samri/Datasets/Dataset2/training/ \
-       --save-path /scratch/project/samri/Model_save/samri2_stage1_raw/ \
+       --ckpt-path /scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt \
+       --train-data-paths /scratch/user/s4670484/Datasets/Dataset1/training/ \
+                          /scratch/user/s4670484/Datasets/Dataset2/training/ \
+       --save-path /scratch/user/s4670484/Model_save/samri2_stage1_raw/ \
        --num-epochs 100 --batch-size 4 --lr 1e-5 --prompt-mode mixed
 
 Key Arguments:

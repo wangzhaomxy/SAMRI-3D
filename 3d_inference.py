@@ -32,9 +32,9 @@ python 3d_inference.py \
   
 python 3d_inference.py \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-path /home/s4670484/Desktop/Scratch/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
---dataset-path /home/s4670484/Desktop/Scratch/samri/Datasets/Test_3d/ \
---save-root /home/s4670484/Desktop/Scratch/samri/Infer_results/SAM2/ \
+--ckpt-path /scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt \
+--dataset-path /scratch/user/s4670484/Datasets/Test_3d/ \
+--save-root /scratch/user/s4670484/Infer_results/SAM2/ \
 --prompt-mode box \
 --device cuda
   

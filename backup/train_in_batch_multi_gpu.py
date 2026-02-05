@@ -32,7 +32,7 @@ if not os.path.exists(model_save_path):
     os.makedirs(model_save_path)
 num_epochs = NUM_EPOCHS
 train_image_path = TRAIN_IMAGE_PATH
-train_image_path.remove('/scratch/project/samri/Embedding/totalseg_mr/')
+train_image_path.remove('/scratch/user/s4670484/Embedding/totalseg_mr/')
 save_every = 1
 
 def ddp_setup(rank: int, world_size: int):
@@ -98,7 +98,7 @@ def main(gpu, world_size, num_epochs, save_every):
     # train_dataset = EmbDataset(train_image_path, 
     #                            resize_mask=True, 
     #                            mask_size=256)
-    train_image_path = "/scratch/project/samri/train_list.pkl"
+    train_image_path = "/scratch/user/s4670484/train_list.pkl"
     train_dataset = BalancedEmbDataset(train_image_path, 
                                sub_set="60_up",
                                resize_mask=True, 

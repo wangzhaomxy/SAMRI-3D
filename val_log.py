@@ -16,10 +16,10 @@ Validation datasets are expected in "validation" subfolders within each dataset 
 1. Validate all checkpoints on 2D validation data:
 python val_log.py \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-folder /scratch/project/samri/Model_save/samri2_stage1/ \
---data-paths /scratch/project/samri/Datasets/SAMRI_train_test/ \
+--ckpt-folder /scratch/user/s4670484/Model_save/samri2_stage1/ \
+--data-paths /scratch/user/s4670484/Datasets/SAMRI_train_test/ \
 --mode 2d \
---output-path /scratch/project/samri/validation_results/ \
+--output-path /scratch/user/s4670484/validation_results/ \
 --prompt-mode box \
 --device cuda \
 --io-workers 8 \
@@ -30,10 +30,10 @@ python val_log.py \
 2. Validate all checkpoints on 3D validation data:
    python val_log.py \
        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-       --ckpt-folder /scratch/project/samri/Model_save/samri2_stage1/ \
-       --data-paths /scratch/project/samri/Datasets/SAMRI_datasets_3D/ \
+       --ckpt-folder /scratch/user/s4670484/Model_save/samri2_stage1/ \
+       --data-paths /scratch/user/s4670484/Datasets/SAMRI_datasets_3D/ \
        --mode 3d \
-       --output-path /scratch/project/samri/validation_results/ \
+       --output-path /scratch/user/s4670484/validation_results/ \
        --prompt-mode box \
        --device cuda:0 \
        --io-workers 8 \
@@ -43,10 +43,10 @@ python val_log.py \
 3. Validate on both 2D and 3D:
    python val_log.py \
        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-       --ckpt-folder /scratch/project/samri/Model_save/samri2_stage1/ \
-       --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/ \
+       --ckpt-folder /scratch/user/s4670484/Model_save/samri2_stage1/ \
+       --data-paths /scratch/user/s4670484/Datasets/SAMRI_train_test/ \
        --mode both \
-       --output-path /scratch/project/samri/validation_results/ \
+       --output-path /scratch/user/s4670484/validation_results/ \
        --prompt-mode box \
        --device cuda:0 \
        --io-workers 8 \
@@ -56,10 +56,10 @@ python val_log.py \
 4. Validate a single checkpoint:
    python val_log.py \
        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-       --ckpt-path /scratch/project/samri/Model_save/samri2_stage1/sam2_maskdecoder_epoch_50.pth \
-       --data-paths /scratch/project/samri/Datasets/SAMRI_train_test/ \
+       --ckpt-path /scratch/user/s4670484/Model_save/samri2_stage1/sam2_maskdecoder_epoch_50.pth \
+       --data-paths /scratch/user/s4670484/Datasets/SAMRI_train_test/ \
        --mode both \
-       --output-path /scratch/project/samri/validation_results/ \
+       --output-path /scratch/user/s4670484/validation_results/ \
        --device cuda:0 \
        --io-workers 8 \
        --use-dataloader-2d \

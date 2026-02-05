@@ -24,18 +24,18 @@ for training on samples filtered by dice score threshold.
 python gen_training_list.py \
 --mode 2d \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
---data-paths /scratch/project/samri/Datasets/SAMRI_train_test/ \
---save-path /scratch/project/samri/training_lists/training_list_2d.pkl \
+--ckpt-path /scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt \
+--data-paths /scratch/user/s4670484/Datasets/SAMRI_train_test/ \
+--save-path /scratch/user/s4670484/training_lists/training_list_2d.pkl \
 --num-workers 12
 
 2. Generate 3D training list (for volume training):
 python gen_training_list.py \
 --mode 3d \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
---data-paths /scratch/project/samri/Datasets/SAMRI_datasets_3D/ \
---save-path /scratch/project/samri/training_lists/training_list_3d.pkl \
+--ckpt-path /scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt \
+--data-paths /scratch/user/s4670484/Datasets/SAMRI_datasets_3D/ \
+--save-path /scratch/user/s4670484/training_lists/training_list_3d.pkl \
 --prompt-mode box \
 --num-workers 16
 
@@ -43,9 +43,9 @@ python gen_training_list.py \
 python gen_training_list.py \
 --mode both \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
---data-paths /scratch/project/samri/Datasets/SAMRI_train_test/ \
---save-dir /scratch/project/samri/training_lists/ \
+--ckpt-path /scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt \
+--data-paths /scratch/user/s4670484/Datasets/SAMRI_train_test/ \
+--save-dir /scratch/user/s4670484/training_lists/ \
 --num-workers 16
 
 === Training with Filtered Samples ===
@@ -53,10 +53,10 @@ python gen_training_list.py \
 After generating the training list, use with train_stage_one_slicewise.py:
    python train_stage_one_slicewise.py \
        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-       --ckpt-path /scratch/project/samri/pretrained_ckpt/sam2.1_hiera_small.pt \
-       --training-list /scratch/project/samri/training_lists/training_list_2d.pkl \
+       --ckpt-path /scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt \
+       --training-list /scratch/user/s4670484/training_lists/training_list_2d.pkl \
        --dice-threshold 0.4 \
-       --save-path /scratch/project/samri/Model_save/samri2_filtered/
+       --save-path /scratch/user/s4670484/Model_save/samri2_filtered/
 
 === Options ===
 

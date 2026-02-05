@@ -24,7 +24,7 @@ def get_balanced_data(data):
 # Load the vitb_train_result CSV file
 vitb_train_result = pd.read_csv(f_path + "20250518samri_sam_medsam/" + "sam_vit_b_01ec64_train_ds.csv")
 vitb_train_result["emb_path"] = vitb_train_result.img_path.apply(lambda x: 
-    "/scratch/project/samri/Embedding/" + 
+    "/scratch/user/s4670484/Embedding/" + 
     x.split("/")[-3] + "/" + 
      x.split("/")[-1][:-7] + ".npz")
 

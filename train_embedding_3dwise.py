@@ -46,15 +46,15 @@ Step 2: Train from embeddings
 === CLI Examples ===
 
 1. Basic training (2x H100 80G GPUs):
-   python train_embedding_3dwise.py \\
-       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-       --stage1-ckpt /path/to/stage1_best.pth \\
-       --embedding-dir /path/to/3D_embeddings/ \\
-       --mix-ratio-3d 0.8 \\
-       --samples-per-dataset 100 \\
-       --save-path /path/to/stage2_checkpoints/ \\
-       --batch-size 2 --num-epochs 50 --lr 5e-6 \\
-       --num-workers 16
+python train_embedding_3dwise.py \\
+--sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
+--stage1-ckpt /path/to/stage1_best.pth \\
+--embedding-dir /path/to/3D_embeddings/ \\
+--mix-ratio-3d 0.8 \\
+--samples-per-dataset 100 \\
+--save-path /path/to/stage2_checkpoints/ \\
+--batch-size 2 --num-epochs 50 --lr 5e-6 \\
+--num-workers 16
 
 2. With gradient accumulation for larger effective batch:
    python train_embedding_3dwise.py \\
@@ -77,6 +77,17 @@ Key Arguments:
 Logging:
   - Training loss logged to training_log.csv in --save-path every epoch
   - CSV format: epoch, train_loss, loss_2d, loss_3d
+  
+Example:
+python train_embedding_3dwise.py \
+--sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+--stage1-ckpt /path/to/stage1_best.pth \
+--embedding-dir /path/to/3D_embeddings/ \
+--mix-ratio-3d 0.8 \
+--samples-per-dataset 100 \
+--save-path /path/to/stage2_checkpoints/ \
+--batch-size 2 --num-epochs 50 --lr 5e-6 \
+--num-workers 16
 """
 
 import os
