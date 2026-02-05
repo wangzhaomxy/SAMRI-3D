@@ -565,9 +565,6 @@ def process_video_with_memory_from_embedding(
     num_frames = len(slice_indices)
     resolution = model.image_size
 
-    # Prepare backbone feature sizes (from SAM2)
-    feat_sizes = [(64, 64)]  # Only the lowest resolution for memory
-
     for frame_idx, slice_z in enumerate(slice_indices):
         is_init_cond_frame = (frame_idx == 0)
 
@@ -614,8 +611,12 @@ def process_video_with_memory_from_embedding(
             # Prepare vision features in the format expected by memory conditioning
             # image_embed is (1, 256, 64, 64), need to reshape to (4096, 1, 256) for attention
             B, C, H, W = image_embed.shape
+            feat_sizes = [(H, W)]
             vision_feats = [image_embed.flatten(2).permute(2, 0, 1)]  # [(HW, B, C)]
-            vision_pos_embeds = [model.sam_prompt_encoder.get_dense_pe().flatten(2).permute(2, 0, 1)]
+            # Use the FPN neck's PositionEmbeddingSine (matches inference path).
+            # Do NOT use sam_prompt_encoder.get_dense_pe() here — that is
+            # PositionEmbeddingRandom, intended only for the mask decoder.
+            vision_pos_embeds = [model.image_encoder.neck.position_encoding(image_embed).flatten(2).permute(2, 0, 1)]
 
             # Prepare high-res features
             high_res_features = [high_res_0, high_res_1]
