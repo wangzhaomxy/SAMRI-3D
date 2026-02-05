@@ -69,7 +69,7 @@ STAGE1_CKPT="/scratch/user/s4670484/Model_save/samri2_stratified/sam2_maskdecode
 EMBEDDING_DIR_3D="/scratch/user/s4670484/3D_embeddings/"
 
 # Stage 2 hyperparameters
-SAVE_PATH_S2="/scratch/user/s4670484/Model_save/samri2_stage2/"
+SAVE_PATH_S2="/scratch/user/s4670484/Model_save/samri2_stage2_emb/"
 NUM_EPOCHS_S2=50
 BATCH_SIZE_S2=2
 LR_S2=5e-6                 # Lower LR for embedding-based training
