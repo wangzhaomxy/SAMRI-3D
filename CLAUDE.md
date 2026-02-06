@@ -34,6 +34,14 @@ python test_vis3d_multi.py \
   --prompt-mode box \
   --num-workers 8
 
+# 2D slice evaluation
+python test_vis2d.py \
+  --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+  --ckpt-path /path/to/checkpoint.pt \
+  --test-file-paths /path/to/datasets/ \
+  --save-path /path/to/results.pkl \
+  --device cuda
+
 # 3D inference without metrics
 python 3d_inference.py \
   --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
@@ -66,18 +74,40 @@ python gen_training_list.py \
 
 ### Training
 ```bash
-# Single-node training
+# Stage 1: 2D slice-wise training (mask decoder only)
+python train_stage_one_slicewise.py \
+  --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+  --ckpt-path /path/to/sam2.1_hiera_small.pt \
+  --training-list /path/to/training_list_2d.pkl \
+  --dice-threshold 0.4 \
+  --save-path /path/to/stage1_checkpoints/ \
+  --batch-size 512 --num-epochs 100 --lr 1e-5
+
+# Stage 2: 3D-wise training with memory (from raw images)
+python train_stage_two_3dwise.py \
+  --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+  --stage1-ckpt /path/to/stage1_best.pth \
+  --training-list /path/to/training_list_3d.pkl \
+  --save-path /path/to/stage2_checkpoints/ \
+  --batch-size 2 --num-epochs 50 --lr 5e-6 \
+  --mix-ratio-3d 0.8 --max-slices-per-video 32 \
+  --use-amp
+
+# Stage 2: 3D-wise training from pre-computed embeddings (faster)
+python train_embedding_3dwise.py \
+  --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+  --stage1-ckpt /path/to/stage1_best.pth \
+  --embedding-dir /path/to/3D_embeddings/ \
+  --save-path /path/to/stage2_checkpoints/ \
+  --batch-size 2 --num-epochs 50 --lr 5e-6 \
+  --mix-ratio-3d 0.8 --max-slices-per-video 32 \
+  --use-amp
+
+# Meta's original VOS training (for reference)
 python training/train.py \
   -c configs/sam2.1_training/sam2.1_hiera_b+_MOSE_finetune.yaml \
   --use-cluster 0 \
   --num-gpus 8
-
-# Multi-node SLURM training
-python training/train.py \
-  -c configs/sam2.1_training/sam2.1_hiera_b+_MOSE_finetune.yaml \
-  --use-cluster 1 \
-  --num-gpus 8 \
-  --num-nodes 2
 ```
 
 ## Architecture
@@ -95,8 +125,11 @@ python training/train.py \
 - `test_vis3d_multi.py` - 3D evaluation (all objects simultaneously, higher accuracy)
 - `test_vis2d.py` - 2D slice evaluation
 - `gen_training_list.py` - Generate training lists with dice scores for filtered training
-- `generate_sam2_embeddings.py` - Pre-compute SAM2 image embeddings for faster training
+- `generate_sam2_embeddings.py` - Pre-compute SAM2 image embeddings for 2D training
+- `generate_3d_embeddings.py` - Pre-compute SAM2 embeddings for 3D volumes
 - `train_stage_one_slicewise.py` - Stage 1 training on 2D slices (mask decoder only)
+- `train_stage_two_3dwise.py` - Stage 2 training with memory bank (from raw images)
+- `train_embedding_3dwise.py` - Stage 2 training with memory bank (from pre-computed embeddings)
 
 **sam2/** - Meta's SAM2 package with:
 - `modeling/` - Hiera backbone, memory attention, mask decoder
@@ -251,3 +284,9 @@ Reference implementation for decoder-only training on pre-computed embeddings:
 - Less motion between MRI slices (more consistency)
 - Occlusion head important (organs appear/disappear across slices)
 - Bidirectional propagation crucial for 3D coherence
+
+**AMP and Embedding Training (IMPORTANT):**
+- When using `--use-amp`, features are computed in float16 for memory efficiency
+- Pre-computed embeddings (`generate_3d_embeddings.py`) are stored as float16
+- `train_embedding_3dwise.py` must keep embeddings as float16 (not convert to float32) to match raw image training behavior
+- Converting embeddings to float32 doubles memory usage and causes OOM
