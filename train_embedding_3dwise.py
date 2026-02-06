@@ -830,28 +830,41 @@ def train_epoch(
         samples_2d = batch["samples_2d"]
         samples_3d = batch["samples_3d"]
 
-        batch_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        # Track valid losses to avoid scaler issues with empty batches
+        batch_losses = []
+        batch_num_2d = 0
+        batch_num_3d = 0
 
         # Process 2D samples
         for sample in samples_2d:
             loss = train_2d_sample_from_embedding(model, sample, loss_fn, args, device)
             if not torch.isnan(loss) and loss.item() > 0:
-                batch_loss = batch_loss + loss
+                batch_losses.append(loss)
                 loss_2d_total += loss.item()
+                batch_num_2d += 1
                 num_2d += 1
 
         # Process 3D samples
         for sample in samples_3d:
             loss = train_3d_sample_from_embedding(model, sample, loss_fn, args, device)
             if not torch.isnan(loss) and loss.item() > 0:
-                batch_loss = batch_loss + loss
+                batch_losses.append(loss)
                 loss_3d_total += loss.item()
+                batch_num_3d += 1
                 num_3d += 1
 
-        # Average loss over batch
-        n_samples = len(samples_2d) + len(samples_3d)
-        if n_samples > 0:
-            batch_loss = batch_loss / n_samples
+        # Skip if no valid losses in batch (prevents scaler assertion error)
+        if not batch_losses:
+            if rank == 0:
+                pbar.set_postfix({
+                    "loss": "N/A",
+                    "2d": num_2d,
+                    "3d": num_3d,
+                })
+            continue
+
+        # Compute batch loss from valid samples
+        batch_loss = torch.stack(batch_losses).mean()
 
         # Gradient accumulation
         batch_loss = batch_loss / args.grad_accum_steps
