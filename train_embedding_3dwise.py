@@ -708,6 +708,10 @@ def train_3d_sample_from_embedding(
 ) -> torch.Tensor:
     """
     Train on a 3D volume using memory bank with pre-computed embeddings.
+
+    Note: To prevent OOM from gradient accumulation, we limit the number of
+    labels processed per sample. Each label creates ~64 forward passes through
+    memory attention, and gradient graphs are kept until backward() is called.
     """
     image_embeds = sample["image_embeds"]  # (N, 256, 64, 64)
     high_res_feat_0s = sample["high_res_feat_0s"]
@@ -736,6 +740,14 @@ def train_3d_sample_from_embedding(
 
     all_losses = []
     total_slices = 0
+
+    # Limit labels per sample to prevent OOM from gradient accumulation
+    # Each label creates ~64 forward passes with gradient graphs
+    max_labels_per_sample = getattr(args, 'max_labels_per_sample', 1)
+    if len(labels) > max_labels_per_sample:
+        # Randomly select labels for this sample
+        rng = np.random.RandomState()
+        labels = rng.choice(labels, size=max_labels_per_sample, replace=False).tolist()
 
     for label in labels:
         # Check if label exists in cut slice
@@ -913,6 +925,8 @@ def parse_args():
                         help="Volumes per dataset per epoch (default: 100)")
     parser.add_argument("--max-slices-per-video", type=int, default=32,
                         help="Max slices per video sequence during training (default: 32)")
+    parser.add_argument("--max-labels-per-sample", type=int, default=1,
+                        help="Max labels per 3D sample to prevent OOM (default: 1)")
 
     # Training configuration
     parser.add_argument("--save-path", type=str, required=True,

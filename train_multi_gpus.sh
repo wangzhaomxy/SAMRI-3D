@@ -71,9 +71,9 @@ EMBEDDING_DIR_3D="/scratch/user/s4670484/SAM2_embeddings/"
 # Stage 2 hyperparameters
 SAVE_PATH_S2="/scratch/user/s4670484/Model_save/samri2_stage2_emb/"
 NUM_EPOCHS_S2=50
-BATCH_SIZE_S2=2
+BATCH_SIZE_S2=1             # Reduced from 2 to prevent OOM from gradient accumulation
 LR_S2=5e-6                 # Lower LR for embedding-based training
-GRAD_ACCUM=2
+GRAD_ACCUM=1               # Reduced from 2 - call backward() after each sample
 MIX_RATIO_3D=0.8           # 80% 3D samples, 20% 2D samples
 SAMPLES_PER_DATASET=100    # Volumes per dataset per epoch
 MAX_SLICES_PER_VIDEO=32
