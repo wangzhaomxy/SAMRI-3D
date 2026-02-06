@@ -245,10 +245,11 @@ class Embedding3DDataset(Dataset):
         npz_path = self.epoch_files[idx]
         data = np.load(npz_path, allow_pickle=True)
 
-        # Load embeddings (convert from float16 to float32)
-        image_embeds = data["image_embeds"].astype(np.float32)
-        high_res_feat_0s = data["high_res_feat_0s"].astype(np.float32)
-        high_res_feat_1s = data["high_res_feat_1s"].astype(np.float32)
+        # Load embeddings - keep as float16 to match AMP behavior in raw image training
+        # (raw version computes features inside autocast, producing float16 tensors)
+        image_embeds = data["image_embeds"]  # float16
+        high_res_feat_0s = data["high_res_feat_0s"]  # float16
+        high_res_feat_1s = data["high_res_feat_1s"]  # float16
         masks = data["masks"].astype(np.int32)
 
         # Load metadata
@@ -262,9 +263,9 @@ class Embedding3DDataset(Dataset):
         dataset = str(data["dataset"])
 
         return {
-            "image_embeds": image_embeds,  # (N, 256, 64, 64)
-            "high_res_feat_0s": high_res_feat_0s,  # (N, 32, 256, 256)
-            "high_res_feat_1s": high_res_feat_1s,  # (N, 64, 128, 128)
+            "image_embeds": image_embeds,  # (N, 256, 64, 64) float16
+            "high_res_feat_0s": high_res_feat_0s,  # (N, 32, 256, 256) float16
+            "high_res_feat_1s": high_res_feat_1s,  # (N, 64, 128, 128) float16
             "masks": masks,  # (N, H, W)
             "ori_h": ori_h,
             "ori_w": ori_w,
