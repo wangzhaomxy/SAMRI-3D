@@ -1,83 +1,55 @@
 # -*- coding: utf-8 -*-
 """
-Validation Logger: Validate multiple checkpoints on 2D and/or 3D validation datasets.
+Validation Logger: Validate checkpoints on 3D validation datasets using pre-computed embeddings.
 
-This script validates trained SAM2 checkpoints on validation datasets and logs
-results to CSV files. It supports:
-- 2D slice-wise validation
-- 3D volume validation with multi-object inference
+This script validates trained SAM2 checkpoints on validation datasets using pre-computed
+3D embeddings (from generate_3d_embeddings.py) and logs results to CSV files.
+
+Key Features:
+- Uses pre-computed embeddings for fast validation (no image encoder forward pass)
+- Multi-object 3D validation with memory bank propagation
+- Multiple checkpoint evaluation with resume support
 - Parallel processing for efficiency
-- Multiple checkpoint evaluation
-
-Validation datasets are expected in "validation" subfolders within each dataset folder.
 
 === CLI Examples ===
 
-1. Validate all checkpoints on 2D validation data:
-python val_log.py \
---sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-folder /scratch/user/s4670484/Model_save/samri2_stage1/ \
---data-paths /scratch/user/s4670484/Datasets/SAMRI_train_test/ \
---mode 2d \
---output-path /scratch/user/s4670484/validation_results/ \
---prompt-mode box \
---device cuda \
---io-workers 8 \
---use-dataloader-2d \
---max-samples-per-dataset 100 \
---sample-seed 42
-
-2. Validate all checkpoints on 3D validation data:
+1. Validate all checkpoints on 3D validation embeddings:
    python val_log.py \
        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-       --ckpt-folder /scratch/user/s4670484/Model_save/samri2_stage1/ \
-       --data-paths /scratch/user/s4670484/Datasets/SAMRI_datasets_3D/ \
-       --mode 3d \
+       --ckpt-folder /scratch/user/s4670484/Model_save/samri2_stage2/ \
+       --embedding-dir /scratch/user/s4670484/SAM2_embeddings_val/ \
        --output-path /scratch/user/s4670484/validation_results/ \
        --prompt-mode box \
        --device cuda:0 \
-       --io-workers 8 \
-       --max-samples-per-dataset 1000 \
-       --sample-seed 42
+       --max-samples-per-dataset 100
 
-3. Validate on both 2D and 3D:
+2. Validate a single checkpoint:
    python val_log.py \
        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-       --ckpt-folder /scratch/user/s4670484/Model_save/samri2_stage1/ \
-       --data-paths /scratch/user/s4670484/Datasets/SAMRI_train_test/ \
-       --mode both \
+       --ckpt-path /scratch/user/s4670484/Model_save/sam2_emb3d_epoch_50.pth \
+       --embedding-dir /scratch/user/s4670484/SAM2_embeddings_val/ \
        --output-path /scratch/user/s4670484/validation_results/ \
-       --prompt-mode box \
-       --device cuda:0 \
-       --io-workers 8 \
-       --max-samples-per-dataset 1000 \
-       --sample-seed 42
+       --device cuda:0
 
-4. Validate a single checkpoint:
+3. Multi-GPU validation:
    python val_log.py \
        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-       --ckpt-path /scratch/user/s4670484/Model_save/samri2_stage1/sam2_maskdecoder_epoch_50.pth \
-       --data-paths /scratch/user/s4670484/Datasets/SAMRI_train_test/ \
-       --mode both \
+       --ckpt-folder /scratch/user/s4670484/Model_save/samri2_stage2/ \
+       --embedding-dir /scratch/user/s4670484/SAM2_embeddings_val/ \
        --output-path /scratch/user/s4670484/validation_results/ \
-       --device cuda:0 \
-       --io-workers 8 \
-       --use-dataloader-2d \
-       --max-samples-per-dataset 1000 \
-       --sample-seed 42
+       --devices cuda:0 cuda:1 cuda:2 \
+       --num-workers 3
 
 Key Arguments:
-  --ckpt-folder         Folder containing multiple checkpoint .pth files
-  --ckpt-path           Single checkpoint path (alternative to --ckpt-folder)
-  --data-paths          Dataset folders containing "validation" subfolders
-  --mode                Validation mode: "2d", "3d", or "both" (default: both)
-  --prompt-mode         Prompt type: "box" or "mask" (default: box)
-  --output-path         Output directory for CSV results
-  --num-workers         Number of parallel workers (default: 8)
+  --ckpt-folder           Folder containing multiple checkpoint .pth files
+  --ckpt-path             Single checkpoint path (alternative to --ckpt-folder)
+  --embedding-dir         Directory containing 3D embeddings (*_3demb.npz files)
+  --prompt-mode           Prompt type: "box" or "mask" (default: box)
+  --output-path           Output directory for CSV results
+  --max-samples-per-dataset  Max volumes per dataset (default: 100)
 
 Output:
-  - validation_results_2d.csv: Per-slice dice scores for 2D mode
-  - validation_results_3d.csv: Per-volume dice scores for 3D mode
+  - validation_results_3d.csv: Per-volume dice scores
   - validation_summary.csv: Mean dice per checkpoint and dataset
 """
 
@@ -88,67 +60,28 @@ import sys
 import csv
 import time
 import argparse
-import contextlib
-import tempfile
-import shutil
-import inspect
 import multiprocessing as mp
 from glob import glob
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
-from PIL import Image
 
 # Prefer local ./sam2
 _THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_THIS_DIR))
 
-try:
-    import SimpleITK as sitk
-    HAS_SITK = True
-except ImportError:
-    HAS_SITK = False
-
 from sam2.build_sam import build_sam2
-from sam2.sam2_image_predictor import SAM2ImagePredictor
-from sam2.sam2_video_predictor import SAM2VideoPredictor
 
 
 # =============================================================================
 # Utility Functions
 # =============================================================================
-
-def normalize_to_uint8(arr: np.ndarray) -> np.ndarray:
-    """Normalize array to uint8 range [0, 255] using plain min-max scaling.
-
-    This matches SAM2's expected preprocessing: images should be normalized
-    to [0, 255] uint8 before being passed through SAM2Transforms.
-    """
-    arr = arr.astype(np.float32)
-    arr_min, arr_max = arr.min(), arr.max()
-    if arr_max - arr_min < 1e-8:
-        arr_max = arr_min + 1e-8
-    arr = (arr - arr_min) / (arr_max - arr_min)
-    return (arr * 255.0).astype(np.uint8)
-
-
-def normalize_to_uint8_with_bounds(arr: np.ndarray, lo: float, hi: float) -> np.ndarray:
-    """Normalize array to uint8 range [0, 255] using provided min-max bounds.
-
-    Used for consistent normalization across slices in a 3D volume.
-    """
-    arr = arr.astype(np.float32)
-    if hi - lo < 1e-8:
-        hi = lo + 1e-8
-    arr = (arr - lo) / (hi - lo)
-    arr = np.clip(arr, 0.0, 1.0)
-    return (arr * 255.0).astype(np.uint8)
-
 
 def dice_score(pred: np.ndarray, gt: np.ndarray) -> float:
     """Compute Dice score between two binary masks."""
@@ -168,70 +101,6 @@ def mask2d_to_bbox_xyxy(mask: np.ndarray) -> Optional[np.ndarray]:
     return np.array([xs.min(), ys.min(), xs.max(), ys.max()], dtype=np.float32)
 
 
-def find_validation_folders(data_paths: List[str]) -> Dict[str, str]:
-    """
-    Find validation folders in dataset paths.
-    Returns: {dataset_name: validation_folder_path}
-    """
-    val_folders = {}
-    for base_path in data_paths:
-        base_path = Path(base_path)
-        if not base_path.exists():
-            continue
-
-        # Check if base_path itself has a validation subfolder
-        val_path = base_path / "validation"
-        if val_path.is_dir():
-            ds_name = base_path.name
-            val_folders[ds_name] = str(val_path)
-        else:
-            # Search for validation folders in subdirectories
-            for subdir in base_path.iterdir():
-                if subdir.is_dir():
-                    val_path = subdir / "validation"
-                    if val_path.is_dir():
-                        ds_name = subdir.name
-                        val_folders[ds_name] = str(val_path)
-
-    return val_folders
-
-
-def find_image_mask_pairs(folder: str) -> List[Tuple[str, str]]:
-    """Find image-mask pairs in a folder."""
-    supported_exts = [".nii.gz", ".nii", ".mha", ".mhd", ".nrrd"]
-
-    all_files = []
-    for ext in supported_exts:
-        all_files.extend(glob(os.path.join(folder, f"*{ext}")))
-
-    img_files = [f for f in all_files if "_img_" in os.path.basename(f) or "_img." in os.path.basename(f)]
-
-    pairs = []
-    for img_path in img_files:
-        basename = os.path.basename(img_path)
-        # Try to find matching mask
-        for pattern in ["_seg_", "_gt_", "_mask_"]:
-            if "_img_" in basename:
-                mask_name = basename.replace("_img_", pattern)
-            else:
-                mask_name = basename.replace("_img.", pattern.rstrip("_") + ".")
-
-            mask_path = os.path.join(folder, mask_name)
-            if os.path.exists(mask_path):
-                pairs.append((img_path, mask_path))
-                break
-        else:
-            # Try same name with seg/gt prefix
-            for ext in supported_exts:
-                for pattern in ["seg_", "gt_", "mask_"]:
-                    mask_path = os.path.join(folder, pattern + basename)
-                    if os.path.exists(mask_path):
-                        pairs.append((img_path, mask_path))
-                        break
-
-    return pairs
-
-
 def get_checkpoint_paths(ckpt_folder: str = None, ckpt_path: str = None) -> List[str]:
     """Get list of checkpoint paths to validate."""
     if ckpt_path:
@@ -246,529 +115,95 @@ def get_checkpoint_paths(ckpt_folder: str = None, ckpt_path: str = None) -> List
 
 
 # =============================================================================
-# SAM2 Output Suppression
+# 3D Embedding Dataset for Validation
 # =============================================================================
 
-@contextlib.contextmanager
-def suppress_sam2_output(enabled: bool = True):
-    """Suppress stdout/stderr (SAM2 prints + tqdm bars) inside the context."""
-    if not enabled:
-        yield
-        return
-
-    old_env = os.environ.get("TQDM_DISABLE", None)
-    os.environ["TQDM_DISABLE"] = "1"
-
-    devnull = open(os.devnull, "w")
-    old_stdout, old_stderr = sys.stdout, sys.stderr
-    try:
-        sys.stdout = devnull
-        sys.stderr = devnull
-        yield
-    finally:
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
-        devnull.close()
-        if old_env is None:
-            os.environ.pop("TQDM_DISABLE", None)
-        else:
-            os.environ["TQDM_DISABLE"] = old_env
-
-
-class TimingStats:
-    """Lightweight timing stats accumulator."""
-    def __init__(self) -> None:
-        self.times = defaultdict(float)
-        self.counts = defaultdict(int)
-
-    def add(self, key: str, dt: float, n: int = 1) -> None:
-        self.times[key] += dt
-        self.counts[key] += n
-
-    def report(self, prefix: str) -> None:
-        if not self.times:
-            return
-        print(prefix)
-        for key in sorted(self.times.keys()):
-            total = self.times[key]
-            n = self.counts.get(key, 0)
-            avg = total / n if n else 0.0
-            print(f"  {key}: total={total:.2f}s avg={avg:.6f}s n={n}")
-
-
-# =============================================================================
-# 2D Validation
-# =============================================================================
-
-def validate_2d_sample(
-    predictor: SAM2ImagePredictor,
-    img_2d: np.ndarray,
-    mask_2d: np.ndarray,
-    prompt_mode: str,
-) -> float:
+class Embedding3DValDataset:
     """
-    Validate a single 2D slice.
+    Dataset for loading pre-computed 3D validation embeddings.
 
-    Args:
-        predictor: SAM2 image predictor
-        img_2d: 2D image (H, W) or (H, W, 3)
-        mask_2d: 2D binary mask (H, W)
-        prompt_mode: "box" or "mask"
-
-    Returns:
-        Dice score
+    Each NPZ file contains:
+    - image_embeds: (N, 256, 64, 64)
+    - high_res_feat_0s: (N, 32, 256, 256)
+    - high_res_feat_1s: (N, 64, 128, 128)
+    - masks: (N, H, W)
+    - cut_idx, v1_slices, v2_slices, labels, dataset, etc.
     """
-    img_rgb = prepare_image_rgb(img_2d)
-    predictor.set_image(img_rgb)
-    return predict_dice_for_label_on_set_image(predictor, mask_2d, prompt_mode)
 
-
-def prepare_image_rgb(
-    img_2d: np.ndarray,
-    norm_bounds: Optional[Tuple[float, float]] = None,
-) -> np.ndarray:
-    """Prepare 2D image into uint8 RGB."""
-    if img_2d.ndim == 2:
-        img_rgb = np.stack([img_2d, img_2d, img_2d], axis=-1)
-    else:
-        img_rgb = img_2d
-    if img_rgb.dtype == np.uint8 and img_rgb.ndim == 3 and img_rgb.shape[-1] == 3:
-        return img_rgb
-    if norm_bounds is not None:
-        return normalize_to_uint8_with_bounds(img_rgb, norm_bounds[0], norm_bounds[1])
-    return normalize_to_uint8(img_rgb)
-
-
-def predict_dice_for_label_on_set_image(
-    predictor: SAM2ImagePredictor,
-    mask_2d: np.ndarray,
-    prompt_mode: str,
-) -> float:
-    """Predict dice for a single label assuming predictor.set_image was already called."""
-    if prompt_mode == "box":
-        box = mask2d_to_bbox_xyxy(mask_2d)
-        if box is None:
-            return 0.0
-        masks, scores, _ = predictor.predict(
-            point_coords=None,
-            point_labels=None,
-            box=box[None, :],
-            multimask_output=False,
-        )
-    else:  # mask mode - sample points
-        ys, xs = np.where(mask_2d > 0)
-        if xs.size == 0:
-            return 0.0
-        k = min(16, xs.size)
-        idx = np.random.choice(xs.size, size=k, replace=False)
-        pts = np.stack([xs[idx], ys[idx]], axis=1)
-        labels = np.ones(k, dtype=np.int32)
-        masks, scores, _ = predictor.predict(
-            point_coords=pts,
-            point_labels=labels,
-            multimask_output=False,
-        )
-
-    pred_mask = masks[0] > 0
-    return dice_score(pred_mask, mask_2d)
-
-
-def validate_2d_volume(
-    predictor: SAM2ImagePredictor,
-    img_path: str,
-    mask_path: str,
-    prompt_mode: str,
-    timing: Optional[TimingStats] = None,
-) -> List[Dict]:
-    """
-    Validate all slices in a 3D volume for 2D evaluation.
-
-    Returns:
-        List of {slice_idx, label, dice} for each valid slice
-    """
-    if not HAS_SITK:
-        raise RuntimeError("SimpleITK required for 2D validation")
-
-    t0 = time.perf_counter()
-    img_sitk = sitk.ReadImage(img_path)
-    mask_sitk = sitk.ReadImage(mask_path)
-    img_arr = sitk.GetArrayFromImage(img_sitk)
-    mask_arr = sitk.GetArrayFromImage(mask_sitk)
-    if timing is not None:
-        timing.add("load_volume", time.perf_counter() - t0)
-
-    return validate_2d_volume_from_arrays(predictor, img_arr, mask_arr, prompt_mode, timing=timing)
-
-
-def validate_2d_volume_from_arrays(
-    predictor: SAM2ImagePredictor,
-    img_arr: np.ndarray,
-    mask_arr: np.ndarray,
-    prompt_mode: str,
-    timing: Optional[TimingStats] = None,
-) -> List[Dict]:
-    """Validate all slices in a 3D volume for 2D evaluation (arrays)."""
-
-    results = []
-    norm_bounds = None
-    if img_arr.dtype != np.uint8:
-        arr = img_arr.astype(np.float32)
-        lo, hi = float(arr.min()), float(arr.max())
-        if hi - lo < 1e-8:
-            hi = lo + 1e-8
-        norm_bounds = (lo, hi)
-
-    if mask_arr.ndim == 3:
-        slice_indices = np.where(mask_arr.sum(axis=(1, 2)) > 0)[0]
-    else:
-        slice_indices = [0] if mask_arr.sum() > 0 else []
-
-    for slice_idx in slice_indices:
-        if img_arr.ndim == 3:
-            img_2d = img_arr[slice_idx]
-            mask_2d = mask_arr[slice_idx]
-        else:
-            img_2d = img_arr
-            mask_2d = mask_arr
-
-        labels = np.unique(mask_2d)
-        labels = labels[labels > 0]
-        if labels.size == 0:
-            continue
-
-        img_rgb = prepare_image_rgb(img_2d, norm_bounds=norm_bounds)
-        t0 = time.perf_counter()
-        predictor.set_image(img_rgb)
-        if timing is not None:
-            timing.add("set_image", time.perf_counter() - t0)
-            timing.add("slices", 0.0, n=1)
-
-        for label in labels:
-            label_mask = (mask_2d == label).astype(np.uint8)
-            if label_mask.sum() < 10:  # Skip very small masks
-                continue
-
-            t1 = time.perf_counter()
-            dice = predict_dice_for_label_on_set_image(predictor, label_mask, prompt_mode)
-            if timing is not None:
-                timing.add("predict", time.perf_counter() - t1)
-                timing.add("labels", 0.0, n=1)
-            results.append({
-                "slice_idx": int(slice_idx),
-                "label": int(label),
-                "dice": float(dice),
-            })
-
-    return results
-
-
-def load_volume_pair(img_path: str, mask_path: str) -> Tuple[str, str, np.ndarray, np.ndarray]:
-    """Load image/mask arrays for a pair path."""
-    if not HAS_SITK:
-        raise RuntimeError("SimpleITK required for validation")
-    img_sitk = sitk.ReadImage(img_path)
-    mask_sitk = sitk.ReadImage(mask_path)
-    img_arr = sitk.GetArrayFromImage(img_sitk)
-    mask_arr = sitk.GetArrayFromImage(mask_sitk)
-    return img_path, mask_path, img_arr, mask_arr
-
-
-def maybe_sample_pairs(
-    pairs: List[Tuple[str, str]],
-    max_samples: Optional[int],
-    rng: np.random.RandomState,
-) -> List[Tuple[str, str]]:
-    """Limit number of pairs with deterministic random sampling."""
-    if not max_samples or len(pairs) <= max_samples:
-        return pairs
-    idx = rng.choice(len(pairs), size=max_samples, replace=False)
-    return [pairs[i] for i in idx]
-
-
-def validate_2d_dataset(
-    sam2_config: str,
-    ckpt_path: str,
-    val_folders: Dict[str, str],
-    prompt_mode: str,
-    device: str = "cuda:0",
-    io_workers: int = 0,
-    max_samples_per_dataset: Optional[int] = None,
-    sample_seed: int = 42,
-    timing_enabled: bool = False,
-    use_dataloader_2d: bool = False,
-) -> List[Dict]:
-    """
-    Validate a checkpoint on 2D validation datasets.
-
-    Returns:
-        List of results with dataset, img_path, slice_idx, label, dice
-    """
-    # Build model
-    model = build_sam2(sam2_config, ckpt_path, device=device)
-    predictor = SAM2ImagePredictor(model)
-
-    all_results = []
-
-    timing = TimingStats() if timing_enabled else None
-
-    if use_dataloader_2d:
-        return validate_2d_dataset_dataloader(
-            predictor=predictor,
-            val_folders=val_folders,
-            prompt_mode=prompt_mode,
-            io_workers=io_workers,
-            max_samples_per_dataset=max_samples_per_dataset,
-            sample_seed=sample_seed,
-            timing=timing,
-        )
-
-    for ds_name, val_folder in val_folders.items():
-        pairs = find_image_mask_pairs(val_folder)
-        rng = np.random.RandomState(sample_seed)
-        pairs = maybe_sample_pairs(pairs, max_samples_per_dataset, rng)
-
-        if io_workers and io_workers > 0:
-            ctx = mp.get_context("spawn")
-            with ProcessPoolExecutor(max_workers=io_workers, mp_context=ctx) as executor:
-                futures = [executor.submit(load_volume_pair, p[0], p[1]) for p in pairs]
-                for fut in tqdm(as_completed(futures), total=len(futures), desc=f"2D {ds_name}", leave=False):
-                    try:
-                        img_path, mask_path, img_arr, mask_arr = fut.result()
-                        slice_results = validate_2d_volume_from_arrays(
-                            predictor, img_arr, mask_arr, prompt_mode, timing=timing
-                        )
-                        for r in slice_results:
-                            r["dataset"] = ds_name
-                            r["img_path"] = img_path
-                            r["mask_path"] = mask_path
-                        all_results.extend(slice_results)
-                    except Exception as e:
-                        print(f"  Warning: Failed to process {ds_name}: {e}")
-        else:
-            for img_path, mask_path in tqdm(pairs, desc=f"2D {ds_name}", leave=False):
-                try:
-                    slice_results = validate_2d_volume(
-                        predictor, img_path, mask_path, prompt_mode, timing=timing
-                    )
-                    for r in slice_results:
-                        r["dataset"] = ds_name
-                        r["img_path"] = img_path
-                        r["mask_path"] = mask_path
-                    all_results.extend(slice_results)
-                except Exception as e:
-                    print(f"  Warning: Failed to process {img_path}: {e}")
-
-    if timing is not None:
-        if io_workers and io_workers > 0:
-            print("Timing note: load_volume timing is not captured when io_workers > 0.")
-        timing.report("2D timing summary:")
-
-    return all_results
-
-
-def validate_2d_dataset_dataloader(
-    predictor: SAM2ImagePredictor,
-    val_folders: Dict[str, str],
-    prompt_mode: str,
-    io_workers: int = 0,
-    max_samples_per_dataset: Optional[int] = None,
-    sample_seed: int = 42,
-    timing: Optional[TimingStats] = None,
-) -> List[Dict]:
-    """Validate 2D datasets using NiiDataset/DataLoader for faster IO."""
-    from torch.utils.data import DataLoader, Subset
-    from utils.dataloader import NiiDataset
-
-    all_results: List[Dict] = []
-
-    for ds_name, val_folder in val_folders.items():
-        val_root = os.path.join(val_folder, "")
-        dataset = NiiDataset([val_root], multi_mask=True, with_name=True)
-        indices = np.arange(len(dataset))
-        rng = np.random.RandomState(sample_seed)
-        if max_samples_per_dataset and len(indices) > max_samples_per_dataset:
-            indices = rng.choice(indices, size=max_samples_per_dataset, replace=False)
-            dataset = Subset(dataset, indices.tolist())
-
-        loader = DataLoader(
-            dataset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=io_workers,
-        )
-
-        for image, mask, img_fullpath, mask_fullpath in tqdm(loader, desc=f"2D {ds_name}", leave=False):
-            image = image.squeeze(0).detach().cpu().numpy()
-            mask = mask.squeeze(0).detach().cpu().numpy()
-            if mask.ndim == 2:
-                mask = mask[None, :, :]
-
-            if isinstance(img_fullpath, (list, tuple)):
-                img_path = img_fullpath[0]
-            else:
-                img_path = img_fullpath
-            if isinstance(mask_fullpath, (list, tuple)):
-                mask_path = mask_fullpath[0]
-            else:
-                mask_path = mask_fullpath
-
-            img_rgb = prepare_image_rgb(image)
-            t0 = time.perf_counter()
-            predictor.set_image(img_rgb)
-            if timing is not None:
-                timing.add("set_image", time.perf_counter() - t0)
-                timing.add("slices", 0.0, n=1)
-
-            mask_2d = mask[0]
-            labels = np.unique(mask_2d)
-            labels = labels[labels > 0]
-            for label in labels:
-                label_mask = (mask_2d == label).astype(np.uint8)
-                if label_mask.sum() < 10:
-                    continue
-                t1 = time.perf_counter()
-                dice = predict_dice_for_label_on_set_image(predictor, label_mask, prompt_mode)
-                if timing is not None:
-                    timing.add("predict", time.perf_counter() - t1)
-                    timing.add("labels", 0.0, n=1)
-
-                all_results.append({
-                    "slice_idx": 0,
-                    "label": int(label),
-                    "dice": float(dice),
-                    "dataset": ds_name,
-                    "img_path": img_path,
-                    "mask_path": mask_path,
-                })
-
-    if timing is not None:
-        timing.report("2D timing summary:")
-
-    return all_results
-
-
-# =============================================================================
-# 3D Validation (Multi-object)
-# =============================================================================
-
-def get_fast_tmp_root() -> Optional[str]:
-    """Get fast tmp directory (/dev/shm if available)."""
-    if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
-        return "/dev/shm"
-    return None
-
-
-def write_video_frames_to_dir(vol_shw: np.ndarray, slice_indices: List[int], out_dir: str) -> str:
-    """Write volume slices as JPEG frames to a directory."""
-    os.makedirs(out_dir, exist_ok=True)
-    for i, z in enumerate(slice_indices):
-        s2d = normalize_to_uint8(vol_shw[z])
-        rgb = np.stack([s2d, s2d, s2d], axis=-1)
-        Image.fromarray(rgb).save(os.path.join(out_dir, f"{i:05d}.jpg"), quality=95)
-    return out_dir
-
-
-def make_pil_loader_from_volume(vol0: np.ndarray, slice_indices: List[int]):
-    """Create a callable frame loader from volume slices."""
-    def loader(frame_idx: int) -> Image.Image:
-        z = slice_indices[frame_idx]
-        s2d = normalize_to_uint8(vol0[z])
-        rgb = np.stack([s2d, s2d, s2d], axis=-1)
-        return Image.fromarray(rgb)
-    return loader, len(slice_indices)
-
-
-def init_state_compat(predictor, video_source: Any, num_frames: int, prefer_streaming: bool = True):
-    """Version-compatible init_state with fallback."""
-    sig = inspect.signature(predictor.init_state)
-    params = sig.parameters
-
-    if prefer_streaming and callable(video_source):
-        kwargs = {"video_path": video_source}
-        if "frame_load_config" in params:
-            kwargs["frame_load_config"] = {"max_frames": int(num_frames), "first_frame_num": 0}
-        elif "max_frames" in params:
-            kwargs["max_frames"] = int(num_frames)
-        elif "num_frames" in params:
-            kwargs["num_frames"] = int(num_frames)
-        try:
-            return predictor.init_state(**kwargs)
-        except TypeError:
-            pass
-
-    if not isinstance(video_source, str):
-        raise TypeError("Fallback init_state requires a directory path (str) as video_source.")
-    return predictor.init_state(video_path=video_source)
-
-
-class PreparedVideos:
-    """Prepared per-case video sources for video1 and video2."""
     def __init__(
         self,
-        v1_source: Any,
-        v2_source: Any,
-        v1_len: int,
-        v2_len: int,
-        v1_slices: List[int],
-        v2_slices: List[int],
-        tmp_base: Optional[str],
-        use_streaming: bool,
+        embedding_dir: str,
+        max_samples_per_dataset: int = 100,
+        seed: int = 42,
     ):
-        self.v1_source = v1_source
-        self.v2_source = v2_source
-        self.v1_len = v1_len
-        self.v2_len = v2_len
-        self.v1_slices = v1_slices
-        self.v2_slices = v2_slices
-        self.tmp_base = tmp_base
-        self.use_streaming = use_streaming
+        self.embedding_dir = embedding_dir
+        self.max_samples_per_dataset = max_samples_per_dataset
+        self.seed = seed
+        self.rng = np.random.RandomState(seed)
 
-    def cleanup(self):
-        if self.tmp_base:
-            shutil.rmtree(self.tmp_base, ignore_errors=True)
+        # Find all 3D embedding files
+        npz_files = sorted(glob(os.path.join(embedding_dir, "**", "*_3demb.npz"), recursive=True))
+
+        if not npz_files:
+            raise ValueError(f"No 3D embedding files found in {embedding_dir}")
+
+        # Group by dataset
+        self.dataset_files = defaultdict(list)
+        for npz_path in npz_files:
+            dataset_name = os.path.basename(os.path.dirname(npz_path))
+            self.dataset_files[dataset_name].append(npz_path)
+
+        self.dataset_names = sorted(self.dataset_files.keys())
+
+        # Sample files per dataset
+        self.files = []
+        for ds_name in self.dataset_names:
+            files = self.dataset_files[ds_name]
+            n = len(files)
+            if n == 0:
+                continue
+            if n > max_samples_per_dataset:
+                indices = self.rng.choice(n, size=max_samples_per_dataset, replace=False)
+                files = [files[i] for i in indices]
+            self.files.extend([(ds_name, f) for f in files])
+
+        # Print statistics
+        print(f"Embedding 3D Validation Dataset:")
+        print(f"  Embedding directory: {embedding_dir}")
+        print(f"  Total volumes: {len(self.files)}")
+        print(f"  Number of datasets: {len(self.dataset_names)}")
+        for ds_name in self.dataset_names:
+            n_total = len(self.dataset_files[ds_name])
+            n_sampled = sum(1 for d, _ in self.files if d == ds_name)
+            print(f"    {ds_name}: {n_sampled}/{n_total} volumes")
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        ds_name, npz_path = self.files[idx]
+        data = np.load(npz_path, allow_pickle=True)
+
+        return {
+            "dataset": ds_name,
+            "npz_path": npz_path,
+            "image_embeds": data["image_embeds"],  # (N, 256, 64, 64) float16
+            "high_res_feat_0s": data["high_res_feat_0s"],  # (N, 32, 256, 256) float16
+            "high_res_feat_1s": data["high_res_feat_1s"],  # (N, 64, 128, 128) float16
+            "masks": data["masks"].astype(np.int32),  # (N, H, W)
+            "ori_h": int(data["ori_h"]),
+            "ori_w": int(data["ori_w"]),
+            "n_slices": int(data["n_slices"]),
+            "cut_idx": int(data["cut_idx"]),
+            "labels": data["labels"].tolist(),
+            "v1_slices": data["v1_slices"].tolist(),
+            "v2_slices": data["v2_slices"].tolist(),
+        }
 
 
-def prepare_videos_once(
-    predictor,
-    vol0: np.ndarray,
-    v1_slices: List[int],
-    v2_slices: List[int],
-) -> PreparedVideos:
-    """Prepare video sources ONCE per case."""
-    loader1, num1 = make_pil_loader_from_volume(vol0, v1_slices)
-    loader2, num2 = make_pil_loader_from_volume(vol0, v2_slices)
-
-    try:
-        with suppress_sam2_output(True):
-            _st = init_state_compat(predictor, loader1, num1, prefer_streaming=True)
-        return PreparedVideos(
-            v1_source=loader1,
-            v2_source=loader2,
-            v1_len=num1,
-            v2_len=num2,
-            v1_slices=v1_slices,
-            v2_slices=v2_slices,
-            tmp_base=None,
-            use_streaming=True,
-        )
-    except Exception:
-        fast_tmp = get_fast_tmp_root()
-        tmp_base = tempfile.mkdtemp(prefix="sam2_val_", dir=fast_tmp)
-        v1_dir = os.path.join(tmp_base, "video1")
-        v2_dir = os.path.join(tmp_base, "video2")
-        write_video_frames_to_dir(vol0, v1_slices, v1_dir)
-        write_video_frames_to_dir(vol0, v2_slices, v2_dir)
-        return PreparedVideos(
-            v1_source=v1_dir,
-            v2_source=v2_dir,
-            v1_len=num1,
-            v2_len=num2,
-            v1_slices=v1_slices,
-            v2_slices=v2_slices,
-            tmp_base=tmp_base,
-            use_streaming=False,
-        )
-
+# =============================================================================
+# 3D Validation with Embeddings
+# =============================================================================
 
 def sample_positive_points(mask2d: np.ndarray, num_pos: int = 256) -> Tuple[np.ndarray, np.ndarray]:
     """Sample positive points from a binary mask."""
@@ -782,325 +217,305 @@ def sample_positive_points(mask2d: np.ndarray, num_pos: int = 256) -> Tuple[np.n
     return pts, lbls
 
 
-def add_prompts_for_all_labels(
-    predictor,
-    inference_state,
-    prompt_mode: str,
-    gt_cut_slice: np.ndarray,
-    labels: List[int],
-    ann_frame_idx: int = 0,
-) -> List[int]:
-    """Add prompts for all labels on the cut slice."""
-    added: List[int] = []
-    for lb in labels:
-        obj_id = int(lb)
-        mask_lb = (gt_cut_slice == obj_id).astype(np.uint8)
-        if mask_lb.sum() == 0:
-            continue
-
-        if prompt_mode == "box":
-            box = mask2d_to_bbox_xyxy(mask_lb)
-            if box is None:
-                continue
-            try:
-                predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=ann_frame_idx,
-                    obj_id=obj_id,
-                    box=box,
-                )
-            except TypeError:
-                predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=ann_frame_idx,
-                    obj_id=obj_id,
-                    points=None,
-                    labels=None,
-                    box=box,
-                )
-            added.append(obj_id)
-
-        elif prompt_mode == "mask":
-            if hasattr(predictor, "add_new_mask"):
-                predictor.add_new_mask(
-                    inference_state=inference_state,
-                    frame_idx=ann_frame_idx,
-                    obj_id=obj_id,
-                    mask=mask_lb,
-                )
-                added.append(obj_id)
-            else:
-                pts, lbls = sample_positive_points(mask_lb, num_pos=256)
-                if pts.shape[0] == 0:
-                    continue
-                predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=ann_frame_idx,
-                    obj_id=obj_id,
-                    points=pts,
-                    labels=lbls,
-                )
-                added.append(obj_id)
-
-    return added
-
-
 @torch.no_grad()
-def propagate_video_multiobj(
-    predictor,
-    inference_state,
-) -> Dict[int, Dict[int, np.ndarray]]:
-    """Multi-object propagation."""
-    out: Dict[int, Dict[int, np.ndarray]] = {}
-    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
-        fi = int(out_frame_idx)
-        out[fi] = {}
-        for i, oid in enumerate(out_obj_ids):
-            oid_i = int(oid)
-            logits = out_mask_logits[i]
-            if hasattr(logits, "detach"):
-                logits = logits.detach()
-            m = (logits > 0.0)
-            if hasattr(m, "cpu"):
-                m = m.cpu().numpy()
-            out[fi][oid_i] = np.squeeze(m).astype(np.uint8)
-    return out
-
-
-def merge_two_videos_to_semantic_volume(
-    N: int,
-    H: int,
-    W: int,
-    v1_slices: List[int],
-    v2_slices: List[int],
-    v1_pred: Dict[int, Dict[int, np.ndarray]],
-    v2_pred: Dict[int, Dict[int, np.ndarray]],
-    labels: List[int],
-) -> np.ndarray:
-    """Merge predictions back to a semantic label volume."""
-    pred = np.zeros((N, H, W), dtype=np.int32)
-    written = set()
-
-    def write_slice(z: int, obj_to_mask: Dict[int, np.ndarray]):
-        for lb in labels:
-            oid = int(lb)
-            if oid not in obj_to_mask:
-                continue
-            pred[z][obj_to_mask[oid] > 0] = oid
-
-    for fidx, objm in v1_pred.items():
-        z = v1_slices[fidx]
-        write_slice(z, objm)
-        written.add(z)
-
-    for fidx, objm in v2_pred.items():
-        z = v2_slices[fidx]
-        if z in written:
-            continue
-        write_slice(z, objm)
-        written.add(z)
-
-    return pred
-
-
-def find_cut_slice_and_labels(mask_arr: np.ndarray) -> Tuple[int, List[int], int]:
-    """
-    Find the optimal cut slice (slice with most foreground) and labels.
-
-    Returns:
-        (cut_slice_idx, labels, primary_axis)
-    """
-    if mask_arr.ndim == 2:
-        labels = [int(lb) for lb in np.unique(mask_arr) if lb > 0]
-        return 0, labels, 0
-
-    # Find primary axis (axis with most slices containing foreground)
-    fg_mask = mask_arr > 0
-    axis_scores = []
-    for ax in range(3):
-        other_axes = tuple(i for i in range(3) if i != ax)
-        slice_fg = fg_mask.sum(axis=other_axes)
-        axis_scores.append(slice_fg.sum())
-
-    primary_axis = int(np.argmax(axis_scores))
-
-    # Move primary axis to front
-    mask_0 = np.moveaxis(mask_arr, primary_axis, 0)
-
-    # Find cut slice (slice with most foreground)
-    fg_0 = (mask_0 > 0).sum(axis=(1, 2))
-    cut_idx = int(np.argmax(fg_0))
-
-    # Get labels present in cut slice
-    labels = [int(lb) for lb in np.unique(mask_0[cut_idx]) if lb > 0]
-
-    return cut_idx, labels, primary_axis
-
-
-def validate_3d_volume(
-    predictor: SAM2VideoPredictor,
-    img_path: str,
-    mask_path: str,
+def validate_3d_volume_from_embedding(
+    model,
+    sample: Dict,
     prompt_mode: str,
+    device: str,
 ) -> List[Dict]:
     """
-    Validate a 3D volume using multi-object inference.
+    Validate a 3D volume using pre-computed embeddings with memory bank propagation.
+
+    This mirrors the training path in train_embedding_3dwise.py but collects predictions
+    instead of computing loss.
 
     Returns:
         List of {label, dice, voxel_count} for each label
     """
-    if not HAS_SITK:
-        raise RuntimeError("SimpleITK required for 3D validation")
-
-    img_sitk = sitk.ReadImage(img_path)
-    mask_sitk = sitk.ReadImage(mask_path)
-
-    img_arr = sitk.GetArrayFromImage(img_sitk)
-    mask_arr = sitk.GetArrayFromImage(mask_sitk)
-
-    return validate_3d_volume_from_arrays(predictor, img_arr, mask_arr, prompt_mode)
-
-
-def validate_3d_volume_from_arrays(
-    predictor: SAM2VideoPredictor,
-    img_arr: np.ndarray,
-    mask_arr: np.ndarray,
-    prompt_mode: str,
-) -> List[Dict]:
-    """Validate a 3D volume using multi-object inference (arrays)."""
-
-    # Find cut slice and labels
-    cut_idx, labels, primary_axis = find_cut_slice_and_labels(mask_arr)
+    image_embeds = sample["image_embeds"]  # (N, 256, 64, 64)
+    high_res_feat_0s = sample["high_res_feat_0s"]  # (N, 32, 256, 256)
+    high_res_feat_1s = sample["high_res_feat_1s"]  # (N, 64, 128, 128)
+    masks = sample["masks"]  # (N, H, W)
+    labels = sample["labels"]
+    cut_idx = sample["cut_idx"]
+    v1_slices = sample["v1_slices"]
+    v2_slices = sample["v2_slices"]
+    ori_h, ori_w = sample["ori_h"], sample["ori_w"]
+    n_slices = sample["n_slices"]
 
     if not labels:
         return []
 
-    # Move primary axis to front for both
-    vol0 = np.moveaxis(img_arr, primary_axis, 0)
-    gt0 = np.moveaxis(mask_arr, primary_axis, 0)
-
-    N, H, W = vol0.shape
-    gt_cut = gt0[cut_idx]
-
-    # Build video indices
-    v1_slices = list(range(cut_idx, -1, -1))
-    v2_slices = [cut_idx] + list(range(cut_idx + 1, N))
-
-    # Prepare videos
-    try:
-        prepared = prepare_videos_once(predictor, vol0, v1_slices, v2_slices)
-    except Exception as e:
-        print(f"  Warning: Failed to prepare videos: {e}")
-        return []
-
     results = []
+    resolution = model.image_size
 
-    try:
-        with suppress_sam2_output(True):
-            # Video 1
-            st1 = init_state_compat(predictor, prepared.v1_source, prepared.v1_len,
-                                    prefer_streaming=prepared.use_streaming)
-            added = add_prompts_for_all_labels(predictor, st1, prompt_mode, gt_cut, labels)
-            if not added:
-                prepared.cleanup()
-                return []
-            pred1 = propagate_video_multiobj(predictor, st1)
+    for label in labels:
+        # Check if label exists in cut slice
+        if (masks[cut_idx] == label).sum() == 0:
+            continue
 
-            # Video 2
-            st2 = init_state_compat(predictor, prepared.v2_source, prepared.v2_len,
-                                    prefer_streaming=prepared.use_streaming)
-            _ = add_prompts_for_all_labels(predictor, st2, prompt_mode, gt_cut, added)
-            pred2 = propagate_video_multiobj(predictor, st2)
+        # Collect predictions for this label across all slices
+        pred_volume = np.zeros((n_slices, ori_h, ori_w), dtype=np.uint8)
 
-        # Merge predictions
-        pred0 = merge_two_videos_to_semantic_volume(
-            N=N, H=H, W=W,
-            v1_slices=v1_slices,
-            v2_slices=v2_slices,
-            v1_pred=pred1,
-            v2_pred=pred2,
-            labels=added,
-        )
+        # Process video 1 (cut -> 0)
+        if len(v1_slices) > 0:
+            preds_v1 = propagate_video_from_embedding(
+                model=model,
+                image_embeds=image_embeds,
+                high_res_feat_0s=high_res_feat_0s,
+                high_res_feat_1s=high_res_feat_1s,
+                masks=masks,
+                slice_indices=v1_slices,
+                label=label,
+                ori_h=ori_h,
+                ori_w=ori_w,
+                resolution=resolution,
+                prompt_mode=prompt_mode,
+                device=device,
+            )
+            for frame_idx, slice_z in enumerate(v1_slices):
+                if frame_idx in preds_v1:
+                    pred_volume[slice_z] = preds_v1[frame_idx]
 
-        # Restore original axis order
-        pred_zyx = np.moveaxis(pred0, 0, primary_axis)
+        # Process video 2 (cut -> end), skip cut slice to avoid double-writing
+        if len(v2_slices) > 1:
+            v2_remaining = v2_slices[1:]  # Skip cut slice
+            preds_v2 = propagate_video_from_embedding(
+                model=model,
+                image_embeds=image_embeds,
+                high_res_feat_0s=high_res_feat_0s,
+                high_res_feat_1s=high_res_feat_1s,
+                masks=masks,
+                slice_indices=v2_remaining,
+                label=label,
+                ori_h=ori_h,
+                ori_w=ori_w,
+                resolution=resolution,
+                prompt_mode=prompt_mode,
+                device=device,
+            )
+            for frame_idx, slice_z in enumerate(v2_remaining):
+                if frame_idx in preds_v2:
+                    pred_volume[slice_z] = preds_v2[frame_idx]
 
-        # Compute dice for each label
-        for lb in added:
-            gt_lb = (mask_arr == lb).astype(np.uint8)
-            pred_lb = (pred_zyx == lb).astype(np.uint8)
-            dsc = dice_score(pred_lb, gt_lb)
+        # Compute dice for this label
+        gt_lb = (masks == label).astype(np.uint8)
+        dsc = dice_score(pred_volume, gt_lb)
 
-            results.append({
-                "label": int(lb),
-                "dice": float(dsc),
-                "voxel_count": int(gt_lb.sum()),
-            })
-
-    except Exception as e:
-        print(f"  Warning: Failed to process: {e}")
-
-    finally:
-        prepared.cleanup()
+        results.append({
+            "label": int(label),
+            "dice": float(dsc),
+            "voxel_count": int(gt_lb.sum()),
+        })
 
     return results
 
 
-def validate_3d_dataset(
+def propagate_video_from_embedding(
+    model,
+    image_embeds: np.ndarray,
+    high_res_feat_0s: np.ndarray,
+    high_res_feat_1s: np.ndarray,
+    masks: np.ndarray,
+    slice_indices: List[int],
+    label: int,
+    ori_h: int,
+    ori_w: int,
+    resolution: int,
+    prompt_mode: str,
+    device: str,
+) -> Dict[int, np.ndarray]:
+    """
+    Propagate through a video sequence using pre-computed embeddings.
+
+    Returns:
+        Dict mapping frame_idx to predicted binary mask (H, W)
+    """
+    if len(slice_indices) == 0:
+        return {}
+
+    predictions = {}
+
+    # Memory bank for tracking
+    output_dict = {
+        "cond_frame_outputs": {},
+        "non_cond_frame_outputs": {},
+    }
+
+    num_frames = len(slice_indices)
+
+    for frame_idx, slice_z in enumerate(slice_indices):
+        is_init_cond_frame = (frame_idx == 0)
+
+        # Get current slice embeddings
+        image_embed = torch.from_numpy(image_embeds[slice_z]).unsqueeze(0).to(device)  # (1, 256, 64, 64)
+        high_res_0 = torch.from_numpy(high_res_feat_0s[slice_z]).unsqueeze(0).to(device)
+        high_res_1 = torch.from_numpy(high_res_feat_1s[slice_z]).unsqueeze(0).to(device)
+
+        mask_2d = (masks[slice_z] == label).astype(np.float32)
+
+        # Prepare prompt for initial frame
+        point_inputs = None
+
+        if is_init_cond_frame:
+            if prompt_mode == "box":
+                box = mask2d_to_bbox_xyxy(mask_2d.astype(np.uint8))
+                if box is None:
+                    return {}
+
+                scale_x = resolution / ori_w
+                scale_y = resolution / ori_h
+                box_scaled = box.copy()
+                box_scaled[0] *= scale_x
+                box_scaled[2] *= scale_x
+                box_scaled[1] *= scale_y
+                box_scaled[3] *= scale_y
+
+                points = torch.tensor([[
+                    [box_scaled[0], box_scaled[1]],
+                    [box_scaled[2], box_scaled[3]],
+                ]], dtype=torch.float32, device=device)
+                labels_pt = torch.tensor([[2, 3]], dtype=torch.int32, device=device)
+
+                point_inputs = {"point_coords": points, "point_labels": labels_pt}
+
+            else:  # mask mode - sample points
+                pts, lbls = sample_positive_points(mask_2d.astype(np.uint8), num_pos=256)
+                if pts.shape[0] == 0:
+                    return {}
+
+                # Scale points to model resolution
+                scale_x = resolution / ori_w
+                scale_y = resolution / ori_h
+                pts_scaled = pts.copy()
+                pts_scaled[:, 0] *= scale_x
+                pts_scaled[:, 1] *= scale_y
+
+                points = torch.from_numpy(pts_scaled).unsqueeze(0).to(device)
+                labels_pt = torch.from_numpy(lbls).unsqueeze(0).to(device)
+
+                point_inputs = {"point_coords": points, "point_labels": labels_pt}
+
+        # Prepare vision features
+        B, C, H, W = image_embed.shape
+        feat_sizes = [(H, W)]
+        vision_feats = [image_embed.flatten(2).permute(2, 0, 1)]  # [(HW, B, C)]
+        vision_pos_embeds = [model.image_encoder.neck.position_encoding(image_embed).flatten(2).permute(2, 0, 1)]
+
+        high_res_features = [high_res_0, high_res_1]
+
+        # Prepare memory-conditioned features
+        pix_feat_with_mem = model._prepare_memory_conditioned_features(
+            frame_idx=frame_idx,
+            is_init_cond_frame=is_init_cond_frame,
+            current_vision_feats=vision_feats,
+            current_vision_pos_embeds=vision_pos_embeds,
+            feat_sizes=feat_sizes,
+            output_dict=output_dict,
+            num_frames=num_frames,
+            track_in_reverse=False,
+        )
+
+        # Forward through SAM heads
+        (
+            low_res_multimasks,
+            high_res_multimasks,
+            ious,
+            low_res_masks,
+            high_res_masks,
+            obj_ptr,
+            object_score_logits,
+        ) = model._forward_sam_heads(
+            backbone_features=pix_feat_with_mem,
+            point_inputs=point_inputs,
+            mask_inputs=None,
+            high_res_features=high_res_features,
+            multimask_output=False,
+        )
+
+        # Get prediction at original resolution
+        pred_logits = F.interpolate(
+            high_res_masks,
+            size=(ori_h, ori_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+        pred_mask = (pred_logits > 0).squeeze().cpu().numpy().astype(np.uint8)
+        predictions[frame_idx] = pred_mask
+
+        # Encode memory for next frames
+        if model.num_maskmem > 0:
+            maskmem_features, maskmem_pos_enc = model._encode_new_memory(
+                current_vision_feats=vision_feats,
+                feat_sizes=feat_sizes,
+                pred_masks_high_res=high_res_masks,
+                object_score_logits=object_score_logits,
+                is_mask_from_pts=(point_inputs is not None),
+            )
+
+            current_out = {
+                "maskmem_features": maskmem_features,
+                "maskmem_pos_enc": maskmem_pos_enc,
+                "pred_masks": low_res_masks,
+                "obj_ptr": obj_ptr,
+            }
+
+            if is_init_cond_frame:
+                output_dict["cond_frame_outputs"][frame_idx] = current_out
+            else:
+                output_dict["non_cond_frame_outputs"][frame_idx] = current_out
+
+    return predictions
+
+
+def validate_3d_dataset_from_embeddings(
     sam2_config: str,
     ckpt_path: str,
-    val_folders: Dict[str, str],
+    embedding_dir: str,
     prompt_mode: str,
     device: str = "cuda:0",
-    io_workers: int = 0,
-    max_samples_per_dataset: Optional[int] = None,
+    max_samples_per_dataset: int = 100,
     sample_seed: int = 42,
 ) -> List[Dict]:
     """
-    Validate a checkpoint on 3D validation datasets.
+    Validate a checkpoint on 3D validation datasets using pre-computed embeddings.
 
     Returns:
-        List of results with dataset, img_path, label, dice, voxel_count
+        List of results with dataset, npz_path, label, dice, voxel_count
     """
     # Build model
     model = build_sam2(sam2_config, ckpt_path, device=device, mode="eval")
-    predictor = SAM2VideoPredictor(model)
+    model.eval()
+
+    # Load validation dataset
+    val_dataset = Embedding3DValDataset(
+        embedding_dir=embedding_dir,
+        max_samples_per_dataset=max_samples_per_dataset,
+        seed=sample_seed,
+    )
 
     all_results = []
 
-    for ds_name, val_folder in val_folders.items():
-        pairs = find_image_mask_pairs(val_folder)
-        rng = np.random.RandomState(sample_seed)
-        pairs = maybe_sample_pairs(pairs, max_samples_per_dataset, rng)
+    for idx in tqdm(range(len(val_dataset)), desc="Validating", leave=False):
+        sample = val_dataset[idx]
+        ds_name = sample["dataset"]
+        npz_path = sample["npz_path"]
 
-        if io_workers and io_workers > 0:
-            ctx = mp.get_context("spawn")
-            with ProcessPoolExecutor(max_workers=io_workers, mp_context=ctx) as executor:
-                futures = [executor.submit(load_volume_pair, p[0], p[1]) for p in pairs]
-                for fut in tqdm(as_completed(futures), total=len(futures), desc=f"3D {ds_name}", leave=False):
-                    try:
-                        img_path, mask_path, img_arr, mask_arr = fut.result()
-                        vol_results = validate_3d_volume_from_arrays(
-                            predictor, img_arr, mask_arr, prompt_mode
-                        )
-                        for r in vol_results:
-                            r["dataset"] = ds_name
-                            r["img_path"] = img_path
-                            r["mask_path"] = mask_path
-                        all_results.extend(vol_results)
-                    except Exception as e:
-                        print(f"  Warning: Failed to process {ds_name}: {e}")
-        else:
-            for img_path, mask_path in tqdm(pairs, desc=f"3D {ds_name}", leave=False):
-                try:
-                    vol_results = validate_3d_volume(predictor, img_path, mask_path, prompt_mode)
-                    for r in vol_results:
-                        r["dataset"] = ds_name
-                        r["img_path"] = img_path
-                        r["mask_path"] = mask_path
-                    all_results.extend(vol_results)
-                except Exception as e:
-                    print(f"  Warning: Failed to process {img_path}: {e}")
+        try:
+            vol_results = validate_3d_volume_from_embedding(
+                model=model,
+                sample=sample,
+                prompt_mode=prompt_mode,
+                device=device,
+            )
+            for r in vol_results:
+                r["dataset"] = ds_name
+                r["npz_path"] = npz_path
+            all_results.extend(vol_results)
+
+        except Exception as e:
+            print(f"  Warning: Failed to process {npz_path}: {e}")
 
     return all_results
 
@@ -1109,78 +524,10 @@ def validate_3d_dataset(
 # Main Validation Functions
 # =============================================================================
 
-def validate_checkpoint(
-    sam2_config: str,
-    ckpt_path: str,
-    val_folders: Dict[str, str],
-    mode: str,
-    prompt_mode: str,
-    device: str = "cuda:0",
-    io_workers: int = 0,
-    max_samples_per_dataset: Optional[int] = None,
-    sample_seed: int = 42,
-    timing_enabled: bool = False,
-    use_dataloader_2d: bool = False,
-) -> Tuple[List[Dict], List[Dict]]:
-    """
-    Validate a single checkpoint.
-
-    Returns:
-        (results_2d, results_3d)
-    """
-    results_2d = []
-    results_3d = []
-
-    if mode in ["2d", "both"]:
-        results_2d = validate_2d_dataset(
-            sam2_config,
-            ckpt_path,
-            val_folders,
-            prompt_mode,
-            device,
-            io_workers=io_workers,
-            max_samples_per_dataset=max_samples_per_dataset,
-            sample_seed=sample_seed,
-            timing_enabled=timing_enabled,
-            use_dataloader_2d=use_dataloader_2d,
-        )
-
-    if mode in ["3d", "both"]:
-        results_3d = validate_3d_dataset(
-            sam2_config,
-            ckpt_path,
-            val_folders,
-            prompt_mode,
-            device,
-            io_workers=io_workers,
-            max_samples_per_dataset=max_samples_per_dataset,
-            sample_seed=sample_seed,
-        )
-
-    return results_2d, results_3d
-
-
-def compute_summary(results_2d: List[Dict], results_3d: List[Dict], ckpt_name: str) -> List[Dict]:
+def compute_summary(results_3d: List[Dict], ckpt_name: str) -> List[Dict]:
     """Compute summary statistics per dataset."""
     summary = []
 
-    # 2D summary
-    if results_2d:
-        by_dataset = defaultdict(list)
-        for r in results_2d:
-            by_dataset[r["dataset"]].append(r["dice"])
-
-        for ds_name, dices in by_dataset.items():
-            summary.append({
-                "checkpoint": ckpt_name,
-                "dataset": ds_name,
-                "mode": "2d",
-                "mean_dice": float(np.mean(dices)),
-                "std_dice": float(np.std(dices)),
-                "num_samples": len(dices),
-            })
-
-    # 3D summary
     if results_3d:
         by_dataset = defaultdict(list)
         for r in results_3d:
@@ -1190,7 +537,6 @@ def compute_summary(results_2d: List[Dict], results_3d: List[Dict], ckpt_name: s
             summary.append({
                 "checkpoint": ckpt_name,
                 "dataset": ds_name,
-                "mode": "3d",
                 "mean_dice": float(np.mean(dices)),
                 "std_dice": float(np.std(dices)),
                 "num_samples": len(dices),
@@ -1202,55 +548,30 @@ def compute_summary(results_2d: List[Dict], results_3d: List[Dict], ckpt_name: s
 def validate_checkpoint_worker(
     sam2_config: str,
     ckpt_path: str,
-    val_folders: Dict[str, str],
-    mode: str,
+    embedding_dir: str,
     prompt_mode: str,
     device: str,
-    io_workers: int,
-    max_samples_per_dataset: Optional[int],
+    max_samples_per_dataset: int,
     sample_seed: int,
-    timing_enabled: bool,
-    use_dataloader_2d: bool,
-) -> Tuple[str, List[Dict], List[Dict], List[Dict]]:
+) -> Tuple[str, List[Dict], List[Dict]]:
     """Worker wrapper for checkpoint validation (for multiprocessing)."""
     ckpt_name = os.path.basename(ckpt_path)
-    results_2d, results_3d = validate_checkpoint(
+
+    results_3d = validate_3d_dataset_from_embeddings(
         sam2_config=sam2_config,
         ckpt_path=ckpt_path,
-        val_folders=val_folders,
-        mode=mode,
+        embedding_dir=embedding_dir,
         prompt_mode=prompt_mode,
         device=device,
-        io_workers=io_workers,
         max_samples_per_dataset=max_samples_per_dataset,
         sample_seed=sample_seed,
-        timing_enabled=timing_enabled,
-        use_dataloader_2d=use_dataloader_2d,
     )
 
-    for r in results_2d:
-        r["checkpoint"] = ckpt_name
     for r in results_3d:
         r["checkpoint"] = ckpt_name
 
-    summary = compute_summary(results_2d, results_3d, ckpt_name)
-    return ckpt_path, results_2d, results_3d, summary
-
-
-def save_results_to_csv(results: List[Dict], csv_path: str):
-    """Save results to CSV file."""
-    if not results:
-        return
-
-    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-
-    # Get all keys
-    keys = list(results[0].keys())
-
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
-        writer.writeheader()
-        writer.writerows(results)
+    summary = compute_summary(results_3d, ckpt_name)
+    return ckpt_path, results_3d, summary
 
 
 def append_results_to_csv(results: List[Dict], csv_path: str):
@@ -1275,7 +596,6 @@ def load_existing_checkpoints(output_path: str) -> set:
     existing = set()
     csv_paths = [
         os.path.join(output_path, "validation_summary.csv"),
-        os.path.join(output_path, "validation_results_2d.csv"),
         os.path.join(output_path, "validation_results_3d.csv"),
     ]
     for csv_path in csv_paths:
@@ -1297,7 +617,7 @@ def load_existing_checkpoints(output_path: str) -> set:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Validate multiple checkpoints on 2D and/or 3D validation datasets"
+        description="Validate checkpoints on 3D validation datasets using pre-computed embeddings"
     )
 
     # Model configuration
@@ -1311,13 +631,10 @@ def parse_args():
                         help="Single checkpoint path (alternative to --ckpt-folder)")
 
     # Data configuration
-    parser.add_argument("--data-paths", type=str, nargs="+", required=True,
-                        help="Dataset folders containing 'validation' subfolders")
+    parser.add_argument("--embedding-dir", type=str, required=True,
+                        help="Directory containing 3D embeddings (*_3demb.npz files)")
 
     # Validation configuration
-    parser.add_argument("--mode", type=str, default="both",
-                        choices=["2d", "3d", "both"],
-                        help="Validation mode (default: both)")
     parser.add_argument("--prompt-mode", type=str, default="box",
                         choices=["box", "mask"],
                         help="Prompt mode (default: box)")
@@ -1330,20 +647,13 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="Device to use (default: cuda:0)")
     parser.add_argument("--devices", type=str, nargs="+", default=None,
-                        help="Device list for parallel validation (e.g., cuda:0 cuda:1). "
-                             "Overrides --device when provided. Use repeats to oversubscribe.")
-    parser.add_argument("--num-workers", type=int, default=8,
+                        help="Device list for parallel validation (e.g., cuda:0 cuda:1)")
+    parser.add_argument("--num-workers", type=int, default=1,
                         help="Number of parallel workers for checkpoint-level validation")
-    parser.add_argument("--io-workers", type=int, default=4,
-                        help="Number of CPU workers for IO/preprocessing (default: 4)")
-    parser.add_argument("--max-samples-per-dataset", type=int, default=1000,
-                        help="Max image-mask pairs per dataset (default: 1000)")
+    parser.add_argument("--max-samples-per-dataset", type=int, default=100,
+                        help="Max volumes per dataset (default: 100)")
     parser.add_argument("--sample-seed", type=int, default=42,
                         help="Random seed for dataset sampling (default: 42)")
-    parser.add_argument("--timing", action="store_true",
-                        help="Print timing breakdown for 2D validation")
-    parser.add_argument("--use-dataloader-2d", action="store_true",
-                        help="Use NiiDataset/DataLoader for 2D validation")
 
     args = parser.parse_args()
 
@@ -1359,19 +669,6 @@ def main():
 
     t0 = time.time()
 
-    # Find validation folders
-    print("Searching for validation folders...")
-    val_folders = find_validation_folders(args.data_paths)
-
-    if not val_folders:
-        print("No validation folders found!")
-        return
-
-    print(f"Found {len(val_folders)} validation datasets:")
-    for ds_name, path in val_folders.items():
-        pairs = find_image_mask_pairs(path)
-        print(f"  {ds_name}: {len(pairs)} image-mask pairs")
-
     # Get checkpoints
     ckpt_paths = get_checkpoint_paths(args.ckpt_folder, args.ckpt_path)
 
@@ -1379,7 +676,7 @@ def main():
         print("No checkpoints found!")
         return
 
-    print(f"\nFound {len(ckpt_paths)} checkpoints to validate")
+    print(f"Found {len(ckpt_paths)} checkpoints to validate")
 
     # Create output directory
     os.makedirs(args.output_path, exist_ok=True)
@@ -1391,13 +688,12 @@ def main():
         ckpt_paths = [p for p in ckpt_paths if os.path.basename(p) not in existing_ckpts]
         skipped = before - len(ckpt_paths)
         if skipped > 0:
-            print(f"\nSkipping {skipped} checkpoints already in CSVs.")
+            print(f"Skipping {skipped} checkpoints already in CSVs.")
         if not ckpt_paths:
-            print("\nAll checkpoints already validated. Nothing to do.")
+            print("All checkpoints already validated. Nothing to do.")
             return
 
     # Results counters
-    new_results_2d = 0
     new_results_3d = 0
     new_summaries = 0
 
@@ -1411,35 +707,24 @@ def main():
             print(f"\nValidating: {ckpt_name}")
 
             try:
-                results_2d, results_3d = validate_checkpoint(
+                results_3d = validate_3d_dataset_from_embeddings(
                     sam2_config=args.sam2_config,
                     ckpt_path=ckpt_path,
-                    val_folders=val_folders,
-                    mode=args.mode,
+                    embedding_dir=args.embedding_dir,
                     prompt_mode=args.prompt_mode,
                     device=devices[0],
-                    io_workers=args.io_workers,
                     max_samples_per_dataset=args.max_samples_per_dataset,
                     sample_seed=args.sample_seed,
-                    timing_enabled=args.timing,
-                    use_dataloader_2d=args.use_dataloader_2d,
                 )
 
                 # Add checkpoint name to results
-                for r in results_2d:
-                    r["checkpoint"] = ckpt_name
                 for r in results_3d:
                     r["checkpoint"] = ckpt_name
 
                 # Compute summary
-                summary = compute_summary(results_2d, results_3d, ckpt_name)
+                summary = compute_summary(results_3d, ckpt_name)
 
-                # Append results immediately so interrupted runs can resume safely.
-                if results_2d:
-                    csv_path = os.path.join(args.output_path, "validation_results_2d.csv")
-                    append_results_to_csv(results_2d, csv_path)
-                    new_results_2d += len(results_2d)
-
+                # Append results
                 if results_3d:
                     csv_path = os.path.join(args.output_path, "validation_results_3d.csv")
                     append_results_to_csv(results_3d, csv_path)
@@ -1454,12 +739,14 @@ def main():
                 if summary:
                     print(f"  Results for {ckpt_name}:")
                     for s in summary:
-                        print(f"    {s['dataset']} ({s['mode']}): "
+                        print(f"    {s['dataset']}: "
                               f"mean_dice={s['mean_dice']:.4f} +/- {s['std_dice']:.4f} "
                               f"(n={s['num_samples']})")
 
             except Exception as e:
                 print(f"  Error validating {ckpt_name}: {e}")
+                import traceback
+                traceback.print_exc()
     else:
         print(f"\nValidating checkpoints in parallel with {max_workers} workers...")
         ctx = mp.get_context("spawn")
@@ -1468,31 +755,22 @@ def main():
             for idx, ckpt_path in enumerate(ckpt_paths):
                 device = devices[idx % len(devices)]
                 ckpt_name = os.path.basename(ckpt_path)
-                print(f"\nQueued: {ckpt_name} on {device}")
+                print(f"Queued: {ckpt_name} on {device}")
                 futures.append(executor.submit(
                     validate_checkpoint_worker,
                     args.sam2_config,
                     ckpt_path,
-                    val_folders,
-                    args.mode,
+                    args.embedding_dir,
                     args.prompt_mode,
                     device,
-                    args.io_workers,
                     args.max_samples_per_dataset,
                     args.sample_seed,
-                    args.timing,
-                    args.use_dataloader_2d,
                 ))
 
             for fut in tqdm(as_completed(futures), total=len(futures), desc="Checkpoints"):
                 try:
-                    ckpt_path, results_2d, results_3d, summary = fut.result()
+                    ckpt_path, results_3d, summary = fut.result()
                     ckpt_name = os.path.basename(ckpt_path)
-
-                    if results_2d:
-                        csv_path = os.path.join(args.output_path, "validation_results_2d.csv")
-                        append_results_to_csv(results_2d, csv_path)
-                        new_results_2d += len(results_2d)
 
                     if results_3d:
                         csv_path = os.path.join(args.output_path, "validation_results_3d.csv")
@@ -1507,18 +785,15 @@ def main():
                     if summary:
                         print(f"  Results for {ckpt_name}:")
                         for s in summary:
-                            print(f"    {s['dataset']} ({s['mode']}): "
+                            print(f"    {s['dataset']}: "
                                   f"mean_dice={s['mean_dice']:.4f} +/- {s['std_dice']:.4f} "
                                   f"(n={s['num_samples']})")
                 except Exception as e:
                     print(f"  Error validating checkpoint: {e}")
 
-    # Results already appended incrementally
-    if new_results_2d or new_results_3d or new_summaries:
+    # Summary
+    if new_results_3d or new_summaries:
         print("\nAppended results:")
-        if new_results_2d:
-            csv_path = os.path.join(args.output_path, "validation_results_2d.csv")
-            print(f"  2D results: {csv_path} (+{new_results_2d} samples)")
         if new_results_3d:
             csv_path = os.path.join(args.output_path, "validation_results_3d.csv")
             print(f"  3D results: {csv_path} (+{new_results_3d} samples)")
