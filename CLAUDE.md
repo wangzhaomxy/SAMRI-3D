@@ -73,41 +73,54 @@ python gen_training_list.py \
 ```
 
 ### Training
+
+Three training modes are available via `train_multi_gpus.sh`:
+
 ```bash
-# Stage 1: 2D slice-wise training (mask decoder only)
-python train_stage_one_slicewise.py \
-  --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-  --ckpt-path /path/to/sam2.1_hiera_small.pt \
-  --training-list /path/to/training_list_2d.pkl \
-  --dice-threshold 0.4 \
-  --save-path /path/to/stage1_checkpoints/ \
-  --batch-size 512 --num-epochs 100 --lr 1e-5
-
-# Stage 2: 3D-wise training with memory (from raw images)
-python train_stage_two_3dwise.py \
-  --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-  --stage1-ckpt /path/to/stage1_best.pth \
-  --training-list /path/to/training_list_3d.pkl \
-  --save-path /path/to/stage2_checkpoints/ \
-  --batch-size 2 --num-epochs 50 --lr 5e-6 \
-  --mix-ratio-3d 0.8 --max-slices-per-video 32 \
-  --use-amp
-
-# Stage 2: 3D-wise training from pre-computed embeddings (faster)
+# 2D Loss from Embeddings (2d_emb) - Default, fastest
+# Uses: train_embedding_3dwise.py
 python train_embedding_3dwise.py \
   --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
   --stage1-ckpt /path/to/stage1_best.pth \
   --embedding-dir /path/to/3D_embeddings/ \
-  --save-path /path/to/stage2_checkpoints/ \
+  --save-path /path/to/checkpoints/ \
   --batch-size 2 --num-epochs 50 --lr 5e-6 \
   --mix-ratio-3d 0.8 --max-slices-per-video 32 \
   --use-amp
 
-# Meta's original VOS training (for reference)
-python training/train.py \
-  -c configs/sam2.1_training/sam2.1_hiera_b+_MOSE_finetune.yaml \
-  --use-cluster 0 \
-  --num-gpus 8
+# 2D + 3D Loss from Embeddings (3d_emb) - Combined volumetric loss
+# Uses: train_embedding_3dloss.py
+python train_embedding_3dloss.py \
+  --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+  --stage1-ckpt /path/to/stage1_best.pth \
+  --embedding-dir /path/to/3D_embeddings/ \
+  --save-path /path/to/checkpoints/ \
+  --batch-size 2 --num-epochs 50 --lr 5e-6 \
+  --lambda-2d 1.0 --lambda-3d 0.5 \
+  --mix-ratio-3d 0.8 --max-slices-per-video 32 \
+  --use-amp
+
+# 2D Loss from Raw Images (2d_img) - No pre-computation needed
+# Uses: train_stage_two_3dwise.py
+python train_stage_two_3dwise.py \
+  --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+  --stage1-ckpt /path/to/stage1_best.pth \
+  --training-list /path/to/training_list_3d.pkl \
+  --save-path /path/to/checkpoints/ \
+  --batch-size 2 --num-epochs 50 --lr 5e-6 \
+  --mix-ratio-3d 0.8 --max-slices-per-video 32 \
+  --use-amp
+```
+
+**Loss Configurations:**
+- `--lambda-2d`: Weight for 2D per-slice Dice-Focal loss (default: 1.0)
+- `--lambda-3d`: Weight for 3D volumetric Dice loss (default: 0.5)
+- Set `--lambda-3d 0.0` for 2D-only training (ablation)
+
+**SLURM submission:**
+```bash
+# Edit TRAINING_MODE in train_multi_gpus.sh: "2d_emb", "3d_emb", or "2d_img"
+sbatch train_multi_gpus.sh
 ```
 
 ## Architecture
@@ -128,8 +141,9 @@ python training/train.py \
 - `generate_sam2_embeddings.py` - Pre-compute SAM2 image embeddings for 2D training
 - `generate_3d_embeddings.py` - Pre-compute SAM2 embeddings for 3D volumes
 - `train_stage_one_slicewise.py` - Stage 1 training on 2D slices (mask decoder only)
-- `train_stage_two_3dwise.py` - Stage 2 training with memory bank (from raw images)
-- `train_embedding_3dwise.py` - Stage 2 training with memory bank (from pre-computed embeddings)
+- `train_stage_two_3dwise.py` - Training with memory bank from raw images (2D loss)
+- `train_embedding_3dwise.py` - Training with memory bank from pre-computed embeddings (2D loss)
+- `train_embedding_3dloss.py` - Training with memory bank from embeddings (2D + 3D volumetric loss)
 
 **sam2/** - Meta's SAM2 package with:
 - `modeling/` - Hiera backbone, memory attention, mask decoder
@@ -290,3 +304,36 @@ Reference implementation for decoder-only training on pre-computed embeddings:
 - Pre-computed embeddings (`generate_3d_embeddings.py`) are stored as float16
 - `train_embedding_3dwise.py` must keep embeddings as float16 (not convert to float32) to match raw image training behavior
 - Converting embeddings to float32 doubles memory usage and causes OOM
+
+**Embedding Training Memory Management:**
+- Gradient graphs accumulate across forward passes until `backward()` is called
+- Each 3D sample with K labels × N slices = K×N forward passes with gradients retained
+- Use `--max-labels-per-sample 1` to limit gradient accumulation (randomly samples 1 label per volume per epoch)
+- Use `batch_size=1` and `grad_accum_steps=1` for memory-constrained environments
+- Empty batches (no valid losses) must be skipped to avoid `scaler.step()` assertion errors
+- The `batch_losses` list pattern: collect valid losses, skip if empty, `torch.stack().mean()` for proper gradient attachment
+
+### 3D Volumetric Loss (train_embedding_3dloss.py)
+
+The 3D loss training adds a multi-scale volumetric Dice loss to capture global 3D shape consistency:
+
+**Loss formulation:**
+```
+total_loss = lambda_2d * per_slice_dice_focal + lambda_3d * multi_scale_3d_dice
+```
+
+**How it works:**
+1. During propagation, predictions are collected at 32×32 resolution
+2. After processing all slices for a label, predictions are stacked into a 3D volume
+3. Multi-scale 3D Dice loss is computed at scales [1.0, 0.5] for coarse-to-fine consistency
+4. The 3D loss penalizes volumetric inconsistencies not captured by per-slice 2D loss
+
+**Why 3D loss helps (vs. memory bank alone):**
+- Memory bank provides **conditioning** (past predictions influence current), but gradients are detached
+- 3D loss provides **explicit supervision** on volumetric shape with gradient flow
+- Helps prevent accumulating slice-wise errors that compound across the volume
+
+**Recommended hyperparameters:**
+- `--lambda-2d 1.0 --lambda-3d 0.5`: Balanced (default, good starting point)
+- `--lambda-2d 0.5 --lambda-3d 1.0`: Emphasize volumetric consistency
+- `--lambda-2d 1.0 --lambda-3d 0.0`: 2D only (ablation, equivalent to train_embedding_3dwise.py)
