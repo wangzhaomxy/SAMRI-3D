@@ -47,7 +47,7 @@ MIX_RATIO_3D=0.8           # 80% 3D samples, 20% 2D samples
 SAMPLES_PER_DATASET=100    # Volumes per dataset per epoch
 MAX_SLICES_PER_VIDEO=32
 SAVE_EVERY=1
-NUM_WORKERS=16
+NUM_WORKERS=32
 
 # ============================================================================
 # 2D Embedding Mode Configuration (train_embedding_3dwise.py)
