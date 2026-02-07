@@ -69,6 +69,13 @@ python generate_3d_embeddings.py \
 --training-list /scratch/user/s4670484/training_lists/training_list_3d.pkl \
 --output-dir /scratch/user/s4670484/SAM2_embeddings/ \
 --dice-threshold 0.2 \
+--num-workers 16
+
+python generate_3d_embeddings.py \
+--sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+--ckpt-path /scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt \
+--data-paths /scratch/user/s4670484/Datasets/SAMRI_datasets_3D/*/validation/ \
+--output-dir /scratch/user/s4670484/SAM2_val_embeddings/ \
 --num-workers 16       
 
 """
