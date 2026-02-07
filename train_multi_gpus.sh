@@ -39,7 +39,7 @@ INITIAL_CKPT="/scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt"
 # ============================================================================
 # Common Hyperparameters (shared across modes)
 # ============================================================================
-NUM_EPOCHS=200
+NUM_EPOCHS=50
 BATCH_SIZE=2
 LR=5e-6
 GRAD_ACCUM=2
