@@ -76,7 +76,7 @@ if [ "$TRAINING_MODE" == "2d_emb" ]; then
     echo "=========================================="
     echo "SAMRI2: 2D Loss Training (from embeddings)"
     echo "=========================================="
-    echo "Stage 1 checkpoint: ${INITIAL_CKPT}"
+    echo "Initial checkpoint: ${INITIAL_CKPT}"
     echo "3D embeddings dir: ${EMBEDDING_DIR_3D}"
 
     python train_embedding_3dwise.py \
@@ -99,7 +99,7 @@ elif [ "$TRAINING_MODE" == "3d_emb" ]; then
     echo "=========================================="
     echo "SAMRI2: 2D + 3D Loss Training (from embeddings)"
     echo "=========================================="
-    echo "Stage 1 checkpoint: ${INITIAL_CKPT}"
+    echo "Initial checkpoint: ${INITIAL_CKPT}"
     echo "3D embeddings dir: ${EMBEDDING_DIR_3D}"
     echo "Lambda 2D: ${LAMBDA_2D}, Lambda 3D: ${LAMBDA_3D}"
 
@@ -125,7 +125,7 @@ elif [ "$TRAINING_MODE" == "2d_img" ]; then
     echo "=========================================="
     echo "SAMRI2: 2D Loss Training (from raw images)"
     echo "=========================================="
-    echo "Stage 1 checkpoint: ${INITIAL_CKPT}"
+    echo "Initial checkpoint: ${INITIAL_CKPT}"
     echo "Training list: ${TRAINING_LIST_3D}"
 
     python train_stage_two_3dwise.py \
