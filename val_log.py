@@ -14,14 +14,14 @@ Key Features:
 === CLI Examples ===
 
 1. Validate all checkpoints on 3D validation embeddings:
-   python val_log.py \
-       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-       --ckpt-folder /scratch/user/s4670484/Model_save/samri2_stage2_emb \
-       --embedding-dir /scratch/user/s4670484/SAM2_val_embeddings/ \
-       --output-path /scratch/user/s4670484/validation_results/samri2_stage2_emb/ \
-       --prompt-mode box \
-       --device cuda:0 \
-       --max-samples-per-dataset 100
+python val_log.py \
+--sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+--ckpt-folder /scratch/user/s4670484/Model_save/samri2_stage2_emb \
+--embedding-dir /scratch/user/s4670484/SAM2_val_embeddings/ \
+--output-path /scratch/user/s4670484/validation_results/samri2_stage2_emb/ \
+--prompt-mode box \
+--device cuda:0 \
+--max-samples-per-dataset 100
 
 2. Validate a single checkpoint:
    python val_log.py \
@@ -348,10 +348,10 @@ def propagate_video_from_embedding(
     for frame_idx, slice_z in enumerate(slice_indices):
         is_init_cond_frame = (frame_idx == 0)
 
-        # Get current slice embeddings
-        image_embed = torch.from_numpy(image_embeds[slice_z]).unsqueeze(0).to(device)  # (1, 256, 64, 64)
-        high_res_0 = torch.from_numpy(high_res_feat_0s[slice_z]).unsqueeze(0).to(device)
-        high_res_1 = torch.from_numpy(high_res_feat_1s[slice_z]).unsqueeze(0).to(device)
+        # Get current slice embeddings (convert float16 -> float32 to match model)
+        image_embed = torch.from_numpy(image_embeds[slice_z]).unsqueeze(0).float().to(device)  # (1, 256, 64, 64)
+        high_res_0 = torch.from_numpy(high_res_feat_0s[slice_z]).unsqueeze(0).float().to(device)
+        high_res_1 = torch.from_numpy(high_res_feat_1s[slice_z]).unsqueeze(0).float().to(device)
 
         mask_2d = (masks[slice_z] == label).astype(np.float32)
 
