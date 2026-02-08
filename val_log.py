@@ -16,9 +16,9 @@ Key Features:
 1. Validate all checkpoints on 3D validation embeddings:
    python val_log.py \
        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-       --ckpt-folder /scratch/user/s4670484/Model_save/samri2_stage2/ \
-       --embedding-dir /scratch/user/s4670484/SAM2_embeddings_val/ \
-       --output-path /scratch/user/s4670484/validation_results/ \
+       --ckpt-folder /scratch/user/s4670484/Model_save/samri2_stage2_emb \
+       --embedding-dir /scratch/user/s4670484/SAM2_val_embeddings/ \
+       --output-path /scratch/user/s4670484/validation_results/samri2_stage2_emb/ \
        --prompt-mode box \
        --device cuda:0 \
        --max-samples-per-dataset 100
@@ -133,7 +133,7 @@ class Embedding3DValDataset:
     def __init__(
         self,
         embedding_dir: str,
-        max_samples_per_dataset: int = 100,
+        max_samples_per_dataset: Optional[int] = None,
         seed: int = 42,
     ):
         self.embedding_dir = embedding_dir
@@ -155,14 +155,14 @@ class Embedding3DValDataset:
 
         self.dataset_names = sorted(self.dataset_files.keys())
 
-        # Sample files per dataset
+        # Sample files per dataset (use all if max_samples_per_dataset is None or 0)
         self.files = []
         for ds_name in self.dataset_names:
             files = self.dataset_files[ds_name]
             n = len(files)
             if n == 0:
                 continue
-            if n > max_samples_per_dataset:
+            if max_samples_per_dataset and n > max_samples_per_dataset:
                 indices = self.rng.choice(n, size=max_samples_per_dataset, replace=False)
                 files = [files[i] for i in indices]
             self.files.extend([(ds_name, f) for f in files])
@@ -475,7 +475,7 @@ def validate_3d_dataset_from_embeddings(
     embedding_dir: str,
     prompt_mode: str,
     device: str = "cuda:0",
-    max_samples_per_dataset: int = 100,
+    max_samples_per_dataset: Optional[int] = None,
     sample_seed: int = 42,
 ) -> List[Dict]:
     """
@@ -551,7 +551,7 @@ def validate_checkpoint_worker(
     embedding_dir: str,
     prompt_mode: str,
     device: str,
-    max_samples_per_dataset: int,
+    max_samples_per_dataset: Optional[int],
     sample_seed: int,
 ) -> Tuple[str, List[Dict], List[Dict]]:
     """Worker wrapper for checkpoint validation (for multiprocessing)."""
@@ -650,8 +650,8 @@ def parse_args():
                         help="Device list for parallel validation (e.g., cuda:0 cuda:1)")
     parser.add_argument("--num-workers", type=int, default=1,
                         help="Number of parallel workers for checkpoint-level validation")
-    parser.add_argument("--max-samples-per-dataset", type=int, default=100,
-                        help="Max volumes per dataset (default: 100)")
+    parser.add_argument("--max-samples-per-dataset", type=int, default=None,
+                        help="Max volumes per dataset (default: None = use all samples)")
     parser.add_argument("--sample-seed", type=int, default=42,
                         help="Random seed for dataset sampling (default: 42)")
 
