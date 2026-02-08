@@ -920,6 +920,7 @@ def train_epoch(
     loss_vol_total = 0.0  # Track 3D volume loss separately
     num_2d = 0
     num_3d = 0
+    pending_grads = False  # Track if there are gradients pending for final step
 
     pbar = tqdm(dataloader, desc="Training", disable=(rank != 0))
 
@@ -971,6 +972,7 @@ def train_epoch(
 
         if args.use_amp and scaler is not None:
             scaler.scale(batch_loss).backward()
+            pending_grads = True
 
             if (batch_idx + 1) % args.grad_accum_steps == 0:
                 scaler.unscale_(optimizer)
@@ -978,13 +980,16 @@ def train_epoch(
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
+                pending_grads = False
         else:
             batch_loss.backward()
+            pending_grads = True
 
             if (batch_idx + 1) % args.grad_accum_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad()
+                pending_grads = False
 
         epoch_loss += batch_loss.item() * args.grad_accum_steps
 
@@ -997,8 +1002,8 @@ def train_epoch(
                 "3d": num_3d,
             })
 
-    # Final gradient step if needed
-    if len(dataloader) % args.grad_accum_steps != 0:
+    # Final gradient step if needed (only if there are pending gradients)
+    if pending_grads:
         if args.use_amp and scaler is not None:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
