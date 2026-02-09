@@ -315,18 +315,18 @@ Reference implementation for decoder-only training on pre-computed embeddings:
 
 ### 3D Volumetric Loss (train_embedding_3dloss.py)
 
-The 3D loss training adds a multi-scale volumetric Dice loss to capture global 3D shape consistency:
+The 3D loss training adds a per-label volumetric Dice loss at 256×256 to capture global 3D shape consistency:
 
 **Loss formulation:**
 ```
-total_loss = lambda_2d * per_slice_dice_focal + lambda_3d * multi_scale_3d_dice
+total_loss = lambda_2d * per_slice_dice_focal + lambda_3d * volumetric_dice
 ```
 
 **How it works:**
-1. During propagation, predictions are collected at 32×32 resolution
-2. After processing all slices for a label, predictions are stacked into a 3D volume
-3. Multi-scale 3D Dice loss is computed at scales [1.0, 0.5] for coarse-to-fine consistency
-4. The 3D loss penalizes volumetric inconsistencies not captured by per-slice 2D loss
+1. During propagation, per-slice 256×256 predictions (same resolution as 2D loss) are collected
+2. After processing all slices for a label, predictions are stacked into a 3D volume `(1, D, 256, 256)`
+3. A single-scale 3D Dice loss is computed on the stacked volume for volumetric consistency
+4. The 3D Dice is computed per-label, so small objects are not diluted by large ones; Dice ignores true-negative (empty slice) agreement naturally
 
 **Why 3D loss helps (vs. memory bank alone):**
 - Memory bank provides **conditioning** (past predictions influence current), but gradients are detached

@@ -124,56 +124,6 @@ def dice_loss_3d(pred: torch.Tensor, target: torch.Tensor, smooth: float = 1.0) 
     return 1.0 - dice
 
 
-def multiscale_dice_loss_3d(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    scales: List[float] = [1.0, 0.5, 0.25],
-    smooth: float = 1.0,
-) -> torch.Tensor:
-    """
-    Compute multi-scale 3D Dice loss.
-
-    Downsamples both prediction and target to multiple scales and averages
-    the Dice loss across scales. This helps capture both fine-grained and
-    coarse structural consistency.
-
-    Args:
-        pred: (1, D, H, W) predicted logits
-        target: (1, D, H, W) binary ground truth
-        scales: List of scale factors (1.0 = original, 0.5 = half, etc.)
-        smooth: Smoothing factor
-
-    Returns:
-        Averaged multi-scale Dice loss
-    """
-    total_loss = 0.0
-
-    for scale in scales:
-        if scale < 1.0:
-            # Downsample spatially (H, W dimensions)
-            D, H, W = pred.shape[1], pred.shape[2], pred.shape[3]
-            new_H, new_W = max(1, int(H * scale)), max(1, int(W * scale))
-
-            pred_scaled = F.interpolate(
-                pred.unsqueeze(0),  # (1, 1, D, H, W)
-                size=(D, new_H, new_W),
-                mode='trilinear',
-                align_corners=False,
-            ).squeeze(0)  # (1, D, H', W')
-
-            target_scaled = F.interpolate(
-                target.unsqueeze(0).float(),
-                size=(D, new_H, new_W),
-                mode='nearest',
-            ).squeeze(0)
-        else:
-            pred_scaled = pred
-            target_scaled = target
-
-        total_loss += dice_loss_3d(pred_scaled, target_scaled, smooth)
-
-    return total_loss / len(scales)
-
 
 # =============================================================================
 # Utility Functions
@@ -631,10 +581,10 @@ def process_video_with_memory_3dloss(
     slice_losses = []  # 2D losses per slice
     num_slices = 0
 
-    # Storage for 3D volume predictions at low resolution (32x32)
-    # This matches the low-res mask output from mask decoder
-    pred_volume_lowres = []  # Will collect (32, 32) predictions
-    gt_volume_lowres = []    # Will collect (32, 32) ground truth
+    # Storage for 3D volume predictions at 256x256
+    # Reuses the same resolution as the 2D loss for higher-fidelity volumetric constraint
+    pred_volume = []  # Will collect (256, 256) predictions
+    gt_volume = []    # Will collect (256, 256) ground truth
 
     # Memory bank for tracking
     output_dict = {
@@ -661,8 +611,7 @@ def process_video_with_memory_3dloss(
 
         # Prepare ground truth at different resolutions
         gt_tensor = torch.from_numpy(mask_2d).float().unsqueeze(0).unsqueeze(0).to(device)
-        gt_256 = F.interpolate(gt_tensor, size=(256, 256), mode="nearest")  # For 2D loss
-        gt_32 = F.interpolate(gt_tensor, size=(32, 32), mode="nearest")     # For 3D loss
+        gt_256 = F.interpolate(gt_tensor, size=(256, 256), mode="nearest")
 
         # Prepare prompt for initial frame
         point_inputs = None
@@ -736,12 +685,9 @@ def process_video_with_memory_3dloss(
                 slice_losses.append(loss_2d)
                 num_slices += 1
 
-            # Collect predictions for 3D loss (at 32x32, same as low_res_masks output)
-            # low_res_masks is (1, 1, H, W) where H, W is typically 256
-            # Downsample to 32x32 for memory efficiency
-            pred_32 = F.interpolate(low_res_masks, size=(32, 32), mode="bilinear", align_corners=False)
-            pred_volume_lowres.append(pred_32.squeeze(0))  # (1, 32, 32)
-            gt_volume_lowres.append(gt_32.squeeze(0))      # (1, 32, 32)
+            # Collect predictions for 3D loss at 256x256 (same as 2D loss resolution)
+            pred_volume.append(pred_256.squeeze(0))  # (1, 256, 256)
+            gt_volume.append(gt_256.squeeze(0))      # (1, 256, 256)
 
             # Encode memory for next frames (detached to prevent OOM)
             if model.num_maskmem > 0:
@@ -775,13 +721,13 @@ def process_video_with_memory_3dloss(
 
     # 3D volume loss
     vol_loss = torch.tensor(0.0, device=device)
-    if lambda_3d > 0 and len(pred_volume_lowres) > 1:
-        # Stack predictions and ground truth into volumes: (1, D, 32, 32)
-        pred_vol = torch.stack(pred_volume_lowres, dim=1)  # (1, D, 32, 32)
-        gt_vol = torch.stack(gt_volume_lowres, dim=1)       # (1, D, 32, 32)
+    if lambda_3d > 0 and len(pred_volume) > 1:
+        # Stack predictions and ground truth into volumes: (1, D, 256, 256)
+        pred_vol = torch.stack(pred_volume, dim=1)  # (1, D, 256, 256)
+        gt_vol = torch.stack(gt_volume, dim=1)       # (1, D, 256, 256)
 
-        # Compute multi-scale 3D Dice loss
-        vol_loss = multiscale_dice_loss_3d(pred_vol, gt_vol, scales=[1.0, 0.5])
+        # Compute 3D Dice loss for volumetric consistency
+        vol_loss = dice_loss_3d(pred_vol, gt_vol)
 
     # Combined loss
     total_loss = lambda_2d * loss_2d_avg + lambda_3d * vol_loss
