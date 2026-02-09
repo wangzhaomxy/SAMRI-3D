@@ -4,7 +4,7 @@
 #SBATCH --cpus-per-task=96
 #SBATCH --mem=512G
 #SBATCH --job-name=SAMRI2
-#SBATCH --time=7-00:00:00
+#SBATCH --time=3-00:00:00
 #SBATCH --partition=gpu_rocm        # gpu_rocm      gpu_rocm    gpu_cuda
 #SBATCH --gres=gpu:mi300x:3         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2
 #SBATCH --account=a_ai_collab
