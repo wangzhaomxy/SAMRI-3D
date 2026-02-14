@@ -2,60 +2,71 @@
 # -*- coding: utf-8 -*-
 
 """
-train_embedding_3dloss.py
+train_embedding_3dwise.py
 
-Stage 2 training from pre-computed 3D embeddings with combined 2D slice and 3D volume losses.
+unified training training from pre-computed 3D embeddings with memory bank.
 
-This script extends train_embedding_3dwise.py by adding a 3D Dice loss that captures
-global volumetric consistency alongside the per-slice 2D losses.
+This script trains SAM2 on a mixture of 2D slices and 3D volumes using
+pre-computed embeddings, significantly faster than training from raw images.
 
-=== Loss Strategy ===
+=== Training Strategy ===
 
-The training uses a weighted combination of two loss components:
+Trainable Components:
+  - Memory Encoder: Encodes predicted masks into memory features
+  - Memory Attention: Conditions current frame on past memories
+  - Mask Decoder: Generates segmentation masks from prompts
 
-1. 2D Slice Loss (lambda_2d):
-   - Per-slice Dice-Focal loss computed on each 256x256 prediction
-   - Same as train_embedding_3dwise.py
-   - Encourages accurate slice-level segmentation
+Frozen Components:
+  - Image Encoder: Pre-trained Hiera backbone (frozen, embeddings pre-computed)
+  - Prompt Encoder: Spatial encoding for points/boxes (domain-invariant)
 
-2. 3D Volume Loss (lambda_3d):
-   - Multi-scale 3D Dice loss computed on the assembled volume
-   - Operates at 32x32 resolution (downsampled from 256x256 predictions)
-   - Captures volumetric shape and inter-slice consistency
-   - Prevents over-segmentation/under-segmentation that may not be penalized slice-by-slice
+Sample Mix:
+  - ~20% 2D samples: Random slices from 3D volumes processed without memory
+  - ~80% 3D samples: Full volumes processed slice-by-slice with memory updates
 
-Total Loss = lambda_2d * slice_loss + lambda_3d * volume_3d_loss
+=== Workflow ===
+
+Step 1: Generate 3D embeddings
+  python generate_3d_embeddings.py \\
+      --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
+      --ckpt-path /path/to/sam2.1_hiera_small.pt \\
+      --training-list /path/to/training_list_3d.pkl \\
+      --output-dir /path/to/3D_embeddings/ \\
+      --dice-threshold 0.2 \\
+      --num-workers 8
+
+Step 2: Train from embeddings
+  python train_embedding_3dwise.py \\
+      --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
+      --pretrained-ckpt /path/to/pretrained_checkpoint.pth \\
+      --embedding-dir /path/to/3D_embeddings/ \\
+      --save-path /path/to/unified_checkpoints/ \\
+      --batch-size 2 --num-epochs 50
 
 === CLI Examples ===
 
-1. Default weighting (balanced 2D and 3D):
-   python train_embedding_3dloss.py \
-       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-       --stage1-ckpt /path/to/stage1_best.pth \
-       --embedding-dir /path/to/3D_embeddings/ \
-       --save-path /path/to/stage2_3dloss/ \
-       --lambda-2d 1.0 --lambda-3d 0.5
+1. Basic training (2x H100 80G GPUs):
+python train_embedding_3dwise.py \\
+--sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
+--pretrained-ckpt /path/to/pretrained_best.pth \\
+--embedding-dir /path/to/3D_embeddings/ \\
+--mix-ratio-3d 0.8 \\
+--samples-per-dataset 100 \\
+--save-path /path/to/unified_checkpoints/ \\
+--batch-size 2 --num-epochs 50 --lr 5e-6 \\
+--num-workers 16
 
-2. 3D-heavy training (emphasize volumetric consistency):
-   python train_embedding_3dloss.py \
-       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-       --stage1-ckpt /path/to/stage1_best.pth \
-       --embedding-dir /path/to/3D_embeddings/ \
-       --save-path /path/to/stage2_3dloss/ \
-       --lambda-2d 0.5 --lambda-3d 1.0
-
-3. Ablation (2D only, equivalent to train_embedding_3dwise.py):
-   python train_embedding_3dloss.py \
-       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-       --stage1-ckpt /path/to/stage1_best.pth \
-       --embedding-dir /path/to/3D_embeddings/ \
-       --save-path /path/to/stage2_2donly/ \
-       --lambda-2d 1.0 --lambda-3d 0.0
+2. With gradient accumulation for larger effective batch:
+   python train_embedding_3dwise.py \\
+       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
+       --pretrained-ckpt /path/to/pretrained_best.pth \\
+       --embedding-dir /path/to/3D_embeddings/ \\
+       --save-path /path/to/unified_checkpoints/ \\
+       --batch-size 1 --grad-accum-steps 4 \\
+       --num-epochs 50 --lr 5e-6
 
 Key Arguments:
-  --lambda-2d             Weight for 2D slice loss (default: 1.0)
-  --lambda-3d             Weight for 3D volume loss (default: 0.5)
-  --stage1-ckpt           Path to stage 1 checkpoint (mask decoder fine-tuned)
+  --pretrained-ckpt           Path to unified (2D mode) checkpoint (mask decoder fine-tuned)
   --embedding-dir         Directory containing 3D embeddings (*_3demb.npz files)
   --mix-ratio-3d          Proportion of 3D samples per epoch (default: 0.8)
   --samples-per-dataset   Volumes per dataset per epoch (default: 100)
@@ -65,7 +76,18 @@ Key Arguments:
 
 Logging:
   - Training loss logged to training_log.csv in --save-path every epoch
-  - CSV format: epoch, train_loss, loss_2d, loss_3d, loss_vol
+  - CSV format: epoch, train_loss, loss_2d, loss_3d
+  
+Example:
+python train_embedding_3dwise.py \
+--sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+--pretrained-ckpt /path/to/pretrained_best.pth \
+--embedding-dir /path/to/3D_embeddings/ \
+--mix-ratio-3d 0.8 \
+--samples-per-dataset 100 \
+--save-path /path/to/unified_checkpoints/ \
+--batch-size 2 --num-epochs 50 --lr 5e-6 \
+--num-workers 16
 """
 
 import os
@@ -96,36 +118,6 @@ from utils.losses import DiceFocalLoss
 
 
 # =============================================================================
-# 3D Dice Loss
-# =============================================================================
-
-def dice_loss_3d(pred: torch.Tensor, target: torch.Tensor, smooth: float = 1.0) -> torch.Tensor:
-    """
-    Compute 3D Dice loss on a volume.
-
-    Args:
-        pred: (1, D, H, W) predicted logits (will be sigmoidized)
-        target: (1, D, H, W) binary ground truth
-        smooth: Smoothing factor to avoid division by zero
-
-    Returns:
-        Dice loss (1 - Dice coefficient)
-    """
-    pred_prob = torch.sigmoid(pred)
-
-    # Flatten to (N,) for dice computation
-    pred_flat = pred_prob.flatten()
-    target_flat = target.flatten()
-
-    intersection = (pred_flat * target_flat).sum()
-    union = pred_flat.sum() + target_flat.sum()
-
-    dice = (2.0 * intersection + smooth) / (union + smooth)
-    return 1.0 - dice
-
-
-
-# =============================================================================
 # Utility Functions
 # =============================================================================
 
@@ -133,7 +125,7 @@ def get_latest_checkpoint(save_path: str, initial_ckpt: str) -> Tuple[str, int]:
     """
     Find the latest checkpoint in save_path and return its path and epoch number.
     """
-    pattern = os.path.join(save_path, "sam2_emb3dloss_epoch_*.pth")
+    pattern = os.path.join(save_path, "sam2_emb3d_epoch_*.pth")
     ckpt_files = glob(pattern)
 
     if not ckpt_files:
@@ -143,7 +135,7 @@ def get_latest_checkpoint(save_path: str, initial_ckpt: str) -> Tuple[str, int]:
     for f in ckpt_files:
         try:
             basename = os.path.basename(f)
-            epoch_str = basename.replace("sam2_emb3dloss_epoch_", "").replace(".pth", "")
+            epoch_str = basename.replace("sam2_emb3d_epoch_", "").replace(".pth", "")
             epochs.append((int(epoch_str), f))
         except (ValueError, IndexError):
             continue
@@ -409,7 +401,7 @@ def mixed_emb_collate_fn(batch):
 # Model Component Freezing
 # =============================================================================
 
-def freeze_stage2_components(model):
+def freeze_unified_components(model):
     """
     Freeze image encoder and prompt encoder.
     Keep memory encoder, memory attention, and mask decoder trainable.
@@ -530,13 +522,13 @@ def train_2d_sample_from_embedding(
             high_res_features=[high_res_feat_0, high_res_feat_1],
         )
 
-        # Compute loss (only 2D loss for 2D samples)
+        # Compute loss
         loss = loss_fn(low_res_masks, mask_resized)
 
     return loss
 
 
-def process_video_with_memory_3dloss(
+def process_video_with_memory_from_embedding(
     model,
     image_embeds: np.ndarray,
     high_res_feat_0s: np.ndarray,
@@ -549,11 +541,9 @@ def process_video_with_memory_3dloss(
     loss_fn,
     device,
     use_amp: bool = False,
-    lambda_2d: float = 1.0,
-    lambda_3d: float = 0.5,
-) -> Tuple[torch.Tensor, int, torch.Tensor]:
+) -> Tuple[torch.Tensor, int]:
     """
-    Process a sequence of slices with memory bank and collect predictions for 3D loss.
+    Process a sequence of slices with memory bank using pre-computed embeddings.
 
     Args:
         model: SAM2 model (unwrapped from DDP)
@@ -564,27 +554,19 @@ def process_video_with_memory_3dloss(
         slice_indices: List of slice indices to process in order
         label: Target label to segment
         ori_h, ori_w: Original image dimensions
-        loss_fn: Loss function for 2D slices
+        loss_fn: Loss function
         device: Torch device
         use_amp: Whether to use automatic mixed precision
-        lambda_2d: Weight for 2D slice loss
-        lambda_3d: Weight for 3D volume loss
 
     Returns:
-        total_loss: Combined 2D + 3D loss
+        total_loss: Accumulated loss over all slices
         num_slices: Number of slices processed
-        vol_loss: Volume-level 3D loss (for logging)
     """
     if len(slice_indices) == 0:
-        return torch.tensor(0.0, device=device, requires_grad=True), 0, torch.tensor(0.0, device=device)
+        return torch.tensor(0.0, device=device, requires_grad=True), 0
 
-    slice_losses = []  # 2D losses per slice
+    losses = []
     num_slices = 0
-
-    # Storage for 3D volume predictions at 256x256
-    # Reuses the same resolution as the 2D loss for higher-fidelity volumetric constraint
-    pred_volume = []  # Will collect (256, 256) predictions
-    gt_volume = []    # Will collect (256, 256) ground truth
 
     # Memory bank for tracking
     output_dict = {
@@ -609,9 +591,9 @@ def process_video_with_memory_3dloss(
         if mask_2d.sum() == 0 and not is_init_cond_frame:
             continue
 
-        # Prepare ground truth at different resolutions
+        # Prepare ground truth
         gt_tensor = torch.from_numpy(mask_2d).float().unsqueeze(0).unsqueeze(0).to(device)
-        gt_256 = F.interpolate(gt_tensor, size=(256, 256), mode="nearest")
+        gt_resized = F.interpolate(gt_tensor, size=(256, 256), mode="nearest")
 
         # Prepare prompt for initial frame
         point_inputs = None
@@ -619,7 +601,7 @@ def process_video_with_memory_3dloss(
         if is_init_cond_frame:
             box = mask2d_to_bbox_xyxy(mask_2d.astype(np.uint8))
             if box is None:
-                return torch.tensor(0.0, device=device), 0, torch.tensor(0.0, device=device)
+                return torch.tensor(0.0, device=device), 0
 
             scale_x = resolution / ori_w
             scale_y = resolution / ori_h
@@ -639,10 +621,13 @@ def process_video_with_memory_3dloss(
 
         with torch.amp.autocast("cuda", enabled=use_amp):
             # Prepare vision features in the format expected by memory conditioning
+            # image_embed is (1, 256, 64, 64), need to reshape to (4096, 1, 256) for attention
             B, C, H, W = image_embed.shape
             feat_sizes = [(H, W)]
             vision_feats = [image_embed.flatten(2).permute(2, 0, 1)]  # [(HW, B, C)]
-            # Use the FPN neck's PositionEmbeddingSine (matches inference path)
+            # Use the FPN neck's PositionEmbeddingSine (matches inference path).
+            # Do NOT use sam_prompt_encoder.get_dense_pe() here — that is
+            # PositionEmbeddingRandom, intended only for the mask decoder.
             vision_pos_embeds = [model.image_encoder.neck.position_encoding(image_embed).flatten(2).permute(2, 0, 1)]
 
             # Prepare high-res features
@@ -677,17 +662,13 @@ def process_video_with_memory_3dloss(
                 multimask_output=False,
             )
 
-            # Compute 2D slice loss at 256x256
-            pred_256 = F.interpolate(low_res_masks, size=(256, 256), mode="bilinear", align_corners=False)
-            loss_2d = loss_fn(pred_256, gt_256)
+            # Compute loss
+            pred_resized = F.interpolate(low_res_masks, size=(256, 256), mode="bilinear", align_corners=False)
+            loss = loss_fn(pred_resized, gt_resized)
 
-            if not torch.isnan(loss_2d):
-                slice_losses.append(loss_2d)
+            if not torch.isnan(loss):
+                losses.append(loss)
                 num_slices += 1
-
-            # Collect predictions for 3D loss at 256x256 (same as 2D loss resolution)
-            pred_volume.append(pred_256.squeeze(0))  # (1, 256, 256)
-            gt_volume.append(gt_256.squeeze(0))      # (1, 256, 256)
 
             # Encode memory for next frames (detached to prevent OOM)
             if model.num_maskmem > 0:
@@ -712,27 +693,10 @@ def process_video_with_memory_3dloss(
                 else:
                     output_dict["non_cond_frame_outputs"][frame_idx] = current_out
 
-    # Compute combined loss
-    if not slice_losses:
-        return torch.tensor(0.0, device=device, requires_grad=True), 0, torch.tensor(0.0, device=device)
-
-    # 2D loss: average over all slices
-    loss_2d_avg = torch.stack(slice_losses).mean()
-
-    # 3D volume loss
-    vol_loss = torch.tensor(0.0, device=device)
-    if lambda_3d > 0 and len(pred_volume) > 1:
-        # Stack predictions and ground truth into volumes: (1, D, 256, 256)
-        pred_vol = torch.stack(pred_volume, dim=1)  # (1, D, 256, 256)
-        gt_vol = torch.stack(gt_volume, dim=1)       # (1, D, 256, 256)
-
-        # Compute 3D Dice loss for volumetric consistency
-        vol_loss = dice_loss_3d(pred_vol, gt_vol)
-
-    # Combined loss
-    total_loss = lambda_2d * loss_2d_avg + lambda_3d * vol_loss
-
-    return total_loss, num_slices, vol_loss
+    if losses:
+        total_loss = torch.stack(losses).sum()
+        return total_loss, num_slices
+    return torch.tensor(0.0, device=device, requires_grad=True), 0
 
 
 def train_3d_sample_from_embedding(
@@ -741,13 +705,13 @@ def train_3d_sample_from_embedding(
     loss_fn,
     args,
     device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """
-    Train on a 3D volume using memory bank with pre-computed embeddings and 3D loss.
+    Train on a 3D volume using memory bank with pre-computed embeddings.
 
-    Returns:
-        total_loss: Combined 2D + 3D loss
-        vol_loss: 3D volume loss (for logging)
+    Note: To prevent OOM from gradient accumulation, we limit the number of
+    labels processed per sample. Each label creates ~64 forward passes through
+    memory attention, and gradient graphs are kept until backward() is called.
     """
     image_embeds = sample["image_embeds"]  # (N, 256, 64, 64)
     high_res_feat_0s = sample["high_res_feat_0s"]
@@ -775,12 +739,13 @@ def train_3d_sample_from_embedding(
     v2_slices_train = subsample_slices(v2_slices, max_slices)
 
     all_losses = []
-    all_vol_losses = []
     total_slices = 0
 
     # Limit labels per sample to prevent OOM from gradient accumulation
+    # Each label creates ~64 forward passes with gradient graphs
     max_labels_per_sample = getattr(args, 'max_labels_per_sample', 1)
     if len(labels) > max_labels_per_sample:
+        # Randomly select labels for this sample
         rng = np.random.RandomState()
         labels = rng.choice(labels, size=max_labels_per_sample, replace=False).tolist()
 
@@ -791,7 +756,7 @@ def train_3d_sample_from_embedding(
 
         # Process video 1 (cut -> 0)
         if len(v1_slices_train) > 0:
-            loss1, n1, vol_loss1 = process_video_with_memory_3dloss(
+            loss1, n1 = process_video_with_memory_from_embedding(
                 model=base_model,
                 image_embeds=image_embeds,
                 high_res_feat_0s=high_res_feat_0s,
@@ -804,18 +769,15 @@ def train_3d_sample_from_embedding(
                 loss_fn=loss_fn,
                 device=device,
                 use_amp=args.use_amp,
-                lambda_2d=args.lambda_2d,
-                lambda_3d=args.lambda_3d,
             )
             if n1 > 0 and loss1.requires_grad:
                 all_losses.append(loss1)
-                all_vol_losses.append(vol_loss1)
                 total_slices += n1
 
         # Process video 2 (cut -> end), skip cut slice
         if len(v2_slices_train) > 1:
             v2_remaining = v2_slices_train[1:]
-            loss2, n2, vol_loss2 = process_video_with_memory_3dloss(
+            loss2, n2 = process_video_with_memory_from_embedding(
                 model=base_model,
                 image_embeds=image_embeds,
                 high_res_feat_0s=high_res_feat_0s,
@@ -828,12 +790,9 @@ def train_3d_sample_from_embedding(
                 loss_fn=loss_fn,
                 device=device,
                 use_amp=args.use_amp,
-                lambda_2d=args.lambda_2d,
-                lambda_3d=args.lambda_3d,
             )
             if n2 > 0 and loss2.requires_grad:
                 all_losses.append(loss2)
-                all_vol_losses.append(vol_loss2)
                 total_slices += n2
 
     # Clear GPU cache
@@ -841,10 +800,9 @@ def train_3d_sample_from_embedding(
         torch.cuda.empty_cache()
 
     if all_losses and total_slices > 0:
-        total_loss = torch.stack(all_losses).mean()
-        avg_vol_loss = torch.stack(all_vol_losses).mean() if all_vol_losses else torch.tensor(0.0, device=device)
-        return total_loss, avg_vol_loss
-    return torch.tensor(0.0, device=device, requires_grad=True), torch.tensor(0.0, device=device)
+        total_loss = torch.stack(all_losses).sum() / total_slices
+        return total_loss
+    return torch.tensor(0.0, device=device, requires_grad=True)
 
 
 def train_epoch(
@@ -857,16 +815,14 @@ def train_epoch(
     rank,
     scaler=None,
 ):
-    """Train for one epoch on mixed 2D/3D embedding data with 3D loss."""
+    """Train for one epoch on mixed 2D/3D embedding data."""
     model.train()
 
     epoch_loss = 0.0
     loss_2d_total = 0.0
     loss_3d_total = 0.0
-    loss_vol_total = 0.0  # Track 3D volume loss separately
     num_2d = 0
     num_3d = 0
-    pending_grads = False  # Track if there are gradients pending for final step
 
     pbar = tqdm(dataloader, desc="Training", disable=(rank != 0))
 
@@ -876,11 +832,10 @@ def train_epoch(
 
         # Track valid losses to avoid scaler issues with empty batches
         batch_losses = []
-        batch_vol_losses = []
         batch_num_2d = 0
         batch_num_3d = 0
 
-        # Process 2D samples (no 3D loss for 2D samples)
+        # Process 2D samples
         for sample in samples_2d:
             loss = train_2d_sample_from_embedding(model, sample, loss_fn, args, device)
             if not torch.isnan(loss) and loss.item() > 0:
@@ -889,14 +844,12 @@ def train_epoch(
                 batch_num_2d += 1
                 num_2d += 1
 
-        # Process 3D samples (with combined 2D + 3D loss)
+        # Process 3D samples
         for sample in samples_3d:
-            loss, vol_loss = train_3d_sample_from_embedding(model, sample, loss_fn, args, device)
+            loss = train_3d_sample_from_embedding(model, sample, loss_fn, args, device)
             if not torch.isnan(loss) and loss.item() > 0:
                 batch_losses.append(loss)
-                batch_vol_losses.append(vol_loss.item())
                 loss_3d_total += loss.item()
-                loss_vol_total += vol_loss.item()
                 batch_num_3d += 1
                 num_3d += 1
 
@@ -918,7 +871,6 @@ def train_epoch(
 
         if args.use_amp and scaler is not None:
             scaler.scale(batch_loss).backward()
-            pending_grads = True
 
             if (batch_idx + 1) % args.grad_accum_steps == 0:
                 scaler.unscale_(optimizer)
@@ -926,30 +878,25 @@ def train_epoch(
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
-                pending_grads = False
         else:
             batch_loss.backward()
-            pending_grads = True
 
             if (batch_idx + 1) % args.grad_accum_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad()
-                pending_grads = False
 
         epoch_loss += batch_loss.item() * args.grad_accum_steps
 
-        avg_vol = np.mean(batch_vol_losses) if batch_vol_losses else 0.0
         if rank == 0:
             pbar.set_postfix({
                 "loss": f"{batch_loss.item() * args.grad_accum_steps:.4f}",
-                "vol": f"{avg_vol:.4f}",
                 "2d": num_2d,
                 "3d": num_3d,
             })
 
-    # Final gradient step if needed (only if there are pending gradients)
-    if pending_grads:
+    # Final gradient step if needed
+    if len(dataloader) % args.grad_accum_steps != 0:
         if args.use_amp and scaler is not None:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -963,9 +910,8 @@ def train_epoch(
     avg_loss = epoch_loss / max(len(dataloader), 1)
     avg_loss_2d = loss_2d_total / max(num_2d, 1)
     avg_loss_3d = loss_3d_total / max(num_3d, 1)
-    avg_loss_vol = loss_vol_total / max(num_3d, 1)
 
-    return avg_loss, avg_loss_2d, avg_loss_3d, avg_loss_vol
+    return avg_loss, avg_loss_2d, avg_loss_3d
 
 
 # =============================================================================
@@ -973,13 +919,13 @@ def train_epoch(
 # =============================================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Stage 2: Train SAM2 from 3D embeddings with 3D Dice loss")
+    parser = argparse.ArgumentParser(description="unified training: Train SAM2 from 3D embeddings with memory")
 
     # Model configuration
     parser.add_argument("--sam2-config", type=str, required=True,
                         help="Path to SAM2 config file")
-    parser.add_argument("--stage1-ckpt", type=str, required=True,
-                        help="Path to stage 1 checkpoint")
+    parser.add_argument("--pretrained-ckpt", type=str, required=True,
+                        help="Path to unified (2D mode) checkpoint")
 
     # Embedding data
     parser.add_argument("--embedding-dir", type=str, required=True,
@@ -1011,17 +957,11 @@ def parse_args():
     parser.add_argument("--max-grad-norm", type=float, default=1.0,
                         help="Max gradient norm for clipping (default: 1.0)")
 
-    # Loss configuration - 2D/3D weighting
-    parser.add_argument("--lambda-2d", type=float, default=1.0,
-                        help="Weight for 2D slice loss (default: 1.0)")
-    parser.add_argument("--lambda-3d", type=float, default=0.5,
-                        help="Weight for 3D volume loss (default: 0.5)")
-
-    # Loss configuration - Dice/Focal weighting (for 2D loss)
+    # Loss configuration
     parser.add_argument("--lambda-dice", type=float, default=1.0,
-                        help="Weight for dice component in 2D loss (default: 1.0)")
+                        help="Weight for dice loss (default: 1.0)")
     parser.add_argument("--lambda-focal", type=float, default=1.0,
-                        help="Weight for focal component in 2D loss (default: 1.0)")
+                        help="Weight for focal loss (default: 1.0)")
 
     # Hardware configuration
     parser.add_argument("--num-workers", type=int, default=16,
@@ -1055,14 +995,14 @@ def main(rank, world_size, args):
         os.makedirs(args.save_path, exist_ok=True)
 
     # Check for existing checkpoint to resume from
-    ckpt_path, start_epoch = get_latest_checkpoint(args.save_path, args.stage1_ckpt)
+    ckpt_path, start_epoch = get_latest_checkpoint(args.save_path, args.pretrained_ckpt)
     resume_training = start_epoch > 0
 
     if rank == 0:
         if resume_training:
             print(f"Resuming from epoch {start_epoch}, checkpoint: {ckpt_path}")
         else:
-            print(f"Starting fresh training from stage 1 checkpoint: {ckpt_path}")
+            print(f"Starting fresh training from unified (2D mode) checkpoint: {ckpt_path}")
 
     # Build SAM2 model
     model = build_sam2(
@@ -1074,7 +1014,7 @@ def main(rank, world_size, args):
     )
 
     # Freeze appropriate components
-    freeze_stage2_components(model)
+    freeze_unified_components(model)
 
     if rank == 0:
         total_params, trainable_params = count_parameters(model)
@@ -1085,7 +1025,6 @@ def main(rank, world_size, args):
         print(f"Batch size per GPU: {args.batch_size}")
         print(f"Gradient accumulation steps: {args.grad_accum_steps}")
         print(f"Effective batch size: {args.batch_size * world_size * args.grad_accum_steps}")
-        print(f"Loss weights: lambda_2d={args.lambda_2d}, lambda_3d={args.lambda_3d}")
 
     # Wrap model with DDP
     model = DDP(
@@ -1102,7 +1041,7 @@ def main(rank, world_size, args):
         weight_decay=args.weight_decay,
     )
 
-    # Setup loss function (for 2D slices)
+    # Setup loss function
     loss_fn = DiceFocalLoss(
         sigmoid=True,
         squared_pred=True,
@@ -1160,7 +1099,7 @@ def main(rank, world_size, args):
         persistent_workers=True if args.num_workers > 0 else False,
     )
 
-    # Setup CSV logging (with additional vol_loss column)
+    # Setup CSV logging
     csv_path = os.path.join(args.save_path, "training_log.csv")
     csv_file = None
     csv_writer = None
@@ -1169,7 +1108,7 @@ def main(rank, world_size, args):
         csv_file = open(csv_path, "a" if csv_exists else "w", newline="")
         csv_writer = csv.writer(csv_file)
         if not csv_exists:
-            csv_writer.writerow(["epoch", "train_loss", "loss_2d", "loss_3d", "loss_vol"])
+            csv_writer.writerow(["epoch", "train_loss", "loss_2d", "loss_3d"])
         csv_file.flush()
         print(f"\nLogging to: {csv_path}" + (" (appending)" if csv_exists else ""))
 
@@ -1190,7 +1129,7 @@ def main(rank, world_size, args):
 
         mixed_dataset.reshuffle(epoch)
 
-        avg_loss, avg_loss_2d, avg_loss_3d, avg_loss_vol = train_epoch(
+        avg_loss, avg_loss_2d, avg_loss_3d = train_epoch(
             model=model,
             dataloader=train_loader,
             optimizer=optimizer,
@@ -1202,7 +1141,7 @@ def main(rank, world_size, args):
         )
 
         if rank == 0:
-            print(f"Epoch {epoch + 1}: Loss={avg_loss:.4f}, 2D={avg_loss_2d:.4f}, 3D={avg_loss_3d:.4f}, Vol={avg_loss_vol:.4f}")
+            print(f"Epoch {epoch + 1}: Loss={avg_loss:.4f}, 2D={avg_loss_2d:.4f}, 3D={avg_loss_3d:.4f}")
 
             # Log to CSV
             if csv_writer is not None:
@@ -1211,7 +1150,6 @@ def main(rank, world_size, args):
                     f"{avg_loss:.6f}",
                     f"{avg_loss_2d:.6f}",
                     f"{avg_loss_3d:.6f}",
-                    f"{avg_loss_vol:.6f}",
                 ])
                 csv_file.flush()
 
@@ -1219,24 +1157,22 @@ def main(rank, world_size, args):
             if (epoch + 1) % args.save_every == 0:
                 save_name = os.path.join(
                     args.save_path,
-                    f"sam2_emb3dloss_epoch_{epoch + 1}.pth"
+                    f"sam2_emb3d_epoch_{epoch + 1}.pth"
                 )
                 torch.save({
                     "model": model.module.state_dict(),
                     "epoch": epoch + 1,
                     "optimizer": optimizer.state_dict(),
-                    "args": vars(args),  # Save hyperparameters for reproducibility
                 }, save_name)
                 print(f"Checkpoint saved: {save_name}")
 
     # Save final checkpoint
     if rank == 0:
-        save_name = os.path.join(args.save_path, "sam2_emb3dloss_final.pth")
+        save_name = os.path.join(args.save_path, "sam2_emb3d_final.pth")
         torch.save({
             "model": model.module.state_dict(),
             "epoch": args.num_epochs,
             "optimizer": optimizer.state_dict(),
-            "args": vars(args),
         }, save_name)
         print(f"Final checkpoint saved: {save_name}")
 
@@ -1263,8 +1199,7 @@ if __name__ == "__main__":
     elif "MASTER_PORT" not in os.environ:
         os.environ["MASTER_PORT"] = str(py_random.randint(29500, 29999))
 
-    print(f"Starting 3D-loss Stage 2 training with {world_size} GPUs")
+    print(f"Starting embedding-based unified training training with {world_size} GPUs")
     print(f"Using MASTER_PORT: {os.environ['MASTER_PORT']}")
-    print(f"Loss weighting: lambda_2d={args.lambda_2d}, lambda_3d={args.lambda_3d}")
 
     mp.spawn(main, args=(world_size, args), nprocs=world_size)

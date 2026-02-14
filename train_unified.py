@@ -4,7 +4,7 @@
 """
 train_stage_two_3dwise.py
 
-Stage 2 training: 3D-wise training with memory bank on SAM2.
+unified training training: 3D-wise training with memory bank on SAM2.
 
 This script trains SAM2 on a mixture of 2D slices and 3D volumes, using the memory
 bank mechanism to improve temporal/spatial consistency across slices.
@@ -21,7 +21,7 @@ Frozen Components:
   - Prompt Encoder: Spatial encoding for points/boxes (domain-invariant)
 
 Sample Mix:
-  - ~20% 2D samples: Single slices processed without memory (like stage 1)
+  - ~20% 2D samples: Single slices processed without memory (like unified (2D mode))
   - ~80% 3D samples: Full volumes processed slice-by-slice with memory updates
 
 === Workflow ===
@@ -43,42 +43,42 @@ Step 1: Generate training lists with dice scores (if not already done)
       --data-paths /path/to/Datasets/ \\
       --save-path /path/to/training_list_3d.pkl
 
-Step 2: Run stage 2 training
+Step 2: Run unified training training
   python train_stage_two_3dwise.py \\
       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-      --stage1-ckpt /path/to/stage1_checkpoint.pth \\
+      --pretrained-ckpt /path/to/pretrained_checkpoint.pth \\
       --training-list-2d /path/to/training_list_2d.pkl \\
       --training-list-3d /path/to/training_list_3d.pkl \\
-      --save-path /path/to/stage2_checkpoints/ \\
+      --save-path /path/to/unified_checkpoints/ \\
       --batch-size 2 --num-epochs 50
 
 === CLI Examples ===
 
-1. Basic stage 2 training (2x H100 80G GPUs):
+1. Basic unified training training (2x H100 80G GPUs):
    python train_stage_two_3dwise.py \\
        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-       --stage1-ckpt /path/to/stage1_best.pth \\
+       --pretrained-ckpt /path/to/pretrained_best.pth \\
        --training-list-2d /path/to/training_list_2d.pkl \\
        --training-list-3d /path/to/training_list_3d.pkl \\
        --dice-threshold-2d 0.4 --dice-threshold-3d 0.2 \\
        --mix-ratio-3d 0.8 \\
        --samples-per-dataset-2d 500 --samples-per-dataset-3d 100 \\
-       --save-path /path/to/stage2_checkpoints/ \\
+       --save-path /path/to/unified_checkpoints/ \\
        --batch-size 2 --num-epochs 50 --lr 5e-6 \\
        --num-workers 32
 
 2. With gradient accumulation for larger effective batch:
    python train_stage_two_3dwise.py \\
        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
-       --stage1-ckpt /path/to/stage1_best.pth \\
+       --pretrained-ckpt /path/to/pretrained_best.pth \\
        --training-list-2d /path/to/training_list_2d.pkl \\
        --training-list-3d /path/to/training_list_3d.pkl \\
-       --save-path /path/to/stage2_checkpoints/ \\
+       --save-path /path/to/unified_checkpoints/ \\
        --batch-size 1 --grad-accum-steps 4 \\
        --num-epochs 50 --lr 5e-6
 
 Key Arguments:
-  --stage1-ckpt           Path to stage 1 checkpoint (mask decoder fine-tuned)
+  --pretrained-ckpt           Path to unified (2D mode) checkpoint (mask decoder fine-tuned)
   --training-list-2d      Path to 2D training list pickle file
   --training-list-3d      Path to 3D training list pickle file
   --dice-threshold-2d     Min dice for 2D samples (default: 0.4)
@@ -98,7 +98,7 @@ Hparameters may need adjustment based on GPU memory and dataset size.
 Example:
 python train_stage_two_3dwise.py \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---stage1-ckpt /path/to/stage1_checkpoint.pth \
+--pretrained-ckpt /path/to/pretrained_checkpoint.pth \
 --training-list-2d /path/to/training_list_2d.pkl \
 --training-list-3d /path/to/training_list_3d.pkl \
 --dice-threshold-2d 0.4 --dice-threshold-3d 0.2 \
@@ -107,7 +107,7 @@ python train_stage_two_3dwise.py \
 --batch-size 2 --grad-accum-steps 2 \
 --lr 5e-6 --num-epochs 50 \
 --num-workers 32 --use-amp \
---save-path /path/to/stage2_checkpoints/
+--save-path /path/to/unified_checkpoints/
 """
 
 import os
@@ -188,13 +188,13 @@ def get_latest_checkpoint(save_path: str, initial_ckpt: str) -> Tuple[str, int]:
 
     Args:
         save_path: Directory containing checkpoint files
-        initial_ckpt: Fallback checkpoint path (e.g., stage 1 checkpoint)
+        initial_ckpt: Fallback checkpoint path (e.g., unified (2D mode) checkpoint)
 
     Returns:
         Tuple of (checkpoint_path, start_epoch)
     """
-    # Look for stage 2 checkpoints
-    pattern = os.path.join(save_path, "sam2_stage2_epoch_*.pth")
+    # Look for unified training checkpoints
+    pattern = os.path.join(save_path, "sam2_unified_epoch_*.pth")
     ckpt_files = glob(pattern)
 
     if not ckpt_files:
@@ -204,9 +204,9 @@ def get_latest_checkpoint(save_path: str, initial_ckpt: str) -> Tuple[str, int]:
     epochs = []
     for f in ckpt_files:
         try:
-            # Extract epoch from filename like "sam2_stage2_epoch_30.pth"
+            # Extract epoch from filename like "sam2_unified_epoch_30.pth"
             basename = os.path.basename(f)
-            epoch_str = basename.replace("sam2_stage2_epoch_", "").replace(".pth", "")
+            epoch_str = basename.replace("sam2_unified_epoch_", "").replace(".pth", "")
             epochs.append((int(epoch_str), f))
         except (ValueError, IndexError):
             continue
@@ -474,7 +474,7 @@ def volume_sample_factory():
 class Stratified2DDataset(Dataset):
     """
     Dataset for stratified 2D slice training with dice filtering.
-    Same as StratifiedTrainingDataset in stage 1, but optimized for mixed training.
+    Same as StratifiedTrainingDataset in unified (2D mode), but optimized for mixed training.
     """
 
     def __init__(
@@ -815,7 +815,7 @@ def mixed_collate_fn(batch):
 # Model Component Freezing
 # =============================================================================
 
-def freeze_stage2_components(model):
+def freeze_unified_components(model):
     """
     Freeze image encoder and prompt encoder.
     Keep memory encoder, memory attention, and mask decoder trainable.
@@ -880,7 +880,7 @@ def train_2d_sample(
 ) -> torch.Tensor:
     """
     Train on a single 2D sample (no memory).
-    Similar to stage 1 training.
+    Similar to unified (2D mode) training.
     """
     image = sample["image"]  # [H, W, 3] numpy
     mask = sample["mask"]  # [H, W] numpy
@@ -1340,13 +1340,13 @@ def train_epoch(
 # =============================================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Stage 2: 3D-wise SAM2 training with memory")
+    parser = argparse.ArgumentParser(description="unified training: 3D-wise SAM2 training with memory")
 
     # Model configuration
     parser.add_argument("--sam2-config", type=str, required=True,
                         help="Path to SAM2 config file")
-    parser.add_argument("--stage1-ckpt", type=str, required=True,
-                        help="Path to stage 1 checkpoint")
+    parser.add_argument("--pretrained-ckpt", type=str, required=True,
+                        help="Path to unified (2D mode) checkpoint")
 
     # Training lists
     parser.add_argument("--training-list-2d", type=str, required=True,
@@ -1427,14 +1427,14 @@ def main(rank, world_size, args):
         os.makedirs(args.save_path, exist_ok=True)
 
     # Check for existing checkpoint to resume from
-    ckpt_path, start_epoch = get_latest_checkpoint(args.save_path, args.stage1_ckpt)
+    ckpt_path, start_epoch = get_latest_checkpoint(args.save_path, args.pretrained_ckpt)
     resume_training = start_epoch > 0
 
     if rank == 0:
         if resume_training:
             print(f"Resuming from epoch {start_epoch}, checkpoint: {ckpt_path}")
         else:
-            print(f"Starting fresh training from stage 1 checkpoint: {ckpt_path}")
+            print(f"Starting fresh training from unified (2D mode) checkpoint: {ckpt_path}")
 
     # Build SAM2 model for training
     # Note: We use the model directly for both 2D and 3D training
@@ -1448,7 +1448,7 @@ def main(rank, world_size, args):
     )
 
     # Freeze appropriate components
-    freeze_stage2_components(model)
+    freeze_unified_components(model)
 
     if rank == 0:
         total_params, trainable_params = count_parameters(model)
@@ -1611,7 +1611,7 @@ def main(rank, world_size, args):
             if (epoch + 1) % args.save_every == 0:
                 save_name = os.path.join(
                     args.save_path,
-                    f"sam2_stage2_epoch_{epoch + 1}.pth"
+                    f"sam2_unified_epoch_{epoch + 1}.pth"
                 )
                 torch.save({
                     "model": model.module.state_dict(),
@@ -1622,7 +1622,7 @@ def main(rank, world_size, args):
 
     # Save final checkpoint
     if rank == 0:
-        save_name = os.path.join(args.save_path, "sam2_stage2_final.pth")
+        save_name = os.path.join(args.save_path, "sam2_unified_final.pth")
         torch.save({
             "model": model.module.state_dict(),
             "epoch": args.num_epochs,
@@ -1653,7 +1653,7 @@ if __name__ == "__main__":
     elif "MASTER_PORT" not in os.environ:
         os.environ["MASTER_PORT"] = str(py_random.randint(29500, 29999))
 
-    print(f"Starting Stage 2 training with {world_size} GPUs")
+    print(f"Starting unified training training with {world_size} GPUs")
     print(f"Using MASTER_PORT: {os.environ['MASTER_PORT']}")
 
     mp.spawn(main, args=(world_size, args), nprocs=world_size)

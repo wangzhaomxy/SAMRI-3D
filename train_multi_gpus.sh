@@ -27,9 +27,9 @@ export MASTER_PORT=$((26000 + RANDOM % 1000))  # Pick a port between 26000 ~ 269
 # ============================================================================
 
 # Training mode:
-#   "2d_emb"  - 2D loss from pre-computed embeddings (train_embedding_3dwise.py)
-#   "3d_emb"  - 2D + 3D loss from pre-computed embeddings (train_embedding_3dloss.py)
-#   "2d_img"  - 2D loss from raw images (train_stage_two_3dwise.py)
+#   "2d_emb"  - 2D loss from pre-computed embeddings (train_unified_emb.py)
+#   "3d_emb"  - 2D + 3D loss from pre-computed embeddings (train_unified_emb_3dloss.py)
+#   "2d_img"  - 2D loss from raw images (train_unified.py)
 TRAINING_MODE="3d_emb"
 
 # Common paths
@@ -50,20 +50,20 @@ SAVE_EVERY=1
 NUM_WORKERS=32
 
 # ============================================================================
-# 2D Embedding Mode Configuration (train_embedding_3dwise.py)
+# 2D Embedding Mode Configuration (train_unified_emb.py)
 # ============================================================================
 EMBEDDING_DIR_3D="/scratch/user/s4670484/SAM2_embeddings/"
 SAVE_PATH_2D_EMB="/scratch/user/s4670484/Model_save/samri2_2d_emb/"
 
 # ============================================================================
-# 3D Loss Embedding Mode Configuration (train_embedding_3dloss.py)
+# 3D Loss Embedding Mode Configuration (train_unified_emb_3dloss.py)
 # ============================================================================
 SAVE_PATH_3D_EMB="/scratch/user/s4670484/Model_save/samri2_single3d_emb_256/"
 LAMBDA_2D=1.0              # Weight for 2D slice loss
 LAMBDA_3D=0.5              # Weight for 3D volume loss
 
 # ============================================================================
-# 2D Image Mode Configuration (train_stage_two_3dwise.py)
+# 2D Image Mode Configuration (train_unified.py)
 # ============================================================================
 TRAINING_LIST_3D="/scratch/user/s4670484/training_lists/training_list_3d.pkl"
 SAVE_PATH_2D_IMG="/scratch/user/s4670484/Model_save/samri2_2d_img/"
@@ -79,9 +79,9 @@ if [ "$TRAINING_MODE" == "2d_emb" ]; then
     echo "Initial checkpoint: ${INITIAL_CKPT}"
     echo "3D embeddings dir: ${EMBEDDING_DIR_3D}"
 
-    python train_embedding_3dwise.py \
+    python train_unified_emb.py \
         --sam2-config ${SAM2_CONFIG} \
-        --stage1-ckpt ${INITIAL_CKPT} \
+        --pretrained-ckpt ${INITIAL_CKPT} \
         --embedding-dir ${EMBEDDING_DIR_3D} \
         --save-path ${SAVE_PATH_2D_EMB} \
         --mix-ratio-3d ${MIX_RATIO_3D} \
@@ -103,9 +103,9 @@ elif [ "$TRAINING_MODE" == "3d_emb" ]; then
     echo "3D embeddings dir: ${EMBEDDING_DIR_3D}"
     echo "Lambda 2D: ${LAMBDA_2D}, Lambda 3D: ${LAMBDA_3D}"
 
-    python train_embedding_3dloss.py \
+    python train_unified_emb_3dloss.py \
         --sam2-config ${SAM2_CONFIG} \
-        --stage1-ckpt ${INITIAL_CKPT} \
+        --pretrained-ckpt ${INITIAL_CKPT} \
         --embedding-dir ${EMBEDDING_DIR_3D} \
         --save-path ${SAVE_PATH_3D_EMB} \
         --mix-ratio-3d ${MIX_RATIO_3D} \
@@ -128,9 +128,9 @@ elif [ "$TRAINING_MODE" == "2d_img" ]; then
     echo "Initial checkpoint: ${INITIAL_CKPT}"
     echo "Training list: ${TRAINING_LIST_3D}"
 
-    python train_stage_two_3dwise.py \
+    python train_unified.py \
         --sam2-config ${SAM2_CONFIG} \
-        --stage1-ckpt ${INITIAL_CKPT} \
+        --pretrained-ckpt ${INITIAL_CKPT} \
         --training-list ${TRAINING_LIST_3D} \
         --save-path ${SAVE_PATH_2D_IMG} \
         --mix-ratio-3d ${MIX_RATIO_3D} \
