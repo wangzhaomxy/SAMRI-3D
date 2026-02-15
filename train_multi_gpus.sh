@@ -1,14 +1,14 @@
 #!/bin/bash --login
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=48
+#SBATCH --cpus-per-task=96
 #SBATCH --mem=512G
 #SBATCH --job-name=SAMRI2
 #SBATCH --time=3-00:00:00
 #SBATCH --partition=gpu_rocm        # gpu_rocm      gpu_rocm    gpu_cuda
-#SBATCH --gres=gpu:mi300x:3         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2
+#SBATCH --gres=gpu:mi300x:8         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2
 #SBATCH --account=a_ai_collab
-#SBATCH --qos=gpu                   # sdf           gpu         gpu
+#SBATCH --qos=sdf                   # sdf           gpu         gpu
 #SBATCH -o /home/s4670484/Documents/SAMRI2_log/slurm-samri2-%j.output
 #SBATCH -e /home/s4670484/Documents/SAMRI2_log/slurm-samri2-%j.error
 #SBATCH --mail-type=ALL
@@ -49,7 +49,7 @@ MIX_RATIO_3D=0.8           # 80% 3D samples, 20% 2D samples
 SAMPLES_PER_DATASET=100    # Volumes per dataset per epoch
 MAX_SLICES_PER_VIDEO=32
 SAVE_EVERY=1
-NUM_WORKERS=32
+NUM_WORKERS=12
 
 # ============================================================================
 # 2D Loss Embedding Mode Configuration (train_unified_emb.py)
