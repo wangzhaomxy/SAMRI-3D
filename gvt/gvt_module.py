@@ -22,7 +22,7 @@ import torch.nn as nn
 class GVTModule(nn.Module):
     def __init__(
         self,
-        num_tokens: int = 4,
+        num_tokens: int = 16,
         input_dim: int = 256,
         output_dim: int = 64,
         num_heads: int = 4,

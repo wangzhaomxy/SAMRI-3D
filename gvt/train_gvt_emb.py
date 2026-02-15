@@ -328,8 +328,8 @@ def parse_args():
     # GVT configuration
     parser.add_argument("--use-gvt", action="store_true",
                         help="Enable Global Volume Token module")
-    parser.add_argument("--gvt-num-tokens", type=int, default=4,
-                        help="Number of global volume tokens K (default: 4)")
+    parser.add_argument("--gvt-num-tokens", type=int, default=16,
+                        help="Number of global volume tokens K (default: 16)")
     parser.add_argument("--gvt-num-layers", type=int, default=2,
                         help="Number of Perceiver cross-attention layers (default: 2)")
     parser.add_argument("--gvt-num-heads", type=int, default=4,

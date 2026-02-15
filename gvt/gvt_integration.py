@@ -81,7 +81,7 @@ class GVTMemoryAttentionWrapper(nn.Module):
 
 def wrap_model_with_gvt(
     model,
-    num_tokens: int = 4,
+    num_tokens: int = 16,
     num_layers: int = 2,
     num_heads: int = 4,
     dropout: float = 0.1,
