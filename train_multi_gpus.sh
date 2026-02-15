@@ -45,14 +45,14 @@ NUM_EPOCHS=100
 BATCH_SIZE=2
 LR=5e-6
 GRAD_ACCUM=2
-MIX_RATIO_3D=0           # 80% 3D samples, 20% 2D samples
+MIX_RATIO_3D=0.8           # 80% 3D samples, 20% 2D samples
 SAMPLES_PER_DATASET=100    # Volumes per dataset per epoch
 MAX_SLICES_PER_VIDEO=32
 SAVE_EVERY=1
 NUM_WORKERS=32
 
 # ============================================================================
-# 2D Embedding Mode Configuration (train_unified_emb.py)
+# 2D Loss Embedding Mode Configuration (train_unified_emb.py)
 # ============================================================================
 EMBEDDING_DIR_3D="/scratch/user/s4670484/SAM2_embeddings/"
 SAVE_PATH_2D_EMB="/scratch/user/s4670484/Model_save/samri2_2d_emb/"
@@ -60,12 +60,12 @@ SAVE_PATH_2D_EMB="/scratch/user/s4670484/Model_save/samri2_2d_emb/"
 # ============================================================================
 # 3D Loss Embedding Mode Configuration (train_unified_emb_3dloss.py)
 # ============================================================================
-SAVE_PATH_3D_EMB="/scratch/user/s4670484/Model_save/samri2_2d_emb_256/"
+SAVE_PATH_3D_EMB="/scratch/user/s4670484/Model_save/samri2_3d_emb_256/"
 LAMBDA_2D=1.0              # Weight for 2D slice loss
 LAMBDA_3D=0.5              # Weight for 3D volume loss
 
 # ============================================================================
-# 2D Image Mode Configuration (train_unified.py)
+# 2D Loss Image Mode Configuration (train_unified.py)
 # ============================================================================
 TRAINING_LIST_3D="/scratch/user/s4670484/training_lists/training_list_3d.pkl"
 SAVE_PATH_2D_IMG="/scratch/user/s4670484/Model_save/samri2_2d_img/"
