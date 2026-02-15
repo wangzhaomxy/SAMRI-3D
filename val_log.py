@@ -278,16 +278,17 @@ def validate_3d_volume_from_embedding(
                 if frame_idx in preds_v1:
                     pred_volume[slice_z] = preds_v1[frame_idx]
 
-        # Process video 2 (cut -> end), skip cut slice to avoid double-writing
+        # Process video 2 (cut -> end)
+        # Must include cut slice as conditioning frame for memory initialization,
+        # but skip writing its prediction (video 1 already wrote it)
         if len(v2_slices) > 1:
-            v2_remaining = v2_slices[1:]  # Skip cut slice
             preds_v2 = propagate_video_from_embedding(
                 model=model,
                 image_embeds=image_embeds,
                 high_res_feat_0s=high_res_feat_0s,
                 high_res_feat_1s=high_res_feat_1s,
                 masks=masks,
-                slice_indices=v2_remaining,
+                slice_indices=v2_slices,
                 label=label,
                 ori_h=ori_h,
                 ori_w=ori_w,
@@ -295,7 +296,9 @@ def validate_3d_volume_from_embedding(
                 prompt_mode=prompt_mode,
                 device=device,
             )
-            for frame_idx, slice_z in enumerate(v2_remaining):
+            for frame_idx, slice_z in enumerate(v2_slices):
+                if frame_idx == 0:
+                    continue  # Skip cut slice (already written by video 1)
                 if frame_idx in preds_v2:
                     pred_volume[slice_z] = preds_v2[frame_idx]
 
