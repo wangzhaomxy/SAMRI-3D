@@ -76,7 +76,7 @@ from tqdm import tqdm
 _THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_THIS_DIR))
 
-from sam2.build_sam import build_sam2
+from sam2.build_sam import build_sam2_video_predictor
 
 
 # =============================================================================
@@ -487,8 +487,9 @@ def validate_3d_dataset_from_embeddings(
     Returns:
         List of results with dataset, npz_path, label, dice, voxel_count
     """
-    # Build model
-    model = build_sam2(sam2_config, ckpt_path, device=device, mode="eval")
+    # Build model (use video predictor to match test_vis3d_multi.py settings:
+    # binarize_mask_from_pts_for_mem_enc=true, fill_hole_area=8)
+    model = build_sam2_video_predictor(sam2_config, ckpt_path, device=device, mode="eval")
     model.eval()
 
     # Load validation dataset
