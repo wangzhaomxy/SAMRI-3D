@@ -53,10 +53,10 @@ Features:
 
 Examples:    
 python test_vis3d_multi.py \
---sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-path /scratch/user/s4670484/Model_save/samri2_single3d_emb_256/sam2_emb3dloss_epoch_47.pth \
---dataset-path /scratch/user/s4670484/Datasets/SAMRI_datasets_3D/ \
---save-path /scratch/user/s4670484/Eval_results/SAMRI2/sam2_emb3dloss_256_epoch_47.pkl \
+--sam2-config configs/sam2.1/sam2.1_hiera_b+.yaml \
+--ckpt-path /scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_base_plus.pt \
+--dataset-path /scratch/user/s4670484/Datasets/SAMRI_datasets_3D/ /scratch/user/s4670484/Datasets/Zeroshot3D/ \
+--save-path /scratch/user/s4670484/Eval_results/SAMRI2/sam2.1_hiera_base_plus.pkl \
 --num-workers 12
 """
 
