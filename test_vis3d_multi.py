@@ -22,7 +22,7 @@ Features:
    python test_vis3d_multi.py \
        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
        --ckpt-path /path/to/sam2.1_hiera_small.pt \
-       --dataset-path /path/to/Datasets/Test_3d/ \
+       --dataset-path /path/to/Test_3d/ /path/to/ZeroShot_results/ \
        --save-path /path/to/results_multi.pkl \
        --prompt-mode box
 
@@ -30,7 +30,7 @@ Features:
    python test_vis3d_multi.py \
        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
        --ckpt-path /path/to/sam2.1_hiera_small.pt \
-       --dataset-path /path/to/Datasets/Test_3d/ \
+       --dataset-path /path/to/Test_3d/ /path/to/ZeroShot_results/ \
        --save-path /path/to/results_multi.pkl \
        --num-workers 8
 
@@ -38,7 +38,7 @@ Features:
 
   --sam2-config     SAM2 config file (yaml)
   --ckpt-path       SAM2 checkpoint file (.pt)
-  --dataset-path    Root path containing dataset folders with /testing/ subdirs
+  --dataset-path    Two root paths with same structure: test dataset and zero-shot results
   --save-path       Output pickle file path
   --prompt-mode     Prompt type: box or mask (default: box)
   --num-workers     Workers for parallel data loading (default: 4)
@@ -223,16 +223,18 @@ def scan_pairs_same_folder(folder: str) -> List[Tuple[str, str]]:
     return pairs
 
 
-def collect_test_folders(dataset_path: str) -> List[str]:
-    dataset_path = dataset_path.rstrip("/")
-    ds_folders = [d for d in sorted(glob(dataset_path + "/*")) if os.path.isdir(d)]
-    if not ds_folders:
-        return [dataset_path]
-
+def collect_test_folders(dataset_paths: List[str]) -> List[str]:
     test_folders: List[str] = []
-    for ds in ds_folders:
-        cand = os.path.join(ds, "testing")
-        test_folders.append(cand if os.path.isdir(cand) else ds)
+    for dataset_path in dataset_paths:
+        dataset_path = dataset_path.rstrip("/")
+        ds_folders = [d for d in sorted(glob(dataset_path + "/*")) if os.path.isdir(d)]
+        if not ds_folders:
+            test_folders.append(dataset_path)
+            continue
+
+        for ds in ds_folders:
+            cand = os.path.join(ds, "testing")
+            test_folders.append(cand if os.path.isdir(cand) else ds)
     return test_folders
 
 
@@ -754,7 +756,7 @@ def prefetch_data_generator(
 # Main record function (per-case, per-label rows)
 # ----------------------------
 def save_test_record_3d_multi_object(
-    dataset_path: str,
+    dataset_paths: List[str],
     predictor,
     prompt_mode: str,
     save_path: str,
@@ -772,7 +774,7 @@ def save_test_record_3d_multi_object(
     """
     final_record: Dict[str, List[Dict]] = {}
 
-    test_folders = collect_test_folders(dataset_path)
+    test_folders = collect_test_folders(dataset_paths)
     for test_folder in test_folders:
         tf = Path(test_folder).resolve()
         ds_name = tf.parent.name if tf.name == "testing" else tf.name
@@ -894,7 +896,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sam2-config", type=str, required=True)
     parser.add_argument("--ckpt-path", type=str, required=True)
-    parser.add_argument("--dataset-path", type=str, required=True)
+    parser.add_argument("--dataset-path", type=str, nargs=2, required=True,
+                        metavar=("TEST_DATA", "ZEROSHOT_RESULTS"),
+                        help="Two paths with same structure: test dataset and zero-shot results")
     parser.add_argument("--save-path", type=str, required=True)
     parser.add_argument("--prompt-mode", type=str, choices=["box", "mask"], default="box")
     parser.add_argument("--device", type=str, default="cuda")
@@ -908,7 +912,8 @@ def main():
     print("\n======================================")
     print(f"SAM2 config   : {args.sam2_config}")
     print(f"Checkpoint    : {args.ckpt_path}")
-    print(f"Dataset path  : {args.dataset_path}")
+    print(f"Test data     : {args.dataset_path[0]}")
+    print(f"Zero-shot data: {args.dataset_path[1]}")
     print(f"Save path     : {args.save_path}")
     print(f"Prompt mode   : {args.prompt_mode}")
     print(f"Device        : {args.device}")
@@ -919,7 +924,7 @@ def main():
     predictor = build_sam2_video_predictor(args.sam2_config, args.ckpt_path, device=args.device)
 
     save_test_record_3d_multi_object(
-        dataset_path=args.dataset_path,
+        dataset_paths=args.dataset_path,
         predictor=predictor,
         prompt_mode=args.prompt_mode,
         save_path=args.save_path,

@@ -20,7 +20,7 @@ python setup_sam2.py install        # Install SAM2 with CUDA extensions
 python test_vis3d.py \
   --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
   --ckpt-path /path/to/checkpoint.pt \
-  --dataset-path /path/to/dataset/ \
+  --dataset-path /path/to/test_data/ /path/to/zeroshot_results/ \
   --save-path /path/to/results.pkl \
   --prompt-mode box \
   --num-workers 8
@@ -29,7 +29,7 @@ python test_vis3d.py \
 python test_vis3d_multi.py \
   --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
   --ckpt-path /path/to/checkpoint.pt \
-  --dataset-path /path/to/dataset/ \
+  --dataset-path /path/to/test_data/ /path/to/zeroshot_results/ \
   --save-path /path/to/results.pkl \
   --prompt-mode box \
   --num-workers 8
