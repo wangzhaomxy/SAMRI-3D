@@ -14,7 +14,7 @@
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=zhao.wang1@uq.edu.au
 
-module load anaconda3
+module --ignore_cache load "anaconda3"
 source $EBROOTANACONDA3/etc/profile.d/conda.sh
 conda activate samri-mi300  # samri samri-mi300
 
