@@ -74,8 +74,8 @@ SAVE_PATH_2D_IMG="/scratch/user/s4670484/Model_save/samri2_2d_img/"
 # GVT Configuration (gvt/train_gvt_emb.py, gvt/train_gvt_emb_3dloss.py)
 # ============================================================================
 SAVE_PATH_GVT_EMB="/scratch/user/s4670484/Model_save/samri2_gvt_emb/"
-SAVE_PATH_GVT_3D_EMB="/scratch/user/s4670484/Model_save/samri2_gvt_3d_emb_K16/"
-GVT_NUM_TOKENS=16
+SAVE_PATH_GVT_3D_EMB="/scratch/user/s4670484/Model_save/samri2_gvt_3d_emb_K32/"
+GVT_NUM_TOKENS=32
 GVT_NUM_LAYERS=2
 GVT_NUM_HEADS=4
 
