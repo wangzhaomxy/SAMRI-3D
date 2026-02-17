@@ -32,7 +32,7 @@ export MASTER_PORT=$((26000 + RANDOM % 1000))  # Pick a port between 26000 ~ 269
 #   "2d_img"      - 2D loss from raw images (train_unified.py)
 #   "gvt_emb"     - 2D loss + GVT from embeddings (gvt/train_gvt_emb.py)
 #   "gvt_3d_emb"  - 2D + 3D loss + GVT from embeddings (gvt/train_gvt_emb_3dloss.py)
-TRAINING_MODE="gvt_3d_emb" # Change this to switch between training modes
+TRAINING_MODE="2d_emb" # Change this to switch between training modes
 
 # Common paths
 SAM2_CONFIG="configs/sam2.1/sam2.1_hiera_s.yaml"
