@@ -75,7 +75,7 @@ SAVE_PATH_2D_IMG="/scratch/user/s4670484/Model_save/samri2_2d_img/"
 # ============================================================================
 SAVE_PATH_GVT_EMB="/scratch/user/s4670484/Model_save/samri2_gvt_emb/"
 SAVE_PATH_GVT_3D_EMB="/scratch/user/s4670484/Model_save/samri2_gvt_3d_emb_K32/"
-GVT_NUM_TOKENS=32
+GVT_NUM_TOKENS=16
 GVT_NUM_LAYERS=2
 GVT_NUM_HEADS=4
 
