@@ -16,9 +16,9 @@ Key Features:
 1. Validate all checkpoints on 3D validation embeddings:
 python val_log.py \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-folder /scratch/user/s4670484/Model_save/samri2_stage2_emb \
+--ckpt-folder /scratch/user/s4670484/Model_save/samri2_single3d_emb_256 \
 --embedding-dir /scratch/user/s4670484/SAM2_val_embeddings/ \
---output-path /scratch/user/s4670484/validation_results/samri2_stage2_emb/ \
+--output-path /scratch/user/s4670484/validation_results/samri2_single3d_emb_256/ \
 --prompt-mode box \
 --device cuda:0 \
 --max-samples-per-dataset 100
@@ -101,14 +101,22 @@ def mask2d_to_bbox_xyxy(mask: np.ndarray) -> Optional[np.ndarray]:
     return np.array([xs.min(), ys.min(), xs.max(), ys.max()], dtype=np.float32)
 
 
+def _natural_sort_key(path: str):
+    """Sort key that orders numbers numerically: epoch_1, epoch_2, ..., epoch_10."""
+    import re
+    parts = re.split(r'(\d+)', os.path.basename(path))
+    return [int(p) if p.isdigit() else p.lower() for p in parts]
+
+
 def get_checkpoint_paths(ckpt_folder: str = None, ckpt_path: str = None) -> List[str]:
     """Get list of checkpoint paths to validate."""
     if ckpt_path:
         return [ckpt_path]
 
     if ckpt_folder:
-        ckpts = sorted(glob(os.path.join(ckpt_folder, "*.pth")))
-        ckpts += sorted(glob(os.path.join(ckpt_folder, "*.pt")))
+        ckpts = glob(os.path.join(ckpt_folder, "*.pth"))
+        ckpts += glob(os.path.join(ckpt_folder, "*.pt"))
+        ckpts.sort(key=_natural_sort_key)
         return ckpts
 
     return []
