@@ -1,18 +1,22 @@
 #!/bin/bash --login
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=500G
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=200G
 #SBATCH --job-name=SAMRI2
-#SBATCH --time=4-00:00:00
-#SBATCH --partition=gpu_rocm        # gpu_rocm      gpu_rocm    gpu_cuda
-#SBATCH --gres=gpu:mi300x:2         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2
+#SBATCH --time=3-00:00:00
+#SBATCH --partition=gpu_cuda        # gpu_rocm      gpu_rocm    gpu_cuda
+#SBATCH --gres=gpu:h100:3         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2
 #SBATCH --account=a_ai_collab
 #SBATCH --qos=gpu                   # sdf           gpu         gpu
-#SBATCH -o /home/s4670484/Documents/SAMRI2_log/slurm-samri2-%j.output
-#SBATCH -e /home/s4670484/Documents/SAMRI2_log/slurm-samri2-%j.error
+#SBATCH --constraint=epyc3
+#SBATCH -o /scratch/user/s4670484/SAMRI2_log/slurm-samri2-%j.output
+#SBATCH -e /scratch/user/s4670484/SAMRI2_log/slurm-samri2-%j.error
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=zhao.wang1@uq.edu.au
+
+# make sure log directory exists
+mkdir -p /scratch/user/s4670484/SAMRI2_log
 
 module module load anaconda3
 source $EBROOTANACONDA3/etc/profile.d/conda.sh
@@ -44,9 +48,9 @@ INITIAL_CKPT="/scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt"
 NUM_EPOCHS=100
 BATCH_SIZE=2
 LR=5e-6
-GRAD_ACCUM=2
+GRAD_ACCUM=1
 MIX_RATIO_3D=0.8        # 80% 3D samples, 20% 2D samples
-SAMPLES_PER_DATASET=100    # Volumes per dataset per epoch
+SAMPLES_PER_DATASET=100    # Voßlumes per dataset per epoch
 MAX_SLICES_PER_VIDEO=32
 SAVE_EVERY=1
 NUM_WORKERS=12
@@ -74,8 +78,8 @@ SAVE_PATH_2D_IMG="/scratch/user/s4670484/Model_save/samri2_2d_img/"
 # GVT Configuration (gvt/train_gvt_emb.py, gvt/train_gvt_emb_3dloss.py)
 # ============================================================================
 SAVE_PATH_GVT_EMB="/scratch/user/s4670484/Model_save/samri2_gvt_emb/"
-SAVE_PATH_GVT_3D_EMB="/scratch/user/s4670484/Model_save/samri2_gvt_3d_emb_K32/"
-GVT_NUM_TOKENS=32
+SAVE_PATH_GVT_3D_EMB="/scratch/user/s4670484/Model_save/samri2_gvt_3d_emb_K16/"
+GVT_NUM_TOKENS=16
 GVT_NUM_LAYERS=2
 GVT_NUM_HEADS=4
 
