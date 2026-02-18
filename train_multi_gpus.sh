@@ -6,7 +6,7 @@
 #SBATCH --job-name=SAMRI2
 #SBATCH --time=3-00:00:00
 #SBATCH --partition=gpu_cuda        # gpu_rocm      gpu_rocm    gpu_cuda
-#SBATCH --gres=gpu:h100:3         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2
+#SBATCH --gres=gpu:h100:2         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2
 #SBATCH --account=a_ai_collab
 #SBATCH --qos=gpu                   # sdf           gpu         gpu
 #SBATCH --constraint=epyc3
