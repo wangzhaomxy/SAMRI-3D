@@ -20,7 +20,7 @@ mkdir -p /scratch/user/s4670484/SAMRI2_log
 
 module module load anaconda3
 source $EBROOTANACONDA3/etc/profile.d/conda.sh
-conda activate samri-mi300  # samri samri-mi300
+conda activate samri  # samri samri-mi300
 
 # Dynamically assign port from job ID to avoid collisions
 export MASTER_ADDR=localhost
