@@ -1490,8 +1490,13 @@ def main(rank, world_size, args):
         mask_threshold=0.0,
     )
 
-    # Setup AMP scaler (use new API to avoid deprecation warning)
-    scaler = torch.amp.GradScaler(device) if args.use_amp else None
+    # Setup AMP scaler (compatible with both old and new PyTorch API)
+    if args.use_amp:
+        scaler = (torch.amp.GradScaler(device)
+                  if hasattr(torch.amp, "GradScaler")
+                  else torch.cuda.amp.GradScaler())
+    else:
+        scaler = None
 
     # Setup datasets
     if rank == 0:

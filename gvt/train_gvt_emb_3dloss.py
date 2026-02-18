@@ -457,7 +457,12 @@ def main(rank, world_size, args):
         lambda_focal=args.lambda_focal,
     )
 
-    scaler = torch.amp.GradScaler(device) if args.use_amp else None
+    if args.use_amp:
+        scaler = (torch.amp.GradScaler(device)
+                  if hasattr(torch.amp, "GradScaler")
+                  else torch.cuda.amp.GradScaler())
+    else:
+        scaler = None
 
     if rank == 0:
         print("\nLoading 3D embedding dataset...")

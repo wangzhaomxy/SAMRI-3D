@@ -1050,8 +1050,13 @@ def main(rank, world_size, args):
         lambda_focal=args.lambda_focal,
     )
 
-    # Setup AMP scaler
-    scaler = torch.amp.GradScaler(device) if args.use_amp else None
+    # Setup AMP scaler (compatible with both old and new PyTorch API)
+    if args.use_amp:
+        scaler = (torch.amp.GradScaler(device)
+                  if hasattr(torch.amp, "GradScaler")
+                  else torch.cuda.amp.GradScaler())
+    else:
+        scaler = None
 
     # Setup datasets
     if rank == 0:
