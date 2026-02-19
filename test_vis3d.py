@@ -86,6 +86,15 @@ sys.path.insert(0, str(_THIS_DIR))
 
 from sam2.build_sam import build_sam2_video_predictor
 
+# GVT support (optional — only imported when --use-gvt is passed)
+_GVT_AVAILABLE = False
+try:
+    from gvt.gvt_integration import wrap_model_with_gvt, has_gvt, load_gvt_checkpoint
+    from gvt.gvt_inference import compute_gvt_from_cached_features, clear_gvt_for_predictor
+    _GVT_AVAILABLE = True
+except ImportError:
+    pass
+
 import contextlib
 
 @contextlib.contextmanager
@@ -649,6 +658,8 @@ def predict_all_labels_reuse_state(
     if not promptable:
         return results
 
+    use_gvt = _GVT_AVAILABLE and has_gvt(predictor)
+
     with suppress_sam2_output(True):
         # --- init states once per case ---
         st1 = init_state_compat(predictor, prepared.v1_source, prepared.v1_len,
@@ -662,6 +673,10 @@ def predict_all_labels_reuse_state(
             prefill_image_features(predictor, st2)
 
         for lb in promptable:
+            # Compute GVT tokens from cached features before each propagation
+            if use_gvt:
+                compute_gvt_from_cached_features(predictor, st1)
+
             # --- video1 ---
             ok1 = add_prompt_single_label(predictor, st1, prompt_mode,
                                           gt_cut_slice, lb, ann_frame_idx=0)
@@ -674,6 +689,9 @@ def predict_all_labels_reuse_state(
             if not ok1:
                 results[lb] = None
                 continue
+
+            if use_gvt:
+                compute_gvt_from_cached_features(predictor, st2)
 
             # --- video2 ---
             ok2 = add_prompt_single_label(predictor, st2, prompt_mode,
@@ -696,6 +714,9 @@ def predict_all_labels_reuse_state(
                 v1_pred=pred1,
                 v2_pred=pred2,
             )
+
+    if use_gvt:
+        clear_gvt_for_predictor(predictor)
 
     return results
 
@@ -988,7 +1009,12 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--num-workers", type=int, default=4, help="Number of parallel workers for data loading")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--use-gvt", action="store_true", help="Enable GVT (auto-detects config from checkpoint)")
     args = parser.parse_args()
+
+    if args.use_gvt and not _GVT_AVAILABLE:
+        print("Error: --use-gvt requires the gvt package. Make sure gvt/ is in the project root.")
+        sys.exit(1)
 
     np.random.seed(args.seed)
     torch.set_grad_enabled(False)
@@ -1002,10 +1028,42 @@ def main():
     print(f"Prompt mode   : {args.prompt_mode}")
     print(f"Device        : {args.device}")
     print(f"Num workers   : {args.num_workers}")
+    print(f"GVT           : {'enabled' if args.use_gvt else 'disabled'}")
     print("======================================\n")
 
     t0 = time.time()
-    predictor = build_sam2_video_predictor(args.sam2_config, args.ckpt_path, device=args.device)
+
+    if args.use_gvt:
+        # Read GVT config from checkpoint
+        ckpt_data = torch.load(args.ckpt_path, map_location="cpu", weights_only=True)
+        gvt_cfg = ckpt_data.get("gvt_config", None)
+        if gvt_cfg is not None:
+            num_tokens = gvt_cfg["num_tokens"]
+            num_layers = gvt_cfg["num_layers"]
+            num_heads = gvt_cfg["num_heads"]
+        else:
+            sd = ckpt_data.get("model", ckpt_data)
+            q_key = "memory_attention.gvt_module.global_queries"
+            num_tokens = sd[q_key].shape[0] if q_key in sd else 16
+            layer_indices = set()
+            for k in sd:
+                if "gvt_module.cross_attn.layers." in k:
+                    layer_indices.add(int(k.split("gvt_module.cross_attn.layers.")[1].split(".")[0]))
+            num_layers = max(layer_indices) + 1 if layer_indices else 2
+            num_heads = 4
+        del ckpt_data
+
+        print(f"  GVT config: {num_tokens} tokens, {num_layers} layers, {num_heads} heads")
+        predictor = build_sam2_video_predictor(args.sam2_config, ckpt_path=None, device=args.device)
+        predictor = wrap_model_with_gvt(
+            predictor, num_tokens=num_tokens, num_layers=num_layers,
+            num_heads=num_heads, device=args.device,
+        )
+        load_gvt_checkpoint(predictor, args.ckpt_path, device=args.device)
+        gvt_params = sum(p.numel() for p in predictor.memory_attention.gvt_module.parameters())
+        print(f"  GVT module: {gvt_params:,} parameters")
+    else:
+        predictor = build_sam2_video_predictor(args.sam2_config, args.ckpt_path, device=args.device)
 
     save_test_record_3d_single_object(
         dataset_paths=args.dataset_path,

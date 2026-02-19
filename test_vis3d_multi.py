@@ -54,10 +54,11 @@ Features:
 Examples:    
 python test_vis3d_multi.py \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-path /scratch/user/s4670484/Model_save/samri2_stage2_emb/sam2_emb3d_epoch_47.pth \
+--ckpt-path /scratch/user/s4670484/Model_save/samri2_gvt_3d_emb_K16/sam2_gvt3dloss_epoch_33.pth \
 --dataset-path /scratch/user/s4670484/Datasets/SAMRI_datasets_3D/ /scratch/user/s4670484/Datasets/Zeroshot3D/ \
---save-path /scratch/user/s4670484/Eval_results/SAMRI2/sam2_emb3d_2dloss_epoch_47.pkl \
---num-workers 12
+--save-path /scratch/user/s4670484/Eval_results/SAMRI2/sam2_gvt3dlossK16_epoch_33.pkl \
+--num-workers 12 \
+--use-gvt
 """
 
 from __future__ import annotations
@@ -92,6 +93,15 @@ _THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_THIS_DIR))
 
 from sam2.build_sam import build_sam2_video_predictor
+
+# GVT support (optional — only imported when --use-gvt is passed)
+_GVT_AVAILABLE = False
+try:
+    from gvt.gvt_integration import wrap_model_with_gvt, has_gvt, load_gvt_checkpoint
+    from gvt.gvt_inference import precompute_gvt_for_state, clear_gvt_for_predictor
+    _GVT_AVAILABLE = True
+except ImportError:
+    pass
 
 import contextlib
 
@@ -316,7 +326,7 @@ def write_video_frames_to_dir(vol_shw: np.ndarray, slice_indices: List[int], out
     os.makedirs(out_dir, exist_ok=True)
     for i, z in enumerate(slice_indices):
         s2d = normalize_to_uint8(vol_shw[z])
-        rgb = np.stack([s2d, s2d, rgb := s2d], axis=-1)  # small trick to avoid extra var
+        rgb = np.stack([s2d, s2d, s2d], axis=-1)
         Image.fromarray(rgb).save(os.path.join(out_dir, f"{i:05d}.jpg"), quality=95)
     return out_dir
 
@@ -590,20 +600,34 @@ def predict_multi_object_semantic(
     Multi-object inference once per video; returns:
       pred0_semantic: [S,H,W] int32 (axis-0 orientation)
       added_labels: labels that were actually prompted (present in cut slice)
+
+    If the predictor has GVT enabled, GVT tokens are pre-computed after
+    init_state and injected into memory attention during propagation.
     """
+    use_gvt = _GVT_AVAILABLE and has_gvt(predictor)
+
     # video1
     with suppress_sam2_output(True):
         st1 = init_state_compat(predictor, prepared.v1_source, prepared.v1_len, prefer_streaming=prepared.use_streaming)
+        if use_gvt:
+            precompute_gvt_for_state(predictor, st1)
         added = add_prompts_for_all_labels(predictor, st1, prompt_mode, gt_cut_slice, labels, ann_frame_idx=0)
         if not added:
+            if use_gvt:
+                clear_gvt_for_predictor(predictor)
             return None, []
         pred1 = propagate_video_multiobj(predictor, st1)
 
     # video2
     with suppress_sam2_output(True):
         st2 = init_state_compat(predictor, prepared.v2_source, prepared.v2_len, prefer_streaming=prepared.use_streaming)
+        if use_gvt:
+            precompute_gvt_for_state(predictor, st2)
         _ = add_prompts_for_all_labels(predictor, st2, prompt_mode, gt_cut_slice, added, ann_frame_idx=0)
         pred2 = propagate_video_multiobj(predictor, st2)
+
+    if use_gvt:
+        clear_gvt_for_predictor(predictor)
 
     N = len(prepared.v1_slices) + (len(prepared.v2_slices) - 1)
     H, W = gt_cut_slice.shape
@@ -904,7 +928,12 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--num-workers", type=int, default=4, help="Number of parallel workers for data loading")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--use-gvt", action="store_true", help="Enable GVT (auto-detects config from checkpoint)")
     args = parser.parse_args()
+
+    if args.use_gvt and not _GVT_AVAILABLE:
+        print("Error: --use-gvt requires the gvt package. Make sure gvt/ is in the project root.")
+        sys.exit(1)
 
     np.random.seed(args.seed)
     torch.set_grad_enabled(False)
@@ -918,10 +947,47 @@ def main():
     print(f"Prompt mode   : {args.prompt_mode}")
     print(f"Device        : {args.device}")
     print(f"Num workers   : {args.num_workers}")
+    print(f"GVT           : {'enabled' if args.use_gvt else 'disabled'}")
     print("======================================\n")
 
     t0 = time.time()
-    predictor = build_sam2_video_predictor(args.sam2_config, args.ckpt_path, device=args.device)
+
+    if args.use_gvt:
+        # Read GVT config from checkpoint
+        ckpt_data = torch.load(args.ckpt_path, map_location="cpu", weights_only=True)
+        gvt_cfg = ckpt_data.get("gvt_config", None)
+        if gvt_cfg is not None:
+            num_tokens = gvt_cfg["num_tokens"]
+            num_layers = gvt_cfg["num_layers"]
+            num_heads = gvt_cfg["num_heads"]
+        else:
+            # Fallback: infer from state dict keys
+            sd = ckpt_data.get("model", ckpt_data)
+            q_key = "memory_attention.gvt_module.global_queries"
+            if q_key in sd:
+                num_tokens = sd[q_key].shape[0]
+            else:
+                num_tokens = 16
+            layer_indices = set()
+            for k in sd:
+                if "gvt_module.cross_attn.layers." in k:
+                    parts = k.split("gvt_module.cross_attn.layers.")[1]
+                    layer_indices.add(int(parts.split(".")[0]))
+            num_layers = max(layer_indices) + 1 if layer_indices else 2
+            num_heads = 4  # not recoverable from weights alone
+        del ckpt_data
+
+        print(f"  GVT config: {num_tokens} tokens, {num_layers} layers, {num_heads} heads")
+        predictor = build_sam2_video_predictor(args.sam2_config, ckpt_path=None, device=args.device)
+        predictor = wrap_model_with_gvt(
+            predictor, num_tokens=num_tokens, num_layers=num_layers,
+            num_heads=num_heads, device=args.device,
+        )
+        load_gvt_checkpoint(predictor, args.ckpt_path, device=args.device)
+        gvt_params = sum(p.numel() for p in predictor.memory_attention.gvt_module.parameters())
+        print(f"  GVT module: {gvt_params:,} parameters")
+    else:
+        predictor = build_sam2_video_predictor(args.sam2_config, args.ckpt_path, device=args.device)
 
     save_test_record_3d_multi_object(
         dataset_paths=args.dataset_path,
