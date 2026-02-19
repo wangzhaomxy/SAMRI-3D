@@ -1,14 +1,14 @@
 #!/bin/bash --login
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=96
-#SBATCH --mem=500G
+#SBATCH --cpus-per-task=48
+#SBATCH --mem=300G
 #SBATCH --job-name=SAMRI2
 #SBATCH --time=3-00:00:00
 #SBATCH --partition=gpu_rocm        # gpu_rocm      gpu_rocm    gpu_cuda
-#SBATCH --gres=gpu:mi300x:8         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2
+#SBATCH --gres=gpu:mi300x:3         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2
 #SBATCH --account=a_ai_collab
-#SBATCH --qos=sdf                   # sdf           gpu         gpu
+#SBATCH --qos=gpu                   # sdf           gpu         gpu
 ### #SBATCH --constraint=epyc3
 #SBATCH -o /scratch/user/s4670484/SAMRI2_log/slurm-samri2-%j.output
 #SBATCH -e /scratch/user/s4670484/SAMRI2_log/slurm-samri2-%j.error
@@ -45,7 +45,7 @@ INITIAL_CKPT="/scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt"
 # ============================================================================
 # Common Hyperparameters (shared across modes)
 # ============================================================================
-NUM_EPOCHS=100
+NUM_EPOCHS=50
 BATCH_SIZE=2
 LR=5e-6
 GRAD_ACCUM=1
