@@ -9,7 +9,7 @@
 #SBATCH --gres=gpu:mi300x:8         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2
 #SBATCH --account=a_ai_collab
 #SBATCH --qos=sdf                   # sdf           gpu         gpu
-# #SBATCH --constraint=epyc3
+### #SBATCH --constraint=epyc3
 #SBATCH -o /scratch/user/s4670484/SAMRI2_log/slurm-samri2-%j.output
 #SBATCH -e /scratch/user/s4670484/SAMRI2_log/slurm-samri2-%j.error
 #SBATCH --mail-type=ALL
@@ -20,7 +20,7 @@ mkdir -p /scratch/user/s4670484/SAMRI2_log
 
 module load anaconda3
 source $EBROOTANACONDA3/etc/profile.d/conda.sh
-conda activate samri  # samri samri-mi300
+conda activate samri-mi300  # samri samri-mi300
 
 # Dynamically assign port from job ID to avoid collisions
 export MASTER_ADDR=localhost
