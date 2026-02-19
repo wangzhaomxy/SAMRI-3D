@@ -50,6 +50,10 @@ class GVTModule(nn.Module):
         # Project spatial-pooled slice embeddings from input_dim to output_dim
         self.input_proj = nn.Linear(input_dim, output_dim)
 
+        # LayerNorm for KV (projected slice tokens) and Q (global queries)
+        self.input_norm = nn.LayerNorm(output_dim)
+        self.query_norm = nn.LayerNorm(output_dim)
+
         # Sinusoidal slice position embedding (not learnable, like standard PE)
         self.register_buffer(
             "slice_pos_enc",
@@ -100,11 +104,12 @@ class GVTModule(nn.Module):
         # Project to mem_dim: (N, 256) -> (N, 64)
         projected = self.input_proj(pooled)
 
-        # Add slice positional encoding: (N, 64)
+        # Add slice positional encoding and normalize: (N, 64)
         projected = projected + self.slice_pos_enc[:N].to(projected.device)
+        projected = self.input_norm(projected)
 
         # Perceiver cross-attention: queries (1, K, 64) attend to KV (1, N, 64)
-        queries = self.global_queries.unsqueeze(0)  # (1, K, 64)
+        queries = self.query_norm(self.global_queries).unsqueeze(0)  # (1, K, 64)
         kv = projected.unsqueeze(0)  # (1, N, 64)
         gvt_out = self.cross_attn(queries, kv)  # (1, K, 64)
 

@@ -1,15 +1,15 @@
 #!/bin/bash --login
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=200G
+#SBATCH --cpus-per-task=96
+#SBATCH --mem=500G
 #SBATCH --job-name=SAMRI2
 #SBATCH --time=3-00:00:00
-#SBATCH --partition=gpu_cuda        # gpu_rocm      gpu_rocm    gpu_cuda
-#SBATCH --gres=gpu:h100:2         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2
+#SBATCH --partition=gpu_rocm        # gpu_rocm      gpu_rocm    gpu_cuda
+#SBATCH --gres=gpu:mi300x:8         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2
 #SBATCH --account=a_ai_collab
-#SBATCH --qos=gpu                   # sdf           gpu         gpu
-#SBATCH --constraint=epyc3
+#SBATCH --qos=sdf                   # sdf           gpu         gpu
+# #SBATCH --constraint=epyc3
 #SBATCH -o /scratch/user/s4670484/SAMRI2_log/slurm-samri2-%j.output
 #SBATCH -e /scratch/user/s4670484/SAMRI2_log/slurm-samri2-%j.error
 #SBATCH --mail-type=ALL
@@ -78,7 +78,7 @@ SAVE_PATH_2D_IMG="/scratch/user/s4670484/Model_save/samri2_2d_img/"
 # GVT Configuration (gvt/train_gvt_emb.py, gvt/train_gvt_emb_3dloss.py)
 # ============================================================================
 SAVE_PATH_GVT_EMB="/scratch/user/s4670484/Model_save/samri2_gvt_emb/"
-SAVE_PATH_GVT_3D_EMB="/scratch/user/s4670484/Model_save/samri2_gvt_3d_emb_K16/"
+SAVE_PATH_GVT_3D_EMB="/scratch/user/s4670484/Model_save/samri2_gvt_3d_emb_K16_norm/"
 GVT_NUM_TOKENS=16
 GVT_NUM_LAYERS=2
 GVT_NUM_HEADS=4
