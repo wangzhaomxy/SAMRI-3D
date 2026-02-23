@@ -64,9 +64,9 @@ SAVE_PATH_2D_EMB="/scratch/user/s4670484/Model_save/samri2_2dloss_all3d_emb/"
 # ============================================================================
 # 3D Loss Embedding Mode Configuration (train_unified_emb_3dloss.py)
 # ============================================================================
-SAVE_PATH_3D_EMB="/scratch/user/s4670484/Model_save/samri2_5x_3d_emb_256/"
+SAVE_PATH_3D_EMB="/scratch/user/s4670484/Model_save/samri2_10x_3d_emb_256/"
 LAMBDA_2D=1.0              # Weight for 2D slice loss
-LAMBDA_3D=5.0              # Weight for 3D volume loss
+LAMBDA_3D=10.0              # Weight for 3D volume loss
 
 # ============================================================================
 # 2D Loss Image Mode Configuration (train_unified.py)
