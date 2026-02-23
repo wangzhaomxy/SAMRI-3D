@@ -36,7 +36,7 @@ export MASTER_PORT=$((26000 + RANDOM % 1000))  # Pick a port between 26000 ~ 269
 #   "2d_img"      - 2D loss from raw images (train_unified.py)
 #   "gvt_emb"     - 2D loss + GVT from embeddings (gvt/train_gvt_emb.py)
 #   "gvt_3d_emb"  - 2D + 3D loss + GVT from embeddings (gvt/train_gvt_emb_3dloss.py)
-TRAINING_MODE="gvt_3d_emb" # Change this to switch between training modes
+TRAINING_MODE="3d_emb" # Change this to switch between training modes
 
 # Common paths
 SAM2_CONFIG="configs/sam2.1/sam2.1_hiera_s.yaml"
@@ -64,9 +64,9 @@ SAVE_PATH_2D_EMB="/scratch/user/s4670484/Model_save/samri2_2dloss_all3d_emb/"
 # ============================================================================
 # 3D Loss Embedding Mode Configuration (train_unified_emb_3dloss.py)
 # ============================================================================
-SAVE_PATH_3D_EMB="/scratch/user/s4670484/Model_save/samri2_3d_emb_256/"
+SAVE_PATH_3D_EMB="/scratch/user/s4670484/Model_save/samri2_2x_3d_emb_256/"
 LAMBDA_2D=1.0              # Weight for 2D slice loss
-LAMBDA_3D=5.0              # Weight for 3D volume loss
+LAMBDA_3D=2.0              # Weight for 3D volume loss
 
 # ============================================================================
 # 2D Loss Image Mode Configuration (train_unified.py)
