@@ -672,7 +672,8 @@ def predict_multi_object_semantic(
     pred0 = np.zeros((N, H, W), dtype=np.int32)
     for lb in added:
         logit_vol = logit_vols[lb]           # (N, H, W)
-        prob_vol = 1.0 / (1.0 + np.exp(-logit_vol))  # sigmoid
+        from scipy.special import expit
+        prob_vol = expit(logit_vol.astype(np.float64)).astype(np.float32)  # stable sigmoid
 
         refined = apply_3d_crf(
             img_float, prob_vol,
