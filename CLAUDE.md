@@ -34,6 +34,24 @@ python test_vis3d_multi.py \
   --prompt-mode box \
   --num-workers 8
 
+# 3D evaluation with Dense CRF post-processing
+python test_vis3d_crf.py \
+  --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+  --ckpt-path /path/to/checkpoint.pt \
+  --dataset-path /path/to/test_data/ /path/to/zeroshot_results/ \
+  --save-path /path/to/results_crf.pkl \
+  --num-workers 8 \
+  --use-crf
+
+# 3D evaluation with two-pass auto-context refinement (topk/allconf/revstyle)
+python test_vis3d_twopass.py \
+  --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
+  --ckpt-path /path/to/checkpoint.pt \
+  --dataset-path /path/to/test_data/ /path/to/zeroshot_results/ \
+  --save-path /path/to/results_topk5.pkl \
+  --num-workers 8 \
+  --two-pass topk --two-pass-k 5
+
 # 2D slice evaluation
 python test_vis2d.py \
   --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
@@ -142,6 +160,8 @@ sbatch train_multi_gpus.sh
 - `3d_inference.py` - Batch 3D inference without evaluation
 - `test_vis3d.py` - 3D evaluation (single object per run, iterative)
 - `test_vis3d_multi.py` - 3D evaluation (all objects simultaneously, higher accuracy)
+- `test_vis3d_crf.py` - 3D evaluation with Dense CRF post-processing (experimental)
+- `test_vis3d_twopass.py` - 3D evaluation with two-pass auto-context refinement (experimental)
 - `test_vis2d.py` - 2D slice evaluation
 - `gen_training_list.py` - Generate training lists with dice scores for filtered training
 - `generate_sam2_embeddings.py` - Pre-compute SAM2 image embeddings for 2D training
@@ -242,6 +262,90 @@ Image encoding cost: **N** forward_image calls total (not N*K).
 
 > **Do not** skip `prefill` when K > 1.  Without it every label re-encodes
 > all frames because the 1-entry cache is destroyed during propagation.
+
+### Dense CRF Post-Processing (test_vis3d_crf.py)
+
+`test_vis3d_crf.py` extends `test_vis3d_multi.py` by applying optional Dense CRF
+refinement to SAM2's soft probability outputs **after** propagation, **before**
+thresholding into the final binary mask.
+
+**CRF backend priority (auto-detected at runtime):**
+1. **SimpleCRF** (`pip install SimpleCRF`) — true 3D CRF, processes the full volume
+2. **pydensecrf** (`pip install pydensecrf`) — 2D slice-by-slice fallback
+3. **Sigmoid threshold** — if neither library is available
+
+**New CLI flags:**
+- `--use-crf` — enable CRF post-processing (default: off)
+- `--crf-sigma-spatial` — spatial Gaussian kernel width (default: 5.0)
+- `--crf-sigma-intensity` — bilateral intensity kernel width (default: 0.1)
+- `--crf-sigma-smooth` — smoothness kernel width (default: 1.0)
+- `--crf-w-bilateral` — bilateral energy weight (default: 5.0)
+- `--crf-w-smooth` — smoothness energy weight (default: 3.0)
+- `--crf-iterations` — CRF mean-field iterations (default: 5)
+
+**Sigmoid overflow (IMPORTANT):**
+SAM2's raw logits can have very large magnitude. Using `1.0 / (1.0 + np.exp(-logit))`
+on `float32` arrays overflows at ±88 and produces `RuntimeWarning`. The fix used
+throughout this script is `scipy.special.expit`, which is numerically stable:
+
+```python
+from scipy.special import expit
+prob_vol = expit(logit_vol.astype(np.float64)).astype(np.float32)
+```
+
+The overflow itself is benign (results in 0.0 or 1.0, which are mathematically correct)
+but the warning pollutes logs and indicates float32 precision loss.
+
+### Two-Pass Auto-Context Refinement (test_vis3d_twopass.py)
+
+`test_vis3d_twopass.py` extends `test_vis3d_multi.py` with a second propagation pass
+that uses Pass 1's high-confidence predictions as additional prompted frames.
+
+**Two-pass variants (`--two-pass`):**
+- `none` — baseline, identical to `test_vis3d_multi.py`
+- `topk` — re-prompt Pass 2 with the K frames of highest `object_score_logits`
+- `allconf` — re-prompt Pass 2 with all frames where sigmoid(score) ≥ threshold
+- `revstyle` — add high-quality anchor frames that bookend low-quality regions
+
+**New CLI flags:**
+- `--two-pass {none|topk|allconf|revstyle}` (default: none)
+- `--two-pass-k` — K for topk mode (default: 5)
+- `--two-pass-conf-threshold` — confidence threshold for allconf/revstyle (default: 0.7)
+
+**Feature-reuse pattern (critical for inference speed):**
+
+Naively, two-pass doubles the image encoder cost (2N forward_image calls vs N for
+single-pass). The implementation avoids this by:
+
+1. **Prefill `cached_features` before Pass 1** — `_prefill_features(predictor, state)`
+   runs `forward_image` on every frame and writes all results into
+   `state["cached_features"]` as a full dict. During propagation, `_get_image_feature`
+   finds every frame in the dict (cache hit) and never replaces it.
+
+2. **`reset_state` preserves `cached_features`** — After Pass 1, `predictor.reset_state(state)`
+   clears all object/tracking state but does **not** touch `cached_features`. Pass 2
+   can re-prompt and re-propagate with zero additional encoder calls.
+
+3. **Sequential per-video processing** — v1 is fully processed (P1 → P2) before v2,
+   so only one video's feature cache is in GPU memory at a time:
+
+```
+init_state(v1) → prefill(v1) → prompt → Pass1-propagate
+   → reset_state(v1) → re-prompt → Pass2-propagate → del(v1)
+init_state(v2) → prefill(v2) → prompt → Pass1-propagate
+   → reset_state(v2) → re-prompt → Pass2-propagate → del(v2)
+```
+
+**Encoding cost: N calls total** (same as single-pass baseline).
+**Memory: one video's feature cache at a time** (same peak as baseline).
+
+**`object_score_logits` as quality proxy:**
+The per-frame confidence used for frame selection is `object_score_logits`, a `(1,1)`
+scalar stored in `state["output_dict_per_obj"][obj_idx]["cond_frame_outputs"|"non_cond_frame_outputs"][frame_idx]`.
+Higher values indicate the model is more confident the object is present and
+well-segmented in that frame. `select_allconf_frames` and `select_revstyle_frames`
+apply sigmoid to convert to a [0,1] confidence using `scipy.special.expit` to avoid
+overflow warnings.
 
 ## Reference Materials (backup/)
 

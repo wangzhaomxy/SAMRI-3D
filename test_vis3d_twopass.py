@@ -508,12 +508,13 @@ def select_allconf_frames(
     exclude_frames: Optional[set] = None,
 ) -> List[int]:
     """Return all frames with sigmoid(score) >= threshold, excluding specified frames."""
+    from scipy.special import expit
     excl = exclude_frames or {0}
     selected = []
     for fi, sc in frame_scores.items():
         if fi in excl:
             continue
-        conf = 1.0 / (1.0 + np.exp(-sc))  # sigmoid
+        conf = float(expit(sc))  # numerically stable sigmoid; avoids overflow warnings
         if conf >= threshold:
             selected.append(fi)
     return selected
@@ -536,8 +537,9 @@ def select_revstyle_frames(
     if not all_frames:
         return []
 
-    # Compute per-frame sigmoid confidence
-    conf = {fi: 1.0 / (1.0 + np.exp(-frame_scores[fi])) for fi in all_frames}
+    # Compute per-frame sigmoid confidence (expit = numerically stable sigmoid)
+    from scipy.special import expit
+    conf = {fi: float(expit(frame_scores[fi])) for fi in all_frames}
 
     # Partition into high/low quality
     high_q = {fi for fi in all_frames if conf[fi] >= threshold and fi not in excl}
