@@ -398,6 +398,45 @@ def propagate_video_multiobj(predictor, inference_state) -> Dict[int, Dict[int, 
     return out
 
 
+@torch.no_grad()
+def _prefill_features(predictor, inference_state: dict) -> None:
+    """Pre-populate cached_features for every frame so features survive reset_state.
+
+    Without prefill, SAM2's _get_image_feature uses a 1-entry dict cache that gets
+    replaced on every cache miss.  After propagation only the last frame's features
+    remain, so a subsequent reset_state + re-propagation would re-encode all frames.
+
+    With prefill, the full dict {frame_idx: (image, backbone_out)} is written before
+    propagation begins.  _get_image_feature finds every frame there (cache hit) and
+    never replaces the dict, so features survive intact through reset_state.
+    """
+    images = inference_state["images"]
+    device = inference_state["device"]
+    cache: Dict[int, Any] = {}
+    for i in range(len(images)):
+        image = images[i].to(device).float().unsqueeze(0)
+        backbone_out = predictor.forward_image(image)
+        cache[i] = (image, backbone_out)
+    inference_state["cached_features"] = cache
+
+
+def _select_extra_frames(
+    mode: str,
+    frame_scores: Dict[int, float],
+    k: int,
+    threshold: float,
+    excl: set,
+) -> List[int]:
+    """Dispatch to the appropriate frame-selection strategy."""
+    if mode == "topk":
+        return select_topk_frames(frame_scores, k, excl)
+    elif mode == "allconf":
+        return select_allconf_frames(frame_scores, threshold, excl)
+    elif mode == "revstyle":
+        return select_revstyle_frames(frame_scores, threshold, excl)
+    return []
+
+
 def merge_two_videos_to_semantic_volume(N, H, W, v1_slices, v2_slices, v1_pred, v2_pred, labels):
     pred = np.zeros((N, H, W), dtype=np.int32)
     written = set()
@@ -591,88 +630,78 @@ def predict_multi_object_semantic(
         "revstyle" - re-prompt Pass 2 with anchors bookending low-quality regions
     """
     do_two_pass = two_pass_mode in ("topk", "allconf", "revstyle")
+    excl_frame0 = {0}  # frame 0 is always the original prompt; never re-prompt it
 
-    # ---- PASS 1 ----
+    # ---- VIDEO 1: Pass 1 then (optionally) Pass 2 in the same state ----
+    # Prefill caches all frame features before Pass 1 so they survive reset_state,
+    # allowing Pass 2 to reuse them without re-running the image encoder.
     with suppress_sam2_output(True):
         st1 = init_state_compat(predictor, prepared.v1_source, prepared.v1_len,
                                 prefer_streaming=prepared.use_streaming)
+        # Prefill before adding prompts: prompt processing also calls _get_image_feature
+        # on frame 0, so prefilling first avoids encoding frame 0 twice.
+        if do_two_pass:
+            _prefill_features(predictor, st1)
         added = add_prompts_for_all_labels(predictor, st1, prompt_mode, gt_cut_slice, labels, ann_frame_idx=0)
         if not added:
             return None, []
         p1_v1 = propagate_video_multiobj(predictor, st1)
-        # Extract per-object confidence scores from state before cleanup
-        scores_v1 = extract_frame_scores(st1, added) if do_two_pass else {}
 
-    with suppress_sam2_output(True):
-        st2 = init_state_compat(predictor, prepared.v2_source, prepared.v2_len,
-                                prefer_streaming=prepared.use_streaming)
-        _ = add_prompts_for_all_labels(predictor, st2, prompt_mode, gt_cut_slice, added, ann_frame_idx=0)
-        p1_v2 = propagate_video_multiobj(predictor, st2)
-        scores_v2 = extract_frame_scores(st2, added) if do_two_pass else {}
+    if do_two_pass:
+        scores_v1 = extract_frame_scores(st1, added)
+        extra_v1: Dict[int, List[int]] = {
+            int(oid): _select_extra_frames(
+                two_pass_mode, scores_v1.get(int(oid), {}),
+                two_pass_k, two_pass_conf_threshold, excl_frame0,
+            )
+            for oid in added
+        }
+        with suppress_sam2_output(True):
+            predictor.reset_state(st1)          # clears objects; keeps cached_features
+            _ = add_prompts_for_all_labels(predictor, st1, prompt_mode, gt_cut_slice, added, ann_frame_idx=0)
+            add_pass2_mask_prompts(predictor, st1, added, p1_v1, extra_v1)
+            final_v1 = propagate_video_multiobj(predictor, st1)
+    else:
+        final_v1 = p1_v1
 
-    # ---- SINGLE PASS: return now ----
-    if not do_two_pass:
-        N = len(prepared.v1_slices) + (len(prepared.v2_slices) - 1)
-        H, W = gt_cut_slice.shape
-        pred0 = merge_two_videos_to_semantic_volume(
-            N=N, H=H, W=W,
-            v1_slices=prepared.v1_slices, v2_slices=prepared.v2_slices,
-            v1_pred=p1_v1, v2_pred=p1_v2, labels=added,
-        )
-        return pred0, added
-
-    # ---- TWO-PASS: select extra frames for video1 and video2 ----
-    excl_frame0 = {0}   # frame 0 is the original prompt frame; exclude from re-prompting
-
-    # Compute extra frame indices per object for each video
-    extra_v1: Dict[int, List[int]] = {}  # obj_id -> [frame_idx_in_v1, ...]
-    extra_v2: Dict[int, List[int]] = {}  # obj_id -> [frame_idx_in_v2, ...]
-
-    for obj_id in added:
-        oid = int(obj_id)
-        fs_v1 = scores_v1.get(oid, {})
-        fs_v2 = scores_v2.get(oid, {})
-
-        if two_pass_mode == "topk":
-            extra_v1[oid] = select_topk_frames(fs_v1, two_pass_k, excl_frame0)
-            extra_v2[oid] = select_topk_frames(fs_v2, two_pass_k, excl_frame0)
-
-        elif two_pass_mode == "allconf":
-            extra_v1[oid] = select_allconf_frames(fs_v1, two_pass_conf_threshold, excl_frame0)
-            extra_v2[oid] = select_allconf_frames(fs_v2, two_pass_conf_threshold, excl_frame0)
-
-        elif two_pass_mode == "revstyle":
-            extra_v1[oid] = select_revstyle_frames(fs_v1, two_pass_conf_threshold, excl_frame0)
-            extra_v2[oid] = select_revstyle_frames(fs_v2, two_pass_conf_threshold, excl_frame0)
-
-    # Free GPU memory between passes: delete Pass 1 states before allocating Pass 2
-    del st1, st2
+    del st1
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # ---- PASS 2 ----
+    # ---- VIDEO 2: Pass 1 then (optionally) Pass 2 in the same state ----
     with suppress_sam2_output(True):
-        st1_p2 = init_state_compat(predictor, prepared.v1_source, prepared.v1_len,
-                                   prefer_streaming=prepared.use_streaming)
-        # Original prompt at frame 0
-        _ = add_prompts_for_all_labels(predictor, st1_p2, prompt_mode, gt_cut_slice, added, ann_frame_idx=0)
-        # Additional mask prompts from Pass 1
-        add_pass2_mask_prompts(predictor, st1_p2, added, p1_v1, extra_v1)
-        p2_v1 = propagate_video_multiobj(predictor, st1_p2)
+        st2 = init_state_compat(predictor, prepared.v2_source, prepared.v2_len,
+                                prefer_streaming=prepared.use_streaming)
+        if do_two_pass:
+            _prefill_features(predictor, st2)
+        _ = add_prompts_for_all_labels(predictor, st2, prompt_mode, gt_cut_slice, added, ann_frame_idx=0)
+        p1_v2 = propagate_video_multiobj(predictor, st2)
 
-    with suppress_sam2_output(True):
-        st2_p2 = init_state_compat(predictor, prepared.v2_source, prepared.v2_len,
-                                   prefer_streaming=prepared.use_streaming)
-        _ = add_prompts_for_all_labels(predictor, st2_p2, prompt_mode, gt_cut_slice, added, ann_frame_idx=0)
-        add_pass2_mask_prompts(predictor, st2_p2, added, p1_v2, extra_v2)
-        p2_v2 = propagate_video_multiobj(predictor, st2_p2)
+    if do_two_pass:
+        scores_v2 = extract_frame_scores(st2, added)
+        extra_v2: Dict[int, List[int]] = {
+            int(oid): _select_extra_frames(
+                two_pass_mode, scores_v2.get(int(oid), {}),
+                two_pass_k, two_pass_conf_threshold, excl_frame0,
+            )
+            for oid in added
+        }
+        with suppress_sam2_output(True):
+            predictor.reset_state(st2)          # clears objects; keeps cached_features
+            _ = add_prompts_for_all_labels(predictor, st2, prompt_mode, gt_cut_slice, added, ann_frame_idx=0)
+            add_pass2_mask_prompts(predictor, st2, added, p1_v2, extra_v2)
+            final_v2 = propagate_video_multiobj(predictor, st2)
+    else:
+        final_v2 = p1_v2
+
+    del st2
 
     N = len(prepared.v1_slices) + (len(prepared.v2_slices) - 1)
     H, W = gt_cut_slice.shape
     pred0 = merge_two_videos_to_semantic_volume(
         N=N, H=H, W=W,
         v1_slices=prepared.v1_slices, v2_slices=prepared.v2_slices,
-        v1_pred=p2_v1, v2_pred=p2_v2, labels=added,
+        v1_pred=final_v1, v2_pred=final_v2, labels=added,
     )
     return pred0, added
 
