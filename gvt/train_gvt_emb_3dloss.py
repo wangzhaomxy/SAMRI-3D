@@ -44,7 +44,8 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_THIS_DIR))
 
 from sam2.build_sam import build_sam2
-from utils.losses import DiceFocalLoss
+from utils.losses import DiceFocalLoss, gvt_recon_loss
+from gvt.gvt_module import GVTReconDecoder
 from gvt.gvt_integration import (
     wrap_model_with_gvt,
     compute_gvt_tokens,
@@ -67,6 +68,56 @@ from train_unified_emb_3dloss import (
     train_2d_sample_from_embedding,
     process_video_with_memory_3dloss,
 )
+
+
+def get_lambda_aux(epoch: int, args) -> float:
+    """Return λ_aux for the current epoch (supports optional warmup schedule)."""
+    if getattr(args, "lambda_aux_warmup", 0) > 0 and epoch < getattr(args, "lambda_aux_warmup_epochs", 10):
+        return args.lambda_aux_warmup
+    return args.lambda_aux
+
+
+def _build_gt_volume_binary(masks, labels, N_total: int, ori_h: int, ori_w: int, device) -> torch.Tensor:
+    """
+    Build a binary foreground GT volume (N, 1, H, W) as the union of all labels.
+    Used as the reconstruction target for GVT v2.
+
+    Args:
+        masks:   numpy (N, H, W) int32 array of label IDs (from Embedding3DDataset).
+                 Slices with no foreground have all-zero masks — handled correctly.
+        labels:  list of integer label IDs to include as foreground.
+                 Empty list → all-zero GT (valid degenerate case).
+        N_total: total number of slices (must equal masks.shape[0]).
+        ori_h, ori_w: original spatial resolution (used only as fallback).
+        device:  target device for the returned tensor.
+
+    Returns:
+        gt_vol: (N, 1, H, W) float32 binary tensor on ``device``.
+    """
+    gt_vol_list = []
+    for idx in range(N_total):
+        m = masks[idx]  # (H, W) numpy int32 for standard Embedding3DDataset
+
+        # Convert to integer torch tensor for exact label comparison (no float rounding)
+        if isinstance(m, np.ndarray):
+            m_t = torch.from_numpy(m.astype(np.int32))
+        elif isinstance(m, torch.Tensor):
+            m_t = m.int()
+        else:
+            # Fallback: slice missing or unexpected type → treat as empty
+            gt_vol_list.append(torch.zeros(1, ori_h, ori_w))
+            continue
+
+        # Binary union: 1 wherever ANY of the selected labels appears
+        any_fg = torch.zeros(m_t.shape, dtype=torch.float32)
+        for lbl in labels:
+            any_fg = any_fg + (m_t == int(lbl)).float()
+        # Clamp in case the same pixel matches multiple labels
+        any_fg = any_fg.clamp(max=1.0).unsqueeze(0)  # (H, W) → (1, H, W)
+
+        gt_vol_list.append(any_fg)
+
+    return torch.stack(gt_vol_list, dim=0).to(device)  # (N, 1, H, W)
 
 
 def get_latest_checkpoint(save_path: str, initial_ckpt: str) -> Tuple[str, int]:
@@ -103,9 +154,15 @@ def train_3d_sample_from_embedding_gvt(
     loss_fn,
     args,
     device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    recon_decoder=None,
+    epoch: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Train on a 3D volume with GVT and combined 2D + 3D volumetric loss.
+
+    Returns:
+        (total_loss, avg_vol_loss, recon_loss_scalar)
+        recon_loss_scalar is zero when --gvt-recon is not set.
     """
     image_embeds = sample["image_embeds"]
     high_res_feat_0s = sample["high_res_feat_0s"]
@@ -122,6 +179,19 @@ def train_3d_sample_from_embedding_gvt(
     # Compute GVT tokens from all slice embeddings
     if has_gvt(base_model):
         compute_gvt_tokens(base_model, image_embeds, device, use_amp=args.use_amp)
+
+    # GVT v2: compute reconstruction loss once per volume using the cached tokens
+    recon_loss_scalar = torch.tensor(0.0, device=device)
+    recon_loss_val = None  # defined only when recon_decoder is active
+    if recon_decoder is not None and has_gvt(base_model):
+        wrapper = base_model.memory_attention
+        gvt_tokens_tensor, _ = wrapper.gvt_tokens_cache   # (K, 1, 64)
+        N_total = image_embeds.shape[0] if hasattr(image_embeds, "shape") else len(image_embeds)
+        gt_vol = _build_gt_volume_binary(masks, labels, N_total, ori_h, ori_w, device)
+        with torch.amp.autocast("cuda", enabled=args.use_amp):
+            recon_logits = recon_decoder(gvt_tokens_tensor, num_slices=N_total)
+            recon_loss_val = gvt_recon_loss(recon_logits, gt_vol, recon_res=args.gvt_recon_res)
+        recon_loss_scalar = recon_loss_val.detach()
 
     # Subsample video slices if too long
     max_slices = getattr(args, 'max_slices_per_video', 32)
@@ -168,7 +238,7 @@ def train_3d_sample_from_embedding_gvt(
             )
             if n1 > 0 and loss1.requires_grad:
                 all_losses.append(loss1)
-                all_vol_losses.append(vol_loss1)
+                all_vol_losses.append(vol_loss1.detach())
                 total_slices += n1
 
         if len(v2_slices_train) > 1:
@@ -191,8 +261,13 @@ def train_3d_sample_from_embedding_gvt(
             )
             if n2 > 0 and loss2.requires_grad:
                 all_losses.append(loss2)
-                all_vol_losses.append(vol_loss2)
+                all_vol_losses.append(vol_loss2.detach())
                 total_slices += n2
+
+    # Add weighted reconstruction loss to the batch (computed before label loop)
+    if recon_loss_val is not None and recon_loss_val.requires_grad:
+        current_lambda_aux = get_lambda_aux(epoch, args)
+        all_losses.append(current_lambda_aux * recon_loss_val)
 
     # Clear GVT cache
     if has_gvt(base_model):
@@ -201,11 +276,15 @@ def train_3d_sample_from_embedding_gvt(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    if all_losses and total_slices > 0:
+    if all_losses:
         total_loss = torch.stack(all_losses).mean()
         avg_vol_loss = torch.stack(all_vol_losses).mean() if all_vol_losses else torch.tensor(0.0, device=device)
-        return total_loss, avg_vol_loss
-    return torch.tensor(0.0, device=device, requires_grad=True), torch.tensor(0.0, device=device)
+        return total_loss, avg_vol_loss, recon_loss_scalar
+    return (
+        torch.tensor(0.0, device=device, requires_grad=True),
+        torch.tensor(0.0, device=device),
+        recon_loss_scalar,
+    )
 
 
 # =============================================================================
@@ -221,14 +300,19 @@ def train_epoch(
     device,
     rank,
     scaler=None,
+    recon_decoder=None,
+    epoch: int = 0,
 ):
     """Train for one epoch with GVT and 3D loss."""
     model.train()
+    if recon_decoder is not None:
+        recon_decoder.train()
 
     epoch_loss = 0.0
     loss_2d_total = 0.0
     loss_3d_total = 0.0
     loss_vol_total = 0.0
+    loss_recon_total = 0.0
     num_2d = 0
     num_3d = 0
     pending_grads = False
@@ -241,6 +325,7 @@ def train_epoch(
 
         batch_losses = []
         batch_vol_losses = []
+        batch_recon_losses = []
 
         for sample in samples_2d:
             loss = train_2d_sample_from_embedding(model, sample, loss_fn, args, device)
@@ -250,12 +335,17 @@ def train_epoch(
                 num_2d += 1
 
         for sample in samples_3d:
-            loss, vol_loss = train_3d_sample_from_embedding_gvt(model, sample, loss_fn, args, device)
+            loss, vol_loss, recon_loss = train_3d_sample_from_embedding_gvt(
+                model, sample, loss_fn, args, device,
+                recon_decoder=recon_decoder, epoch=epoch,
+            )
             if not torch.isnan(loss) and loss.item() > 0:
                 batch_losses.append(loss)
                 batch_vol_losses.append(vol_loss.item())
+                batch_recon_losses.append(recon_loss.item())
                 loss_3d_total += loss.item()
                 loss_vol_total += vol_loss.item()
+                loss_recon_total += recon_loss.item()
                 num_3d += 1
 
         if not batch_losses:
@@ -266,12 +356,17 @@ def train_epoch(
         batch_loss = torch.stack(batch_losses).mean()
         batch_loss = batch_loss / args.grad_accum_steps
 
+        # Collect all trainable params (model + recon_decoder if present)
+        all_params = list(model.parameters())
+        if recon_decoder is not None:
+            all_params = all_params + list(recon_decoder.parameters())
+
         if args.use_amp and scaler is not None:
             scaler.scale(batch_loss).backward()
             pending_grads = True
             if (batch_idx + 1) % args.grad_accum_steps == 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(all_params, args.max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -280,7 +375,7 @@ def train_epoch(
             batch_loss.backward()
             pending_grads = True
             if (batch_idx + 1) % args.grad_accum_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(all_params, args.max_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad()
                 pending_grads = False
@@ -288,22 +383,29 @@ def train_epoch(
         epoch_loss += batch_loss.item() * args.grad_accum_steps
 
         avg_vol = np.mean(batch_vol_losses) if batch_vol_losses else 0.0
+        avg_recon = np.mean(batch_recon_losses) if batch_recon_losses else 0.0
         if rank == 0:
-            pbar.set_postfix({
+            postfix = {
                 "loss": f"{batch_loss.item() * args.grad_accum_steps:.4f}",
                 "vol": f"{avg_vol:.4f}",
                 "2d": num_2d,
                 "3d": num_3d,
-            })
+            }
+            if recon_decoder is not None:
+                postfix["recon"] = f"{avg_recon:.4f}"
+            pbar.set_postfix(postfix)
 
     if pending_grads:
+        all_params = list(model.parameters())
+        if recon_decoder is not None:
+            all_params = all_params + list(recon_decoder.parameters())
         if args.use_amp and scaler is not None:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(all_params, args.max_grad_norm)
             scaler.step(optimizer)
             scaler.update()
         else:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(all_params, args.max_grad_norm)
             optimizer.step()
         optimizer.zero_grad()
 
@@ -311,8 +413,9 @@ def train_epoch(
     avg_loss_2d = loss_2d_total / max(num_2d, 1)
     avg_loss_3d = loss_3d_total / max(num_3d, 1)
     avg_loss_vol = loss_vol_total / max(num_3d, 1)
+    avg_loss_recon = loss_recon_total / max(num_3d, 1)
 
-    return avg_loss, avg_loss_2d, avg_loss_3d, avg_loss_vol
+    return avg_loss, avg_loss_2d, avg_loss_3d, avg_loss_vol, avg_loss_recon
 
 
 # =============================================================================
@@ -333,6 +436,18 @@ def parse_args():
     parser.add_argument("--gvt-num-tokens", type=int, default=16)
     parser.add_argument("--gvt-num-layers", type=int, default=2)
     parser.add_argument("--gvt-num-heads", type=int, default=4)
+
+    # GVT v2: auxiliary reconstruction loss
+    parser.add_argument("--gvt-recon", action="store_true",
+                        help="Enable reconstruction loss (GVT v2). Only effective with --use-gvt.")
+    parser.add_argument("--gvt-recon-res", type=int, default=16,
+                        help="Low-resolution target size for reconstruction (default: 16).")
+    parser.add_argument("--lambda-aux", type=float, default=1.0,
+                        help="Weight for the reconstruction loss (default: 1.0).")
+    parser.add_argument("--lambda-aux-warmup", type=float, default=0.0,
+                        help="λ_aux used during warmup epochs. 0 disables warmup (default: 0).")
+    parser.add_argument("--lambda-aux-warmup-epochs", type=int, default=10,
+                        help="Number of warmup epochs for λ_aux schedule (default: 10).")
 
     # Sampling
     parser.add_argument("--mix-ratio-3d", type=float, default=0.8)
@@ -429,6 +544,32 @@ def main(rank, world_size, args):
         print(f"GVT enabled: {args.gvt_num_tokens} tokens, "
               f"{args.gvt_num_layers} layers, {gvt_params:,} parameters")
 
+    # GVT v2: create reconstruction decoder (training-only, not DDP-wrapped)
+    recon_decoder = None
+    if args.use_gvt and args.gvt_recon:
+        mem_dim = model.mem_dim  # 64
+        recon_decoder = GVTReconDecoder(
+            C_mem=mem_dim,
+            max_slices=256,
+            recon_res=args.gvt_recon_res,
+        ).to(device)
+        # Load decoder weights when resuming a v2 checkpoint
+        if resume_training:
+            sd = torch.load(ckpt_path, map_location=device, weights_only=True)
+            if "gvt_recon_decoder" in sd:
+                recon_decoder.load_state_dict(sd["gvt_recon_decoder"])
+                if rank == 0:
+                    print("Loaded GVTReconDecoder weights from checkpoint.")
+            elif rank == 0:
+                print("No GVTReconDecoder weights in checkpoint; starting decoder fresh.")
+        if rank == 0:
+            recon_params = sum(p.numel() for p in recon_decoder.parameters())
+            print(f"GVT v2 recon decoder enabled: res={args.gvt_recon_res}, "
+                  f"{recon_params:,} parameters, λ_aux={args.lambda_aux}")
+            if args.lambda_aux_warmup > 0:
+                print(f"  λ_aux warmup: {args.lambda_aux_warmup} for first "
+                      f"{args.lambda_aux_warmup_epochs} epochs")
+
     if rank == 0:
         total_params, trainable_params = count_parameters(model)
         print(f"Total parameters: {total_params:,}")
@@ -443,8 +584,12 @@ def main(rank, world_size, args):
         find_unused_parameters=True,
     )
 
+    # Include recon_decoder parameters in the optimizer (if active)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    if recon_decoder is not None:
+        trainable = trainable + list(recon_decoder.parameters())
     optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
+        trainable,
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
@@ -503,7 +648,7 @@ def main(rank, world_size, args):
         csv_file = open(csv_path, "a" if csv_exists else "w", newline="")
         csv_writer = csv.writer(csv_file)
         if not csv_exists:
-            csv_writer.writerow(["epoch", "train_loss", "loss_2d", "loss_3d", "loss_vol"])
+            csv_writer.writerow(["epoch", "train_loss", "loss_2d", "loss_3d", "loss_vol", "loss_recon"])
         csv_file.flush()
 
     if rank == 0:
@@ -519,7 +664,7 @@ def main(rank, world_size, args):
 
         mixed_dataset.reshuffle(epoch)
 
-        avg_loss, avg_loss_2d, avg_loss_3d, avg_loss_vol = train_epoch(
+        avg_loss, avg_loss_2d, avg_loss_3d, avg_loss_vol, avg_loss_recon = train_epoch(
             model=model,
             dataloader=train_loader,
             optimizer=optimizer,
@@ -528,11 +673,17 @@ def main(rank, world_size, args):
             device=device,
             rank=rank,
             scaler=scaler,
+            recon_decoder=recon_decoder,
+            epoch=epoch,
         )
 
         if rank == 0:
+            recon_str = f", Recon={avg_loss_recon:.4f}" if recon_decoder is not None else ""
             print(f"Epoch {epoch + 1}: Loss={avg_loss:.4f}, 2D={avg_loss_2d:.4f}, "
-                  f"3D={avg_loss_3d:.4f}, Vol={avg_loss_vol:.4f}")
+                  f"3D={avg_loss_3d:.4f}, Vol={avg_loss_vol:.4f}{recon_str}")
+            if recon_decoder is not None:
+                current_lambda_aux = get_lambda_aux(epoch, args)
+                print(f"  λ_aux={current_lambda_aux:.4f}")
 
             if csv_writer is not None:
                 csv_writer.writerow([
@@ -541,12 +692,13 @@ def main(rank, world_size, args):
                     f"{avg_loss_2d:.6f}",
                     f"{avg_loss_3d:.6f}",
                     f"{avg_loss_vol:.6f}",
+                    f"{avg_loss_recon:.6f}",
                 ])
                 csv_file.flush()
 
             if (epoch + 1) % args.save_every == 0:
                 save_name = os.path.join(args.save_path, f"sam2_gvt3dloss_epoch_{epoch + 1}.pth")
-                torch.save({
+                ckpt = {
                     "model": model.module.state_dict(),
                     "epoch": epoch + 1,
                     "optimizer": optimizer.state_dict(),
@@ -556,12 +708,15 @@ def main(rank, world_size, args):
                         "num_layers": args.gvt_num_layers,
                         "num_heads": args.gvt_num_heads,
                     } if args.use_gvt else None,
-                }, save_name)
+                }
+                if recon_decoder is not None:
+                    ckpt["gvt_recon_decoder"] = recon_decoder.state_dict()
+                torch.save(ckpt, save_name)
                 print(f"Checkpoint saved: {save_name}")
 
     if rank == 0:
         save_name = os.path.join(args.save_path, "sam2_gvt3dloss_final.pth")
-        torch.save({
+        ckpt = {
             "model": model.module.state_dict(),
             "epoch": args.num_epochs,
             "optimizer": optimizer.state_dict(),
@@ -571,7 +726,10 @@ def main(rank, world_size, args):
                 "num_layers": args.gvt_num_layers,
                 "num_heads": args.gvt_num_heads,
             } if args.use_gvt else None,
-        }, save_name)
+        }
+        if recon_decoder is not None:
+            ckpt["gvt_recon_decoder"] = recon_decoder.state_dict()
+        torch.save(ckpt, save_name)
         print(f"Final checkpoint saved: {save_name}")
 
         if csv_file is not None:
@@ -596,7 +754,8 @@ if __name__ == "__main__":
         os.environ["MASTER_PORT"] = str(py_random.randint(29500, 29999))
 
     gvt_str = " with GVT" if args.use_gvt else ""
-    print(f"Starting GVT + 3D-loss training{gvt_str} with {world_size} GPUs")
+    recon_str = " + recon (v2)" if (args.use_gvt and args.gvt_recon) else ""
+    print(f"Starting GVT + 3D-loss training{gvt_str}{recon_str} with {world_size} GPUs")
     print(f"Loss weighting: lambda_2d={args.lambda_2d}, lambda_3d={args.lambda_3d}")
 
     mp.spawn(main, args=(world_size, args), nprocs=world_size)

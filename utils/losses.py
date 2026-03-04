@@ -720,3 +720,42 @@ def sd_residual_mean_square_distance(input1, input2, sampling=1, connectivity=1)
     sd = surface_distance(input1, input2, sampling=1, connectivity=1)
     return np.sqrt((sd**2).mean())
 
+
+def gvt_recon_loss(
+    recon_logits: torch.Tensor,
+    gt_masks_3d: torch.Tensor,
+    recon_res: int = 16,
+) -> torch.Tensor:
+    """
+    Auxiliary reconstruction loss for GVT v2.
+
+    Measures how well the K GVT tokens can reconstruct per-slice foreground masks
+    at low resolution. Backpropagates through the GVTReconDecoder into the GVT
+    encoder, giving the encoder an explicit volumetric shape supervision signal.
+
+    Args:
+        recon_logits: (1, N, 1, recon_res, recon_res) — raw logits from GVTReconDecoder.
+        gt_masks_3d:  (N, 1, H, W) or (1, N, 1, H, W) — binary GT at original resolution.
+        recon_res:    Target low resolution (must match recon_logits spatial dims).
+
+    Returns:
+        loss: scalar — BCE + soft Dice.
+    """
+    if gt_masks_3d.dim() == 5:
+        gt_masks_3d = gt_masks_3d.squeeze(0)  # (N, 1, H, W)
+
+    gt_low = F.interpolate(
+        gt_masks_3d.float(),
+        size=(recon_res, recon_res),
+        mode="bilinear",
+        align_corners=False,
+    ).unsqueeze(0)  # (1, N, 1, recon_res, recon_res)
+
+    bce = F.binary_cross_entropy_with_logits(recon_logits, gt_low)
+
+    recon_prob = torch.sigmoid(recon_logits)
+    intersection = (recon_prob * gt_low).sum()
+    dice = 1.0 - (2.0 * intersection + 1e-5) / (recon_prob.sum() + gt_low.sum() + 1e-5)
+
+    return bce + dice
+

@@ -118,3 +118,60 @@ class GVTModule(nn.Module):
         gvt_pos = self.gvt_pos_enc.unsqueeze(1)  # (K, 1, 64)
 
         return gvt_tokens, gvt_pos
+
+
+class GVTReconDecoder(nn.Module):
+    """
+    Training-only auxiliary decoder. Expands K GVT tokens back to N slice masks
+    at low resolution. Mirrors the GVT encoder: encoder compresses N→K, decoder
+    expands K→N. Discarded at inference — zero overhead.
+
+    Architecture:
+        Input:  gvt_tokens (K, 1, C_mem) from GVT encoder
+        Query:  sinusoidal slice PE (N, C_mem) — same PE as GVTModule
+        Decoder: 2-layer TransformerDecoder (N slice queries cross-attend to K tokens)
+        Head:   Linear → (N, recon_res * recon_res) → reshape to (1, N, 1, R, R)
+    """
+
+    def __init__(self, C_mem: int = 64, max_slices: int = 256, recon_res: int = 16):
+        super().__init__()
+        self.recon_res = recon_res
+
+        # Reuse the SAME sinusoidal PE as GVTModule for consistent slice positions
+        self.register_buffer(
+            "slice_pos_enc",
+            GVTModule._build_sinusoidal_pe(max_slices, C_mem),
+        )
+
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=C_mem, nhead=4, dim_feedforward=128, batch_first=True
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=2)
+
+        self.mask_head = nn.Sequential(
+            nn.Linear(C_mem, C_mem * 2),
+            nn.ReLU(),
+            nn.Linear(C_mem * 2, recon_res * recon_res),
+        )
+
+    def forward(self, gvt_tokens: torch.Tensor, num_slices: int) -> torch.Tensor:
+        """
+        Args:
+            gvt_tokens: (K, 1, C_mem) — output of GVT encoder.
+            num_slices: int — N slices in this volume.
+        Returns:
+            recon_logits: (1, N, 1, recon_res, recon_res)
+        """
+        # Normalise to (1, K, C_mem) for batch_first TransformerDecoder
+        if gvt_tokens.shape[1] == 1:
+            memory = gvt_tokens.transpose(0, 1)  # (K, 1, C_mem) → (1, K, C_mem)
+        else:
+            memory = gvt_tokens  # already (1, K, C_mem)
+
+        # Slice queries from sinusoidal PE — match dtype/device of memory
+        queries = self.slice_pos_enc[:num_slices].unsqueeze(0)          # (1, N, C_mem)
+        queries = queries.to(device=memory.device, dtype=memory.dtype)
+
+        decoded = self.decoder(queries, memory)                          # (1, N, C_mem)
+        masks = self.mask_head(decoded.float())                          # (1, N, recon_res^2)
+        return masks.view(1, num_slices, 1, self.recon_res, self.recon_res)
