@@ -94,29 +94,30 @@ def _build_gt_volume_binary(masks, labels, N_total: int, ori_h: int, ori_w: int,
     Returns:
         gt_vol: (N, 1, H, W) float32 binary tensor on ``device``.
     """
+    # Fast path: masks is (N, H, W) numpy int32 — one conversion, one GPU transfer
+    if isinstance(masks, np.ndarray) and masks.ndim == 3:
+        masks_t = torch.from_numpy(masks).to(device)          # (N, H, W) int32 on GPU
+        any_fg = torch.zeros(N_total, masks_t.shape[1], masks_t.shape[2],
+                             dtype=torch.float32, device=device)
+        for lbl in labels:
+            any_fg += (masks_t == int(lbl))
+        return any_fg.clamp(max=1.0).unsqueeze(1)             # (N, 1, H, W)
+
+    # Fallback: per-slice loop for non-standard input types
     gt_vol_list = []
     for idx in range(N_total):
-        m = masks[idx]  # (H, W) numpy int32 for standard Embedding3DDataset
-
-        # Convert to integer torch tensor for exact label comparison (no float rounding)
+        m = masks[idx]
         if isinstance(m, np.ndarray):
             m_t = torch.from_numpy(m.astype(np.int32))
         elif isinstance(m, torch.Tensor):
             m_t = m.int()
         else:
-            # Fallback: slice missing or unexpected type → treat as empty
             gt_vol_list.append(torch.zeros(1, ori_h, ori_w))
             continue
-
-        # Binary union: 1 wherever ANY of the selected labels appears
         any_fg = torch.zeros(m_t.shape, dtype=torch.float32)
         for lbl in labels:
             any_fg = any_fg + (m_t == int(lbl)).float()
-        # Clamp in case the same pixel matches multiple labels
-        any_fg = any_fg.clamp(max=1.0).unsqueeze(0)  # (H, W) → (1, H, W)
-
-        gt_vol_list.append(any_fg)
-
+        gt_vol_list.append(any_fg.clamp(max=1.0).unsqueeze(0))
     return torch.stack(gt_vol_list, dim=0).to(device)  # (N, 1, H, W)
 
 
@@ -208,7 +209,6 @@ def train_3d_sample_from_embedding_gvt(
 
     all_losses = []
     all_vol_losses = []
-    total_slices = 0
 
     max_labels_per_sample = getattr(args, 'max_labels_per_sample', 1)
     if len(labels) > max_labels_per_sample:
@@ -239,7 +239,6 @@ def train_3d_sample_from_embedding_gvt(
             if n1 > 0 and loss1.requires_grad:
                 all_losses.append(loss1)
                 all_vol_losses.append(vol_loss1.detach())
-                total_slices += n1
 
         if len(v2_slices_train) > 1:
             v2_remaining = v2_slices_train[1:]
@@ -262,23 +261,27 @@ def train_3d_sample_from_embedding_gvt(
             if n2 > 0 and loss2.requires_grad:
                 all_losses.append(loss2)
                 all_vol_losses.append(vol_loss2.detach())
-                total_slices += n2
-
-    # Add weighted reconstruction loss to the batch (computed before label loop)
-    if recon_loss_val is not None and recon_loss_val.requires_grad:
-        current_lambda_aux = get_lambda_aux(epoch, args)
-        all_losses.append(current_lambda_aux * recon_loss_val)
 
     # Clear GVT cache
     if has_gvt(base_model):
         clear_gvt_cache(base_model)
 
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    # Combine losses: seg_loss (mean of per-video losses) + lambda_aux * recon_loss (additive)
+    # This keeps lambda_aux as a direct multiplier rather than diluting it by averaging.
+    avg_vol_loss = torch.stack(all_vol_losses).mean() if all_vol_losses else torch.tensor(0.0, device=device)
 
     if all_losses:
-        total_loss = torch.stack(all_losses).mean()
-        avg_vol_loss = torch.stack(all_vol_losses).mean() if all_vol_losses else torch.tensor(0.0, device=device)
+        seg_loss = torch.stack(all_losses).mean()
+        if recon_loss_val is not None and recon_loss_val.requires_grad:
+            current_lambda_aux = get_lambda_aux(epoch, args)
+            total_loss = seg_loss + current_lambda_aux * recon_loss_val
+        else:
+            total_loss = seg_loss
+        return total_loss, avg_vol_loss, recon_loss_scalar
+    elif recon_loss_val is not None and recon_loss_val.requires_grad:
+        # No seg losses (all labels absent from cut_idx) but recon still trains GVT encoder
+        current_lambda_aux = get_lambda_aux(epoch, args)
+        total_loss = current_lambda_aux * recon_loss_val
         return total_loss, avg_vol_loss, recon_loss_scalar
     return (
         torch.tensor(0.0, device=device, requires_grad=True),
@@ -562,6 +565,7 @@ def main(rank, world_size, args):
                     print("Loaded GVTReconDecoder weights from checkpoint.")
             elif rank == 0:
                 print("No GVTReconDecoder weights in checkpoint; starting decoder fresh.")
+            del sd  # free checkpoint tensors from GPU memory before optimizer load
         if rank == 0:
             recon_params = sum(p.numel() for p in recon_decoder.parameters())
             print(f"GVT v2 recon decoder enabled: res={args.gvt_recon_res}, "
@@ -593,6 +597,14 @@ def main(rank, world_size, args):
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
+    # Restore optimizer state when resuming (preserves AdamW moment estimates)
+    if resume_training:
+        sd_resume = torch.load(ckpt_path, map_location=device, weights_only=True)
+        if "optimizer" in sd_resume:
+            optimizer.load_state_dict(sd_resume["optimizer"])
+            if rank == 0:
+                print("Loaded optimizer state from checkpoint.")
+        del sd_resume
 
     loss_fn = DiceFocalLoss(
         sigmoid=True,
