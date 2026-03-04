@@ -455,3 +455,64 @@ total_loss = lambda_2d * per_slice_dice_focal + lambda_3d * volumetric_dice
 - `--lambda-2d 1.0 --lambda-3d 0.5`: Balanced (default, good starting point)
 - `--lambda-2d 0.5 --lambda-3d 1.0`: Emphasize volumetric consistency
 - `--lambda-2d 1.0 --lambda-3d 0.0`: 2D only (ablation, equivalent to train_unified_emb.py)
+
+### GVT (Global Volume Token) Module (gvt/)
+
+GVT injects volume-level context into SAM2's memory bank without modifying any SAM2 source files.
+
+**Architecture:**
+- `gvt/gvt_module.py` — `GVTModule`: Perceiver-style cross-attention, N slice embeddings → K global tokens (K=16). `GVTReconDecoder`: training-only auxiliary decoder that expands K tokens back to N slice masks (discarded at inference).
+- `gvt/gvt_integration.py` — `GVTMemoryAttentionWrapper`: wraps SAM2's `memory_attention`, appending GVT tokens to the memory bank on every forward call. Helper functions: `wrap_model_with_gvt`, `compute_gvt_tokens`, `clear_gvt_cache`, `has_gvt`, `load_gvt_checkpoint`.
+- `gvt/train_gvt_emb_3dloss.py` — GVT v2 training script (2D + 3D + auxiliary reconstruction loss).
+
+**GVT versions:**
+- **GVT v1**: GVT encoder only. K tokens appended to memory bank; training signal comes solely from segmentation loss. Limited by weak/indirect gradient path to GVT encoder.
+- **GVT v2**: Adds `GVTReconDecoder` auxiliary reconstruction loss. Explicitly forces GVT encoder to learn spatially meaningful representations via a direct, short gradient path. Decoder is discarded at inference — zero overhead.
+
+**GVT v2 loss formulation:**
+```
+total_loss = mean(seg_losses_v1_v2) + lambda_aux * recon_loss
+```
+- `seg_losses` = per-video 2D Dice-Focal + 3D volumetric Dice (same as `train_unified_emb_3dloss.py`)
+- `recon_loss` = BCE + soft Dice on low-resolution (16×16) mask reconstructions
+- `lambda_aux` is **additive**, not averaged — its effective weight is always `lambda_aux` regardless of how many seg losses exist. (Do NOT revert to appending `lambda_aux * recon` into `all_losses` and averaging — this dilutes the recon weight by ~1/N_losses.)
+
+**CLI flags (gvt/train_gvt_emb_3dloss.py):**
+- `--num-gvt-tokens`: K global tokens (default: 16)
+- `--num-gvt-layers`: Perceiver cross-attention depth (default: 2)
+- `--num-gvt-heads`: Attention heads (default: 4)
+- `--gvt-dropout`: Dropout rate (default: 0.1)
+- `--lambda-aux`: Recon loss weight (default: 0.1); ramps up over `--lambda-aux-warmup-epochs`
+- `--lambda-aux-warmup-epochs`: Warm-up epochs before full lambda_aux (default: 5)
+- `--gvt-recon-res`: Reconstruction resolution R (default: 16, i.e., 16×16 masks)
+
+**GVT token flow per volume:**
+```
+compute_gvt_tokens(model, image_embeds[all N], ...)   # K tokens from ALL N slices — never capped
+   → wrapper.gvt_tokens_cache = (gvt_tokens, gvt_pos)
+for each label:
+    process_video_with_memory_3dloss(v1_slices_train, ...)  # video capped at max_slices
+    process_video_with_memory_3dloss(v2_slices_train, ...)
+recon_decoder(gvt_tokens, num_slices=N_recon)         # recon capped at max_slices (load balance)
+clear_gvt_cache(model)
+```
+
+**GPU load balance (IMPORTANT — do not regress):**
+`compute_gvt_tokens` intentionally processes all N slices to capture global volume context. However, `recon_decoder` must be capped at `max_slices_per_video` to match the per-sample cost of video processing. Without this cap, large-N volumes (N=200) cause one GPU to run 2× longer than others, leaving other GPUs idle during NCCL allreduce. Capping recon to `max_slices` makes per-sample cost approximately uniform across GPUs.
+
+```python
+# Correct pattern — recon decoder capped at max_slices
+recon_slice_indices = list(range(N_total))
+if N_total > max_slices:
+    recon_slice_indices = subsample_slices(recon_slice_indices, max_slices)
+N_recon = len(recon_slice_indices)
+recon_masks = masks[np.array(recon_slice_indices)] if N_recon < N_total else masks
+gt_vol = _build_gt_volume_binary(recon_masks, labels, N_recon, ...)
+recon_logits = recon_decoder(gvt_tokens_tensor, num_slices=N_recon)
+```
+
+**MAX_SLICES_PER_VIDEO and training-inference gap:**
+- `MAX_SLICES_PER_VIDEO=32` caps video processing at 32 slices per sub-video during training. At inference the full volume (50–200+ slices) is processed.
+- This creates a propagation-depth gap, but SAM2's memory bank is a **sliding window** (~`num_maskmem=7` frames), so each frame always attends to the same number of recent memory frames regardless of total sequence length. The gap is therefore less severe than it appears.
+- GVT tokens (computed from all N slices, uncapped) directly address the gap by providing global volume context independent of the sequential propagation depth.
+- The correct comparison is: memory bank = local (last 7 frames); GVT = global (all N slices). GVT is complementary to the memory bank, not redundant with it. K=16 GVT tokens vs 32-slice training cap is not a meaningful bottleneck — they operate on different axes.
