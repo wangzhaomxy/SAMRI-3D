@@ -181,20 +181,7 @@ def train_3d_sample_from_embedding_gvt(
     if has_gvt(base_model):
         compute_gvt_tokens(base_model, image_embeds, device, use_amp=args.use_amp)
 
-    # GVT v2: compute reconstruction loss once per volume using the cached tokens
-    recon_loss_scalar = torch.tensor(0.0, device=device)
-    recon_loss_val = None  # defined only when recon_decoder is active
-    if recon_decoder is not None and has_gvt(base_model):
-        wrapper = base_model.memory_attention
-        gvt_tokens_tensor, _ = wrapper.gvt_tokens_cache   # (K, 1, 64)
-        N_total = image_embeds.shape[0] if hasattr(image_embeds, "shape") else len(image_embeds)
-        gt_vol = _build_gt_volume_binary(masks, labels, N_total, ori_h, ori_w, device)
-        with torch.amp.autocast("cuda", enabled=args.use_amp):
-            recon_logits = recon_decoder(gvt_tokens_tensor, num_slices=N_total)
-            recon_loss_val = gvt_recon_loss(recon_logits, gt_vol, recon_res=args.gvt_recon_res)
-        recon_loss_scalar = recon_loss_val.detach()
-
-    # Subsample video slices if too long
+    # Subsample video slices if too long (also caps recon decoder cost)
     max_slices = getattr(args, 'max_slices_per_video', 32)
 
     def subsample_slices(slices: List[int], max_len: int) -> List[int]:
@@ -206,6 +193,28 @@ def train_3d_sample_from_embedding_gvt(
 
     v1_slices_train = subsample_slices(v1_slices, max_slices)
     v2_slices_train = subsample_slices(v2_slices, max_slices)
+
+    # GVT v2: compute reconstruction loss once per volume using the cached tokens.
+    # Recon target is capped at max_slices to bound GPU cost (same as video processing),
+    # preventing load imbalance across GPUs with volumes of varying slice counts.
+    recon_loss_scalar = torch.tensor(0.0, device=device)
+    recon_loss_val = None
+    if recon_decoder is not None and has_gvt(base_model):
+        wrapper = base_model.memory_attention
+        gvt_tokens_tensor, _ = wrapper.gvt_tokens_cache   # (K, 1, 64)
+        N_total = image_embeds.shape[0] if hasattr(image_embeds, "shape") else len(image_embeds)
+        # Subsample slice indices uniformly when volume is larger than max_slices
+        recon_slice_indices = list(range(N_total))
+        if N_total > max_slices:
+            recon_slice_indices = subsample_slices(recon_slice_indices, max_slices)
+        N_recon = len(recon_slice_indices)
+        # Build GT for the subsampled slice set (numpy fancy indexing for the subset)
+        recon_masks = masks[np.array(recon_slice_indices)] if N_recon < N_total else masks
+        gt_vol = _build_gt_volume_binary(recon_masks, labels, N_recon, ori_h, ori_w, device)
+        with torch.amp.autocast("cuda", enabled=args.use_amp):
+            recon_logits = recon_decoder(gvt_tokens_tensor, num_slices=N_recon)
+            recon_loss_val = gvt_recon_loss(recon_logits, gt_vol, recon_res=args.gvt_recon_res)
+        recon_loss_scalar = recon_loss_val.detach()
 
     all_losses = []
     all_vol_losses = []
