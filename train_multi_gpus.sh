@@ -78,14 +78,14 @@ SAVE_PATH_2D_IMG="/scratch/user/s4670484/Model_save/samri2_2d_img/"
 # GVT Configuration (gvt/train_gvt_emb_3dloss.py)
 # ============================================================================
 SAVE_PATH_GVT_3D_EMB="/scratch/user/s4670484/Model_save/samri2_gvt2_5x_3d_K16_AUX1/"
-GVT_NUM_TOKENS=16
+GVT_NUM_TOKENS=32
 GVT_NUM_LAYERS=2
 GVT_NUM_HEADS=4
 
 # GVT v2: Auxiliary reconstruction loss
 # Set GVT_RECON=true to enable; false disables it (v1 behaviour)
 GVT_RECON=true
-GVT_RECON_RES=16           # Low-res reconstruction target (16x16)
+GVT_RECON_RES=32           # Low-res reconstruction target (32x32)
 LAMBDA_AUX=1.0             # Weight for reconstruction loss
 LAMBDA_AUX_WARMUP=0.0      # λ_aux during warmup (0 = no warmup)
 LAMBDA_AUX_WARMUP_EPOCHS=10
