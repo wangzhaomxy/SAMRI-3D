@@ -54,9 +54,9 @@ Features:
 Examples:    
 python test_vis3d_multi.py \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-path /scratch/user/s4670484/Model_save/samri2_5x_3d_emb_256/sam2_emb3dloss_epoch_48.pth \
+--ckpt-path /scratch/user/s4670484/Model_save/samri2_gvt2_5x_3d_K32_rec32_AUX1/sam2_gvt3dloss_epoch_48.pth \
 --dataset-path /scratch/user/s4670484/Datasets/SAMRI_datasets_3D/ /scratch/user/s4670484/Datasets/Zeroshot3D/ \
---save-path /scratch/user/s4670484/Eval_results/SAMRI2/sam2_5x_3dloss_256_epoch_48.pkl \
+--save-path /scratch/user/s4670484/Eval_results/SAMRI2/samri2_gvt2_5x_3d_K32_rec32_AUX1_epoch_48.pkl \
 --num-workers 12 \
 --use-gvt
 """
