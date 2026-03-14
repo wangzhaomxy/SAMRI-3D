@@ -18,7 +18,7 @@
 # make sure log directory exists
 mkdir -p /scratch/user/s4670484/SAMRI2_log
 
-module load anaconda3
+module load anaconda3/2023.09-0
 source $EBROOTANACONDA3/etc/profile.d/conda.sh
 conda activate samri-mi300  # samri samri-mi300
 
