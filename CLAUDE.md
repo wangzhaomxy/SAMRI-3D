@@ -16,16 +16,7 @@ python setup_sam2.py install        # Install SAM2 with CUDA extensions
 
 ### Running Evaluation
 ```bash
-# 3D single-object evaluation (iterative, per-label)
-python test_vis3d.py \
-  --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-  --ckpt-path /path/to/checkpoint.pt \
-  --dataset-path /path/to/test_data/ /path/to/zeroshot_results/ \
-  --save-path /path/to/results.pkl \
-  --prompt-mode box \
-  --num-workers 8
-
-# 3D multi-object evaluation (faster, all labels at once)
+# 3D evaluation (per-label cut, semantic volume output)
 python test_vis3d_multi.py \
   --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
   --ckpt-path /path/to/checkpoint.pt \
@@ -173,8 +164,7 @@ sbatch train_multi_gpus.sh
 
 **Root scripts:**
 - `3d_inference.py` - Batch 3D inference without evaluation
-- `test_vis3d.py` - 3D evaluation (single object per run, iterative)
-- `test_vis3d_multi.py` - 3D evaluation (all objects simultaneously, higher accuracy)
+- `test_vis3d_multi.py` - 3D evaluation (per-label cut, semantic volume output)
 - `test_vis3d_crf.py` - 3D evaluation with Dense CRF post-processing (experimental)
 - `test_vis3d_twopass.py` - 3D evaluation with two-pass auto-context refinement (experimental)
 - `test_vis2d.py` - 2D slice evaluation
@@ -241,44 +231,35 @@ hi = np.percentile(img, 99.5)
 img = np.clip((img - lo) / (hi - lo), 0.0, 1.0)
 ```
 
-### Single-Object Evaluation State-Reuse Pattern (test_vis3d.py)
+### Per-Label Cut Evaluation State-Reuse Pattern (test_vis3d_multi.py)
 
-`test_vis3d.py` runs one propagation per label (single-object mode).  Naively
-this means calling `init_state` 2*K times per volume (K = label count).  Two
-SAM2 internals make a much faster pattern possible:
-
-1. **`reset_state()` preserves image data.**  It clears all object/tracking
-   state (`obj_ids`, `output_dict_per_obj`, etc.) but does **not** touch
-   `cached_features` or `images`.  The same state can be re-prompted after a
-   `reset_state` call.
-
-2. **`_get_image_feature` is a 1-entry LRU cache** — each cache miss
-   *replaces* the entire `cached_features` dict.  After propagation only the
-   last frame's features survive.  To keep all frames cached across labels,
-   pre-fill the cache before the label loop:
+`test_vis3d_multi.py` runs one propagation per label using a per-label cut
+slice (the slice with maximum foreground for that specific label).  To avoid
+re-running the image encoder (O(N) cost) for every label, all N slices are
+pre-encoded once and injected into each label's inference state:
 
 ```python
-# Pre-fill: runs forward_image once per frame; persists through reset_state
-for i in range(num_frames):
-    image = state["images"][i].to(device).float().unsqueeze(0)
-    backbone_out = predictor.forward_image(image)
-    cache[i] = (image, backbone_out)
-state["cached_features"] = cache
+# Pre-encode all N slices once; keyed by slice index
+slice_cache = precompute_slice_features(predictor, vol0)
+
+# Per-label: inject relevant features before init_state + propagate
+inject_cached_features(state, v_slices, slice_cache)
 ```
 
 The resulting per-case loop is:
 ```
-init_state  x2  (video1 + video2)
-prefill     x2  (only when K > 1)
+precompute_slice_features  (N forward_image calls, once per case)
 for each label:
-    add_prompt  ->  propagate  ->  reset_state   (x2 per label)
+    per-label cut_L = argmax foreground count
+    build v1_L, v2_L around cut_L
+    init_state(v1_L) -> inject_cached_features -> prompt -> propagate -> reset_state
+    init_state(v2_L) -> inject_cached_features -> prompt -> propagate -> reset_state
+    layer binary result into semantic volume
 ```
 
 Image encoding cost: **N** forward_image calls total (not N*K).
-`init_state` / `load_video_frames` cost: **2** calls total (not 2K).
-
-> **Do not** skip `prefill` when K > 1.  Without it every label re-encodes
-> all frames because the 1-entry cache is destroyed during propagation.
+`init_state` cost: **2*K** calls (one pair per label), but no disk I/O when
+streaming is available — sources are in-memory PIL loaders.
 
 ### Dense CRF Post-Processing (test_vis3d_crf.py)
 

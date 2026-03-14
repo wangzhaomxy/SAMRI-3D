@@ -6,10 +6,9 @@
 #SBATCH --job-name=SAMRI2
 #SBATCH --time=3-00:00:00
 #SBATCH --partition=gpu_rocm        # gpu_rocm      gpu_rocm    gpu_cuda
-#SBATCH --gres=gpu:mi300x:2         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2
+#SBATCH --gres=gpu:mi300x:8         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2
 #SBATCH --account=a_ai_collab
-#SBATCH --qos=gpu                   # sdf           gpu         gpu
-### #SBATCH --constraint=epyc3
+#SBATCH --qos=sdf                   # sdf           gpu         gpu
 #SBATCH -o /scratch/user/s4670484/SAMRI2_log/slurm-samri2-%j.output
 #SBATCH -e /scratch/user/s4670484/SAMRI2_log/slurm-samri2-%j.error
 #SBATCH --mail-type=ALL

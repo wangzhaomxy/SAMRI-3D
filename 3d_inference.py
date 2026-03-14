@@ -5,7 +5,7 @@
 3d_inference.py
 
 Batch 3D inference with SAM2 VideoPredictor (NO evaluation).
-- Scans dataset folders automatically (same logic as test_vis3d.py)
+- Scans dataset folders automatically (same logic as test_vis3d_multi.py)
 - Image + GT in same folder with "_img_" and "_gt_" keys
 - Uses GT ONLY to find cut slice (largest foreground slice) and to build prompt:
     prompt-mode = "box": bbox from cut-slice GT for each label
@@ -19,7 +19,7 @@ Batch 3D inference with SAM2 VideoPredictor (NO evaluation).
   Uses SimpleITK to write NIfTI (.nii.gz). Spacing/origin/direction copied from input image.
 
 NOTE:
-This script is intentionally “almost the same” as test_vis3d.py but without metrics.
+This script is intentionally “almost the same” as test_vis3d_multi.py but without metrics.
 
 CLI:
 python 3d_inference.py \

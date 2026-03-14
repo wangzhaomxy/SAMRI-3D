@@ -718,12 +718,11 @@ def train_3d_sample_from_embedding(
     high_res_feat_1s = sample["high_res_feat_1s"]
     masks = sample["masks"]  # (N, H, W)
     labels = sample["labels"]
-    cut_idx = sample["cut_idx"]
-    v1_slices = sample["v1_slices"]
-    v2_slices = sample["v2_slices"]
     ori_h, ori_w = sample["ori_h"], sample["ori_w"]
 
     base_model = model.module if hasattr(model, 'module') else model
+
+    N = image_embeds.shape[0] if hasattr(image_embeds, 'shape') else len(image_embeds)
 
     # Subsample video slices if too long
     max_slices = getattr(args, 'max_slices_per_video', 32)
@@ -734,9 +733,6 @@ def train_3d_sample_from_embedding(
         step = max(1, (len(slices) - 1) // (max_len - 1))
         subsampled = [slices[0]] + slices[1::step][:max_len - 1]
         return subsampled
-
-    v1_slices_train = subsample_slices(v1_slices, max_slices)
-    v2_slices_train = subsample_slices(v2_slices, max_slices)
 
     all_losses = []
     total_slices = 0
@@ -749,20 +745,28 @@ def train_3d_sample_from_embedding(
         rng = np.random.RandomState()
         labels = rng.choice(labels, size=max_labels_per_sample, replace=False).tolist()
 
-    for label in labels:
-        # Check if label exists in cut slice
-        if (masks[cut_idx] == label).sum() == 0:
-            continue
+    masks_np = masks if isinstance(masks, np.ndarray) else np.array(masks)
 
-        # Process video 1 (cut -> 0)
-        if len(v1_slices_train) > 0:
+    for label in labels:
+        # Per-label cut slice: slice with the most foreground for this label
+        fg_counts = (masks_np == label).sum(axis=(1, 2))
+        if fg_counts.max() == 0:
+            continue  # label not present anywhere in volume
+        cut_idx_L = int(np.argmax(fg_counts))
+        v1_L = list(range(cut_idx_L, -1, -1))
+        v2_L = [cut_idx_L] + list(range(cut_idx_L + 1, N))
+        v1_L_train = subsample_slices(v1_L, max_slices)
+        v2_L_train = subsample_slices(v2_L, max_slices)
+
+        # Process video 1 (cut_L -> 0)
+        if len(v1_L_train) > 0:
             loss1, n1 = process_video_with_memory_from_embedding(
                 model=base_model,
                 image_embeds=image_embeds,
                 high_res_feat_0s=high_res_feat_0s,
                 high_res_feat_1s=high_res_feat_1s,
                 masks=masks,
-                slice_indices=v1_slices_train,
+                slice_indices=v1_L_train,
                 label=label,
                 ori_h=ori_h,
                 ori_w=ori_w,
@@ -774,9 +778,9 @@ def train_3d_sample_from_embedding(
                 all_losses.append(loss1)
                 total_slices += n1
 
-        # Process video 2 (cut -> end), skip cut slice
-        if len(v2_slices_train) > 1:
-            v2_remaining = v2_slices_train[1:]
+        # Process video 2 (cut_L+1 -> N-1), skip cut slice
+        if len(v2_L_train) > 1:
+            v2_remaining = v2_L_train[1:]
             loss2, n2 = process_video_with_memory_from_embedding(
                 model=base_model,
                 image_embeds=image_embeds,

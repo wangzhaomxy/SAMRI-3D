@@ -39,6 +39,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
@@ -125,12 +126,11 @@ def train_3d_sample_from_embedding_gvt_tsdf(
     high_res_feat_1s = sample["high_res_feat_1s"]
     masks = sample["masks"]
     labels = sample["labels"]
-    cut_idx = sample["cut_idx"]
-    v1_slices = sample["v1_slices"]
-    v2_slices = sample["v2_slices"]
     ori_h, ori_w = sample["ori_h"], sample["ori_w"]
 
     base_model = model.module if hasattr(model, 'module') else model
+
+    N_total = image_embeds.shape[0] if hasattr(image_embeds, 'shape') else len(image_embeds)
 
     # Compute GVT tokens from all slice embeddings (ALL N slices, uncapped)
     if has_gvt(base_model):
@@ -138,15 +138,16 @@ def train_3d_sample_from_embedding_gvt_tsdf(
 
     max_slices = getattr(args, 'max_slices_per_video', 32)
 
-    v1_slices_train = subsample_slices(v1_slices, max_slices)
-    v2_slices_train = subsample_slices(v2_slices, max_slices)
-
     # Subsample labels if needed
     max_labels_per_sample = getattr(args, 'max_labels_per_sample', 1)
     active_labels = labels
     if len(active_labels) > max_labels_per_sample:
         rng = np.random.RandomState()
         active_labels = rng.choice(active_labels, size=max_labels_per_sample, replace=False).tolist()
+
+    masks_np = masks if isinstance(masks, np.ndarray) else (
+        masks.numpy() if isinstance(masks, torch.Tensor) else np.array(masks)
+    )
 
     # -------------------------------------------------------------------------
     # GVT v2: Reconstruction loss (same as train_gvt_emb_3dloss.py)
@@ -206,18 +207,17 @@ def train_3d_sample_from_embedding_gvt_tsdf(
             )
 
         # Phase 1: collect prompted memory features per label (no_grad)
-        # Use the base predictor to get maskmem_features after prompting cut slice
+        # Use per-label cut slice as init frame — guaranteed to contain the label.
         phase1_mem_features: Dict[int, Optional[torch.Tensor]] = {}
         with torch.no_grad():
             for label in active_labels:
-                cut_mask = masks[cut_idx]
-                label_arr = cut_mask if isinstance(cut_mask, np.ndarray) else (
-                    cut_mask.numpy() if isinstance(cut_mask, torch.Tensor) else np.array(cut_mask)
-                )
-                if not (label_arr == label).any():
+                fg_counts_p1 = (masks_np == label).sum(axis=(1, 2))
+                if fg_counts_p1.max() == 0:
                     phase1_mem_features[label] = None
                     continue
+                init_slice = int(np.argmax(fg_counts_p1))
 
+                label_arr = masks_np[init_slice]
                 binary = (label_arr == label).astype(np.float32)
 
                 # Build bounding box from GT
@@ -234,14 +234,14 @@ def train_3d_sample_from_embedding_gvt_tsdf(
                 box_t = torch.from_numpy(box).to(device).unsqueeze(0).unsqueeze(0)  # (1, 1, 4)
 
                 try:
-                    cut_embed = image_embeds[cut_idx:cut_idx+1]
-                    if isinstance(cut_embed, np.ndarray):
-                        cut_embed_t = torch.from_numpy(cut_embed).to(device)
+                    embed = image_embeds[init_slice:init_slice+1]
+                    if isinstance(embed, np.ndarray):
+                        embed_t = torch.from_numpy(embed).to(device)
                     else:
-                        cut_embed_t = cut_embed.to(device)
+                        embed_t = embed.to(device)
 
-                    hr0 = high_res_feat_0s[cut_idx:cut_idx+1]
-                    hr1 = high_res_feat_1s[cut_idx:cut_idx+1]
+                    hr0 = high_res_feat_0s[init_slice:init_slice+1]
+                    hr1 = high_res_feat_1s[init_slice:init_slice+1]
                     if isinstance(hr0, np.ndarray):
                         hr0 = torch.from_numpy(hr0).to(device)
                         hr1 = torch.from_numpy(hr1).to(device)
@@ -259,7 +259,7 @@ def train_3d_sample_from_embedding_gvt_tsdf(
 
                         # Decode mask; capture object_score_logits for _encode_new_memory
                         low_res_masks, _, _, object_score_logits = predictor.sam_mask_decoder(
-                            image_embeddings=cut_embed_t,
+                            image_embeddings=embed_t,
                             image_pe=predictor.sam_prompt_encoder.get_dense_pe(),
                             sparse_prompt_embeddings=sparse_embeddings,
                             dense_prompt_embeddings=dense_embeddings,
@@ -268,14 +268,28 @@ def train_3d_sample_from_embedding_gvt_tsdf(
                             high_res_features=[hr0, hr1],
                         )
 
+                        # _encode_new_memory feeds masks through MaskDownSampler
+                        # (total_stride=16, strided convolutions). It expects input at
+                        # image_size × image_size (e.g. 1024×1024) so it downsamples to
+                        # 64×64 matching pix_feat. Passing low_res_masks (256×256) would
+                        # downsample to 16×16, causing a shape mismatch with pix_feat.
+                        # Replicate _forward_sam_heads: upsample to image_size first.
+                        image_size = predictor.image_size
+                        high_res_masks = F.interpolate(
+                            low_res_masks.float(),
+                            size=(image_size, image_size),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+
                         # Encode prediction into memory features
                         # current_vision_feats: list of (HW, B, C) tensors per scale
-                        feat_hw = cut_embed_t.shape[2], cut_embed_t.shape[3]
-                        current_vision_feats = [cut_embed_t.flatten(2).permute(2, 0, 1)]
+                        feat_hw = embed_t.shape[2], embed_t.shape[3]
+                        current_vision_feats = [embed_t.flatten(2).permute(2, 0, 1)]
                         maskmem_features, _ = predictor._encode_new_memory(
                             current_vision_feats=current_vision_feats,
                             feat_sizes=[feat_hw],
-                            pred_masks_high_res=low_res_masks,
+                            pred_masks_high_res=high_res_masks,
                             object_score_logits=object_score_logits,
                             is_mask_from_pts=False,
                         )
@@ -286,7 +300,8 @@ def train_3d_sample_from_embedding_gvt_tsdf(
 
                 except Exception as e:
                     import traceback
-                    print(f"[Phase1] label={label} failed: {e}\n{traceback.format_exc()}")
+                    print(f"[Phase1] label={label} init_slice={init_slice} failed: {e}\n"
+                          f"{traceback.format_exc()}")
                     phase1_mem_features[label] = None
 
         # Phase 2: compute TSDF losses per label
@@ -350,21 +365,24 @@ def train_3d_sample_from_embedding_gvt_tsdf(
     all_vol_losses = []
 
     for label in active_labels:
-        cut_mask = masks[cut_idx]
-        label_arr = cut_mask if isinstance(cut_mask, np.ndarray) else (
-            cut_mask.numpy() if isinstance(cut_mask, torch.Tensor) else np.array(cut_mask)
-        )
-        if not (label_arr == label).any():
+        # Per-label cut slice: slice with the most foreground for this label
+        fg_counts_L = (masks_np == label).sum(axis=(1, 2))
+        if fg_counts_L.max() == 0:
             continue
+        cut_idx_L = int(np.argmax(fg_counts_L))
+        v1_L = list(range(cut_idx_L, -1, -1))
+        v2_L = [cut_idx_L] + list(range(cut_idx_L + 1, N_total))
+        v1_L_train = subsample_slices(v1_L, max_slices)
+        v2_L_train = subsample_slices(v2_L, max_slices)
 
-        if len(v1_slices_train) > 0:
+        if len(v1_L_train) > 0:
             loss1, n1, vol_loss1 = process_video_with_memory_3dloss(
                 model=base_model,
                 image_embeds=image_embeds,
                 high_res_feat_0s=high_res_feat_0s,
                 high_res_feat_1s=high_res_feat_1s,
                 masks=masks,
-                slice_indices=v1_slices_train,
+                slice_indices=v1_L_train,
                 label=label,
                 ori_h=ori_h,
                 ori_w=ori_w,
@@ -378,8 +396,8 @@ def train_3d_sample_from_embedding_gvt_tsdf(
                 all_losses.append(loss1)
                 all_vol_losses.append(vol_loss1.detach())
 
-        if len(v2_slices_train) > 1:
-            v2_remaining = v2_slices_train[1:]
+        if len(v2_L_train) > 1:
+            v2_remaining = v2_L_train[1:]
             loss2, n2, vol_loss2 = process_video_with_memory_3dloss(
                 model=base_model,
                 image_embeds=image_embeds,

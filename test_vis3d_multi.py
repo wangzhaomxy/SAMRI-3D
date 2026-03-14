@@ -4,15 +4,15 @@
 """
 test_vis3d_multi.py
 
-3D SAM2 VideoPredictor evaluation (multi-object, simultaneous propagation).
-Processes ALL labels at once for each volume, which is faster and more accurate
-than the iterative single-object approach in test_vis3d.py.
+3D SAM2 VideoPredictor evaluation (per-label cut, semantic volume output).
+Processes each label with its own optimal cut slice and builds a semantic
+segmentation volume from the per-label binary predictions.
 
 Features:
-- Splits 3D volume into two "videos" around cut slice (largest foreground)
-- Adds prompts for ALL labels simultaneously (obj_id = label)
-- Propagates in video ONCE to get all objects together
-- Merges video1 + video2 back to 3D semantic prediction
+- Per-label cut slice: each label uses the slice with maximum foreground for
+  that label (no label is silently skipped due to a shared global cut)
+- One prompt + propagation per label; binary results layered into semantic volume
+- Pre-encodes all N slices once (O(N) encoding cost regardless of label count)
 - Computes per-label 3D DSC / HD / MSD metrics
 - Parallel data loading for improved throughput
 
@@ -51,7 +51,7 @@ Features:
     sam2.1_hiera_b+.yaml    sam2.1_hiera_base_plus.pt
     sam2.1_hiera_l.yaml     sam2.1_hiera_large.pt
 
-Examples:    
+Examples:
 python test_vis3d_multi.py \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
 --ckpt-path /scratch/user/s4670484/Model_save/samri2_gvt2_5x_3d_K32_rec32_AUX1/sam2_gvt3dloss_epoch_48.pth \
@@ -71,7 +71,7 @@ import shutil
 import inspect
 import argparse
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from glob import glob
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Callable, Any, Union, Generator
@@ -98,7 +98,7 @@ from sam2.build_sam import build_sam2_video_predictor
 _GVT_AVAILABLE = False
 try:
     from gvt.gvt_integration import wrap_model_with_gvt, has_gvt, load_gvt_checkpoint
-    from gvt.gvt_inference import precompute_gvt_for_state, clear_gvt_for_predictor
+    from gvt.gvt_inference import compute_gvt_from_cached_features, clear_gvt_for_predictor
     _GVT_AVAILABLE = True
 except ImportError:
     pass
@@ -109,7 +109,7 @@ import contextlib
 @contextlib.contextmanager
 def suppress_sam2_output(enabled: bool = True):
     """
-    Suppress stdout/stderr (SAM2 prints + internal tqdm bars) inside the context.
+    Suppress stdout/stderr (SAM2 prints + tqdm bars) inside the context.
     Keeps dataset-level tqdm clean.
     """
     if not enabled:
@@ -205,6 +205,7 @@ def try_find_gt_same_folder(img_path: Path) -> Optional[Path]:
     if gt_path.exists():
         return gt_path
 
+    # Match by base (handle .nii.gz)
     if gt_name.lower().endswith(".nii.gz"):
         base = gt_name[:-7]
     else:
@@ -273,13 +274,6 @@ def choose_primary_axis(shape: Tuple[int, int, int]) -> int:
     return ax[0] if ax else 0
 
 
-def largest_mask_slice_index(mask: np.ndarray, axis: int, label: Optional[int] = None) -> int:
-    moved = np.moveaxis(mask, axis, 0)  # [S, ...]
-    fg = (moved == label) if (label is not None) else (moved > 0)
-    sums = fg.sum(axis=tuple(range(1, moved.ndim)))
-    return int(np.argmax(sums))
-
-
 def build_two_videos_indices(N: int, n: int) -> Tuple[List[int], List[int]]:
     v1 = list(range(n, -1, -1))
     v2 = [n] + list(range(n + 1, N))
@@ -304,14 +298,18 @@ def normalize_to_uint8(slice2d: np.ndarray) -> np.ndarray:
 
 
 def make_pil_loader_from_volume(
-    vol_shw: np.ndarray,
-    slice_indices: List[int],
+    vol_shw: np.ndarray,        # [S,H,W]
+    slice_indices: List[int],   # maps frame_idx -> slice_idx
 ) -> Tuple[Callable[[int], Image.Image], int]:
-    def loader_func(frame_idx: int) -> Image.Image:
-        z = slice_indices[frame_idx]
+    # Pre-compute all PIL frames so the loader is a simple lookup
+    frames: List[Image.Image] = []
+    for z in slice_indices:
         s2d = normalize_to_uint8(vol_shw[z])
         rgb = np.stack([s2d, s2d, s2d], axis=-1)
-        return Image.fromarray(rgb)
+        frames.append(Image.fromarray(rgb))
+
+    def loader_func(frame_idx: int) -> Image.Image:
+        return frames[frame_idx]
 
     return loader_func, len(slice_indices)
 
@@ -364,6 +362,8 @@ def init_state_compat(predictor, video_source: Any, num_frames: int, prefer_stre
 class PreparedVideos:
     """
     Prepared per-case video sources for video1 and video2.
+    - If streaming works: sources are callables (no disk IO).
+    - Else: sources are directories with jpgs (written once and reused).
     """
     def __init__(
         self,
@@ -390,19 +390,29 @@ class PreparedVideos:
             shutil.rmtree(self.tmp_base, ignore_errors=True)
 
 
+# Cached across cases: None = untested, True/False = result from first probe
+_streaming_works: Optional[bool] = None
+
+
 def prepare_videos_once(
     predictor,
-    vol0: np.ndarray,
+    vol0: np.ndarray,            # [S,H,W]
     v1_slices: List[int],
     v2_slices: List[int],
 ) -> PreparedVideos:
+    """
+    Prepare video sources ONCE per case:
+    - Try streaming callables first (probe only on the very first case;
+      result is cached for the rest of the run)
+    - If SAM2 rejects callables, write both videos to jpg dirs and reuse
+    """
+    global _streaming_works
+
     loader1, num1 = make_pil_loader_from_volume(vol0, v1_slices)
     loader2, num2 = make_pil_loader_from_volume(vol0, v2_slices)
 
-    # streaming sanity check
-    try:
-        with suppress_sam2_output(True):
-            _ = init_state_compat(predictor, loader1, num1, prefer_streaming=True)
+    # Fast path: streaming decision already cached from a previous case
+    if _streaming_works is True:
         return PreparedVideos(
             v1_source=loader1,
             v2_source=loader2,
@@ -413,27 +423,47 @@ def prepare_videos_once(
             tmp_base=None,
             use_streaming=True,
         )
-    except Exception:
-        fast_tmp = get_fast_tmp_root()
-        tmp_base = tempfile.mkdtemp(prefix="sam2_3d_case_", dir=fast_tmp)
-        v1_dir = os.path.join(tmp_base, "video1")
-        v2_dir = os.path.join(tmp_base, "video2")
-        write_video_frames_to_dir(vol0, v1_slices, v1_dir)
-        write_video_frames_to_dir(vol0, v2_slices, v2_dir)
-        return PreparedVideos(
-            v1_source=v1_dir,
-            v2_source=v2_dir,
-            v1_len=num1,
-            v2_len=num2,
-            v1_slices=v1_slices,
-            v2_slices=v2_slices,
-            tmp_base=tmp_base,
-            use_streaming=False,
-        )
+
+    if _streaming_works is None:
+        # First case only: probe streaming with one init_state call
+        try:
+            with suppress_sam2_output(True):
+                _ = init_state_compat(predictor, loader1, num1, prefer_streaming=True)
+            _streaming_works = True
+            return PreparedVideos(
+                v1_source=loader1,
+                v2_source=loader2,
+                v1_len=num1,
+                v2_len=num2,
+                v1_slices=v1_slices,
+                v2_slices=v2_slices,
+                tmp_base=None,
+                use_streaming=True,
+            )
+        except Exception:
+            _streaming_works = False
+
+    # _streaming_works is False: fallback to jpg dirs
+    fast_tmp = get_fast_tmp_root()
+    tmp_base = tempfile.mkdtemp(prefix="sam2_3d_case_", dir=fast_tmp)
+    v1_dir = os.path.join(tmp_base, "video1")
+    v2_dir = os.path.join(tmp_base, "video2")
+    write_video_frames_to_dir(vol0, v1_slices, v1_dir)
+    write_video_frames_to_dir(vol0, v2_slices, v2_dir)
+    return PreparedVideos(
+        v1_source=v1_dir,
+        v2_source=v2_dir,
+        v1_len=num1,
+        v2_len=num2,
+        v1_slices=v1_slices,
+        v2_slices=v2_slices,
+        tmp_base=tmp_base,
+        use_streaming=False,
+    )
 
 
 # ----------------------------
-# Prompts: multi-object
+# Prompts: single-object
 # ----------------------------
 def mask2d_to_bbox_xyxy(mask2d: np.ndarray) -> Optional[np.ndarray]:
     ys, xs = np.where(mask2d > 0)
@@ -455,191 +485,271 @@ def sample_positive_points(mask2d: np.ndarray, num_pos: int = 256) -> Tuple[np.n
     return pts, lbls
 
 
-def add_prompts_for_all_labels(
+def add_prompt_single_label(
     predictor,
     inference_state,
     prompt_mode: str,
     gt_cut_slice: np.ndarray,   # [H,W] label ids
-    labels: List[int],
+    label: int,
     ann_frame_idx: int = 0,
-) -> List[int]:
+) -> bool:
     """
-    Adds one SAM2 object per label with obj_id=label.
-    Returns labels actually added (present on cut slice).
+    Add prompt for exactly ONE label (obj_id=label).
+    Returns True if prompt added, False if label not present on cut slice.
     """
-    added: List[int] = []
-    for lb in labels:
-        obj_id = int(lb)
-        mask_lb = (gt_cut_slice == obj_id).astype(np.uint8)
-        if mask_lb.sum() == 0:
-            continue
+    lb = int(label)
+    mask_lb = (gt_cut_slice == lb).astype(np.uint8)
+    if mask_lb.sum() == 0:
+        return False
 
-        if prompt_mode == "box":
-            box = mask2d_to_bbox_xyxy(mask_lb)
-            if box is None:
-                continue
-            try:
-                predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=ann_frame_idx,
-                    obj_id=obj_id,
-                    box=box,
-                )
-            except TypeError:
-                predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=ann_frame_idx,
-                    obj_id=obj_id,
-                    points=None,
-                    labels=None,
-                    box=box,
-                )
-            added.append(obj_id)
+    if prompt_mode == "box":
+        box = mask2d_to_bbox_xyxy(mask_lb)
+        if box is None:
+            return False
+        try:
+            predictor.add_new_points_or_box(
+                inference_state=inference_state,
+                frame_idx=ann_frame_idx,
+                obj_id=lb,
+                box=box,
+            )
+        except TypeError:
+            predictor.add_new_points_or_box(
+                inference_state=inference_state,
+                frame_idx=ann_frame_idx,
+                obj_id=lb,
+                points=None,
+                labels=None,
+                box=box,
+            )
+        return True
 
-        elif prompt_mode == "mask":
-            if hasattr(predictor, "add_new_mask"):
-                predictor.add_new_mask(
-                    inference_state=inference_state,
-                    frame_idx=ann_frame_idx,
-                    obj_id=obj_id,
-                    mask=mask_lb,
-                )
-                added.append(obj_id)
-            else:
-                pts, lbls = sample_positive_points(mask_lb, num_pos=256)
-                if pts.shape[0] == 0:
-                    continue
-                predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=ann_frame_idx,
-                    obj_id=obj_id,
-                    points=pts,
-                    labels=lbls,
-                )
-                added.append(obj_id)
-        else:
-            raise ValueError(f"Unknown prompt_mode: {prompt_mode}")
+    if prompt_mode == "mask":
+        if hasattr(predictor, "add_new_mask"):
+            predictor.add_new_mask(
+                inference_state=inference_state,
+                frame_idx=ann_frame_idx,
+                obj_id=lb,
+                mask=mask_lb,
+            )
+            return True
+        pts, lbls = sample_positive_points(mask_lb, num_pos=256)
+        if pts.shape[0] == 0:
+            return False
+        predictor.add_new_points_or_box(
+            inference_state=inference_state,
+            frame_idx=ann_frame_idx,
+            obj_id=lb,
+            points=pts,
+            labels=lbls,
+        )
+        return True
 
-    return added
+    raise ValueError(f"Unknown prompt_mode: {prompt_mode}")
 
 
 # ----------------------------
-# SAM2 propagation (multi-object) + merge
+# SAM2 propagation (single-object) + merge
 # ----------------------------
 @torch.no_grad()
-def propagate_video_multiobj(
+def propagate_video_singleobj(
     predictor,
     inference_state,
-) -> Dict[int, Dict[int, np.ndarray]]:
+    obj_id: int,
+) -> Dict[int, np.ndarray]:
     """
-    Returns: frame_idx -> {obj_id -> mask2d_uint8}
+    Returns: frame_idx -> mask2d_uint8 for a single obj_id.
     """
-    out: Dict[int, Dict[int, np.ndarray]] = {}
+    out: Dict[int, np.ndarray] = {}
+    oid = int(obj_id)
+
     for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
         fi = int(out_frame_idx)
-        out[fi] = {}
-        for i, oid in enumerate(out_obj_ids):
-            oid_i = int(oid)
-            logits = out_mask_logits[i]
-            if hasattr(logits, "detach"):
-                logits = logits.detach()
-            m = (logits > 0.0)
-            if hasattr(m, "cpu"):
-                m = m.cpu().numpy()
-            out[fi][oid_i] = np.squeeze(m).astype(np.uint8)
+        # find index of this obj_id
+        idx = None
+        for j, o in enumerate(out_obj_ids):
+            if int(o) == oid:
+                idx = j
+                break
+        if idx is None:
+            continue
+        logits = out_mask_logits[idx]
+        if hasattr(logits, "detach"):
+            logits = logits.detach()
+        m = (logits > 0.0)
+        if hasattr(m, "cpu"):
+            m = m.cpu().numpy()
+        out[fi] = np.squeeze(m).astype(np.uint8)
+
     return out
 
 
-def merge_two_videos_to_semantic_volume(
+def merge_two_videos_single_label(
     N: int,
     H: int,
     W: int,
     v1_slices: List[int],
     v2_slices: List[int],
-    v1_pred: Dict[int, Dict[int, np.ndarray]],
-    v2_pred: Dict[int, Dict[int, np.ndarray]],
-    labels: List[int],
+    v1_pred: Dict[int, np.ndarray],
+    v2_pred: Dict[int, np.ndarray],
 ) -> np.ndarray:
     """
-    Merge predictions back to a semantic label volume [S,H,W] (int32), background=0.
-    Overlap resolution: later writes override earlier ones.
+    Merge into [S,H,W] uint8 binary mask for ONE label.
     """
-    pred = np.zeros((N, H, W), dtype=np.int32)
+    pred = np.zeros((N, H, W), dtype=np.uint8)
     written = set()
 
-    def write_slice(z: int, obj_to_mask: Dict[int, np.ndarray]):
-        for lb in labels:
-            oid = int(lb)
-            if oid not in obj_to_mask:
-                continue
-            pred[z][obj_to_mask[oid] > 0] = oid
-
-    for fidx, objm in v1_pred.items():
+    for fidx, m in v1_pred.items():
         z = v1_slices[fidx]
-        write_slice(z, objm)
+        pred[z] = (m > 0).astype(np.uint8)
         written.add(z)
 
-    for fidx, objm in v2_pred.items():
+    for fidx, m in v2_pred.items():
         z = v2_slices[fidx]
         if z in written:
             continue
-        write_slice(z, objm)
+        pred[z] = (m > 0).astype(np.uint8)
         written.add(z)
 
     return pred
 
 
-def predict_multi_object_semantic(
+@torch.no_grad()
+def precompute_slice_features(predictor, vol0: np.ndarray) -> Dict[int, Tuple]:
+    """Pre-encode all N slices once. Returns {slice_z: (image_tensor, backbone_out)}.
+
+    Uses a canonical forward sequence [0..N-1] so frame_idx == slice_z.
+    Per-label inference injects the relevant entries via inject_cached_features,
+    avoiding re-encoding across labels.  Encoding cost: N forward_image calls total.
+    """
+    if not hasattr(predictor, "forward_image"):
+        return {}
+    N = vol0.shape[0]
+    canonical_slices = list(range(N))
+    prepared = prepare_videos_once(predictor, vol0, canonical_slices, [0])
+    try:
+        with suppress_sam2_output(True):
+            state = init_state_compat(predictor, prepared.v1_source, N,
+                                      prefer_streaming=prepared.use_streaming)
+        device = state["device"]
+        slice_cache: Dict[int, Tuple] = {}
+        for i in range(N):
+            image = state["images"][i].to(device).float().unsqueeze(0)
+            backbone_out = predictor.forward_image(image)
+            slice_cache[i] = (image, backbone_out)  # keyed by slice_z (==frame_idx for canonical)
+    finally:
+        prepared.cleanup()
+    return slice_cache
+
+
+def inject_cached_features(state: Dict, v_slices: List[int],
+                            slice_cache: Dict[int, Tuple]) -> None:
+    """Inject pre-encoded features into state for the given slice ordering.
+
+    Maps frame_idx → slice_cache[v_slices[frame_idx]] so SAM2 finds every
+    frame in cached_features and never calls forward_image during propagation.
+    """
+    cache = {}
+    for frame_idx, slice_z in enumerate(v_slices):
+        if slice_z in slice_cache:
+            cache[frame_idx] = slice_cache[slice_z]
+    state["cached_features"] = cache
+
+
+def predict_per_label_semantic(
     predictor,
-    prepared: PreparedVideos,
-    gt_cut_slice: np.ndarray,
+    vol0: np.ndarray,            # [S,H,W]
+    gt0: np.ndarray,             # [S,H,W]
+    slice_cache: Dict[int, Tuple],
     prompt_mode: str,
     labels: List[int],
 ) -> Tuple[Optional[np.ndarray], List[int]]:
     """
-    Multi-object inference once per video; returns:
-      pred0_semantic: [S,H,W] int32 (axis-0 orientation)
-      added_labels: labels that were actually prompted (present in cut slice)
+    Per-label cut slice inference building a semantic volume.
 
-    If the predictor has GVT enabled, GVT tokens are pre-computed after
-    init_state and injected into memory attention during propagation.
+    Each label uses its own cut slice (slice with maximum foreground for that
+    label).  Pre-encoded features are injected so forward_image is not called
+    again after precompute_slice_features.
+
+    Returns:
+      pred0_semantic: [S,H,W] int32 semantic volume (axis-0 orientation)
+      added_labels: labels successfully segmented
     """
+    N, H, W = vol0.shape
     use_gvt = _GVT_AVAILABLE and has_gvt(predictor)
+    pred0_semantic = np.zeros((N, H, W), dtype=np.int32)
+    added_labels: List[int] = []
 
-    # video1
     with suppress_sam2_output(True):
-        st1 = init_state_compat(predictor, prepared.v1_source, prepared.v1_len, prefer_streaming=prepared.use_streaming)
-        if use_gvt:
-            precompute_gvt_for_state(predictor, st1)
-        added = add_prompts_for_all_labels(predictor, st1, prompt_mode, gt_cut_slice, labels, ann_frame_idx=0)
-        if not added:
-            if use_gvt:
-                clear_gvt_for_predictor(predictor)
-            return None, []
-        pred1 = propagate_video_multiobj(predictor, st1)
+        for lb in labels:
+            lb = int(lb)
+            fg = (gt0 == lb).sum(axis=(1, 2))
+            if fg.max() == 0:
+                continue
+            cut_L = int(np.argmax(fg))
+            v1_L, v2_L = build_two_videos_indices(N, cut_L)
+            gt_cut_L = gt0[cut_L]
 
-    # video2
-    with suppress_sam2_output(True):
-        st2 = init_state_compat(predictor, prepared.v2_source, prepared.v2_len, prefer_streaming=prepared.use_streaming)
-        if use_gvt:
-            precompute_gvt_for_state(predictor, st2)
-        _ = add_prompts_for_all_labels(predictor, st2, prompt_mode, gt_cut_slice, added, ann_frame_idx=0)
-        pred2 = propagate_video_multiobj(predictor, st2)
+            prepared_L = prepare_videos_once(predictor, vol0, v1_L, v2_L)
+            try:
+                # --- video 1 ---
+                st1 = init_state_compat(predictor, prepared_L.v1_source,
+                                        prepared_L.v1_len,
+                                        prefer_streaming=prepared_L.use_streaming)
+                if slice_cache:
+                    inject_cached_features(st1, v1_L, slice_cache)
+                if use_gvt:
+                    compute_gvt_from_cached_features(predictor, st1)
+
+                ok1 = add_prompt_single_label(predictor, st1, prompt_mode,
+                                              gt_cut_L, lb, ann_frame_idx=0)
+                if ok1:
+                    pred1 = propagate_video_singleobj(predictor, st1, obj_id=lb)
+                else:
+                    pred1 = {}
+                predictor.reset_state(st1)
+
+                if not ok1:
+                    continue
+
+                # --- video 2 ---
+                st2 = init_state_compat(predictor, prepared_L.v2_source,
+                                        prepared_L.v2_len,
+                                        prefer_streaming=prepared_L.use_streaming)
+                if slice_cache:
+                    inject_cached_features(st2, v2_L, slice_cache)
+                if use_gvt:
+                    compute_gvt_from_cached_features(predictor, st2)
+
+                ok2 = add_prompt_single_label(predictor, st2, prompt_mode,
+                                              gt_cut_L, lb, ann_frame_idx=0)
+                if ok2:
+                    pred2 = propagate_video_singleobj(predictor, st2, obj_id=lb)
+                else:
+                    pred2 = {}
+                predictor.reset_state(st2)
+
+                if not ok2:
+                    continue
+
+                # Merge binary and layer into semantic volume
+                binary_vol = merge_two_videos_single_label(
+                    N=N, H=H, W=W,
+                    v1_slices=v1_L, v2_slices=v2_L,
+                    v1_pred=pred1, v2_pred=pred2,
+                )
+                pred0_semantic[binary_vol > 0] = lb
+                added_labels.append(lb)
+
+            finally:
+                prepared_L.cleanup()
 
     if use_gvt:
         clear_gvt_for_predictor(predictor)
 
-    N = len(prepared.v1_slices) + (len(prepared.v2_slices) - 1)
-    H, W = gt_cut_slice.shape
-    pred0 = merge_two_videos_to_semantic_volume(
-        N=N, H=H, W=W,
-        v1_slices=prepared.v1_slices,
-        v2_slices=prepared.v2_slices,
-        v1_pred=pred1,
-        v2_pred=pred2,
-        labels=added,
-    )
-    return pred0, added
+    if not added_labels:
+        return None, []
+    return pred0_semantic, added_labels
 
 
 # ----------------------------
@@ -832,67 +942,63 @@ def save_test_record_3d_multi_object(
                 labels = case_data["labels"]
                 spacing_zyx = case_data["spacing_zyx"]
 
-                # choose cut slice on shortest axis
+                # axis-0 view on shortest axis (no global cut — per-label cuts used below)
                 primary_axis = choose_primary_axis(img_zyx.shape)
-                cut_idx = largest_mask_slice_index(gt_zyx, primary_axis, label=None)
-
                 vol0 = np.moveaxis(img_zyx, primary_axis, 0)  # [S,H,W]
                 gt0 = np.moveaxis(gt_zyx, primary_axis, 0)
-                N, H, W = vol0.shape
-                n = int(cut_idx)
-                v1_slices, v2_slices = build_two_videos_indices(N, n)
-                gt_cut = gt0[n]  # [H,W]
-
-                prepared = prepare_videos_once(predictor, vol0, v1_slices, v2_slices)
                 total_voxels = int(gt_zyx.size)
 
-                try:
-                    pred0_sem, added = predict_multi_object_semantic(
-                        predictor=predictor,
-                        prepared=prepared,
-                        gt_cut_slice=gt_cut,
-                        prompt_mode=prompt_mode,
-                        labels=labels,
-                    )
-                    if pred0_sem is None or not added:
-                        # no promptable labels on cut slice => treat as empty-like
-                        skipped_empty += 1
+                # Pre-encode all slices once (O(N) encoding, reused across labels)
+                slice_cache = precompute_slice_features(predictor, vol0)
+
+                # Per-label cut inference: each label uses its own optimal cut slice
+                pred0_sem, added = predict_per_label_semantic(
+                    predictor=predictor,
+                    vol0=vol0,
+                    gt0=gt0,
+                    slice_cache=slice_cache,
+                    prompt_mode=prompt_mode,
+                    labels=labels,
+                )
+                if pred0_sem is None or not added:
+                    skipped_empty += 1
+                    continue
+
+                # restore to zyx
+                pred_zyx_sem = np.moveaxis(pred0_sem, 0, primary_axis)  # [Z,Y,X]
+
+                # record per label
+                for lb in labels:
+                    if lb not in added:
+                        skipped_unpromptable_labels += 1
                         continue
 
-                    # restore to zyx
-                    pred_zyx_sem = np.moveaxis(pred0_sem, 0, primary_axis)  # [Z,Y,X]
+                    gt_lb = (gt_zyx == lb).astype(np.uint8)
+                    pr_lb = (pred_zyx_sem == lb).astype(np.uint8)
 
-                    # record per label
-                    for lb in labels:
-                        if lb not in added:
-                            skipped_unpromptable_labels += 1
-                            continue
+                    dsc = dice_3d(pr_lb, gt_lb)
+                    hd, msd = hd_msd_3d_sitk(pr_lb, gt_lb, spacing_zyx=spacing_zyx)
 
-                        gt_lb = (gt_zyx == lb).astype(np.uint8)
-                        pr_lb = (pred_zyx_sem == lb).astype(np.uint8)
+                    vc = int(gt_lb.sum())
+                    vp = vc / float(total_voxels)
 
-                        dsc = dice_3d(pr_lb, gt_lb)
-                        hd, msd = hd_msd_3d_sitk(pr_lb, gt_lb, spacing_zyx=spacing_zyx)
+                    # Per-label cut index for logging
+                    fg_lb = (gt0 == int(lb)).sum(axis=(1, 2))
+                    cut_idx_lb = int(np.argmax(fg_lb)) if fg_lb.max() > 0 else -1
 
-                        vc = int(gt_lb.sum())
-                        vp = vc / float(total_voxels)
-
-                        ds_rows.append({
-                            "img_name": img_path,
-                            "mask_name": gt_path,
-                            "label": int(lb),
-                            "voxel_count": vc,
-                            "voxel_percentage": vp,
-                            "dice": float(dsc),
-                            "hd": float(hd),
-                            "msd": float(msd),
-                            "cut_axis": int(primary_axis),
-                            "cut_idx": int(cut_idx),
-                        })
-                        kept_labels += 1
-
-                finally:
-                    prepared.cleanup()
+                    ds_rows.append({
+                        "img_name": img_path,
+                        "mask_name": gt_path,
+                        "label": int(lb),
+                        "voxel_count": vc,
+                        "voxel_percentage": vp,
+                        "dice": float(dsc),
+                        "hd": float(hd),
+                        "msd": float(msd),
+                        "cut_axis": int(primary_axis),
+                        "cut_idx": cut_idx_lb,
+                    })
+                    kept_labels += 1
 
             except Exception:
                 skipped_errors += 1
@@ -961,20 +1067,15 @@ def main():
             num_layers = gvt_cfg["num_layers"]
             num_heads = gvt_cfg["num_heads"]
         else:
-            # Fallback: infer from state dict keys
             sd = ckpt_data.get("model", ckpt_data)
             q_key = "memory_attention.gvt_module.global_queries"
-            if q_key in sd:
-                num_tokens = sd[q_key].shape[0]
-            else:
-                num_tokens = 16
+            num_tokens = sd[q_key].shape[0] if q_key in sd else 16
             layer_indices = set()
             for k in sd:
                 if "gvt_module.cross_attn.layers." in k:
-                    parts = k.split("gvt_module.cross_attn.layers.")[1]
-                    layer_indices.add(int(parts.split(".")[0]))
+                    layer_indices.add(int(k.split("gvt_module.cross_attn.layers.")[1].split(".")[0]))
             num_layers = max(layer_indices) + 1 if layer_indices else 2
-            num_heads = 4  # not recoverable from weights alone
+            num_heads = 4
         del ckpt_data
 
         print(f"  GVT config: {num_tokens} tokens, {num_layers} layers, {num_heads} heads")

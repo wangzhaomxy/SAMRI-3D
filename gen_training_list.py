@@ -255,7 +255,7 @@ def evaluate_2d_training_samples(
 
 
 # =============================================================================
-# 3D Evaluation Functions (adapted from test_vis3d.py)
+# 3D Evaluation Functions (adapted from test_vis3d_multi.py)
 # =============================================================================
 
 SUPPORTED_EXTS = {".nii", ".mhd", ".mha", ".nrrd", ".dcm", ".gz"}
