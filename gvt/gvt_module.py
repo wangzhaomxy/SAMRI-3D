@@ -17,6 +17,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class GVTModule(nn.Module):
@@ -175,3 +176,113 @@ class GVTReconDecoder(nn.Module):
         decoded = self.decoder(queries, memory)                          # (1, N, C_mem)
         masks = self.mask_head(decoded.float())                          # (1, N, recon_res^2)
         return masks.view(1, num_slices, 1, self.recon_res, self.recon_res)
+
+
+class TSDFDecoder(nn.Module):
+    """
+    Per-slice TSDF decoder: GVT tokens → 256×256 TSDF prediction.
+    Training-only auxiliary decoder (discarded at inference).
+
+    Architecture:
+        1. Add learned slice positional embedding to GVT tokens
+        2. Cross-attention: Q=GVT tokens, K/V=prompted slice memory features (label condition)
+        3. Linear projection: flatten K tokens → single feature vector
+        4. Reshape to spatial seed (seed_channels × 4 × 4)
+        5. ConvTranspose2d upsampling: 4→8→16→32→64→128→256 (6 stages)
+        6. Final 1×1 conv → single-channel TSDF (linear activation, NO sigmoid)
+
+    Parameter count: ~100-150K.
+    """
+
+    def __init__(self,
+                 num_tokens: int = 16,
+                 token_dim: int = 64,
+                 max_slices: int = 256,
+                 seed_channels: int = 64,
+                 seed_size: int = 4,
+                 mem_feature_dim: int = None):  # if None, assume same as token_dim
+        super().__init__()
+
+        self.num_tokens = num_tokens
+        self.token_dim = token_dim
+        self.seed_channels = seed_channels
+        self.seed_size = seed_size
+
+        # Project memory features to token_dim if they differ
+        actual_mem_dim = mem_feature_dim if mem_feature_dim is not None else token_dim
+        self.mem_proj = nn.Linear(actual_mem_dim, token_dim) if actual_mem_dim != token_dim else nn.Identity()
+
+        # Learned slice positional embedding
+        self.slice_pos_embed = nn.Embedding(max_slices, token_dim)
+
+        # Cross-attention: GVT tokens (Q) attend to prompted memory features (K/V)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=token_dim,
+            num_heads=4,
+            batch_first=True
+        )
+        self.cross_attn_norm = nn.LayerNorm(token_dim)
+
+        # Linear projection: K tokens → spatial seed
+        self.token_proj = nn.Linear(num_tokens * token_dim, seed_channels * seed_size * seed_size)
+
+        # Convolutional upsampling: 4×4 → 256×256 (6 stages, each ×2)
+        channels = [seed_channels, 64, 64, 32, 32, 16, 8]
+        self.upsample = nn.ModuleList()
+        for i in range(6):
+            self.upsample.append(nn.Sequential(
+                nn.ConvTranspose2d(channels[i], channels[i+1],
+                                   kernel_size=4, stride=2, padding=1),
+                nn.GroupNorm(min(8, channels[i+1]), channels[i+1]),
+                nn.GELU()
+            ))
+
+        # Final 1×1 conv → single channel TSDF (linear activation, no sigmoid)
+        self.head = nn.Conv2d(channels[-1], 1, kernel_size=1)
+
+    def forward(self,
+                gvt_tokens: torch.Tensor,       # (B, K, C_mem)
+                mem_features: torch.Tensor,      # (B, M, C_mem_actual)
+                slice_indices: torch.Tensor      # (S,) integer tensor
+               ) -> torch.Tensor:
+        """
+        Predict TSDF for given slices.
+
+        Returns:
+            tsdf_pred: (B, S, 256, 256)
+        """
+        B, K, C = gvt_tokens.shape
+        S = slice_indices.shape[0]
+
+        # Project memory features if needed
+        mem_proj = self.mem_proj(mem_features)  # (B, M, token_dim)
+
+        predictions = []
+        for s_idx in range(S):
+            # 1. Add slice positional embedding
+            slice_pe = self.slice_pos_embed(slice_indices[s_idx:s_idx+1])  # (1, C)
+            tokens_s = gvt_tokens + slice_pe.unsqueeze(0)  # (B, K, C)
+
+            # 2. Cross-attention with label-conditioned memory features
+            attn_out, _ = self.cross_attn(
+                query=tokens_s,
+                key=mem_proj,
+                value=mem_proj
+            )
+            tokens_s = self.cross_attn_norm(tokens_s + attn_out)  # (B, K, C)
+
+            # 3. Flatten tokens → linear → spatial seed
+            flat = tokens_s.reshape(B, K * C)
+            seed = self.token_proj(flat)  # (B, seed_channels * 4 * 4)
+            seed = seed.reshape(B, self.seed_channels, self.seed_size, self.seed_size)
+
+            # 4. Convolutional upsampling
+            x = seed
+            for layer in self.upsample:
+                x = layer(x)
+
+            # 5. Final 1×1 conv → single-channel TSDF
+            tsdf = self.head(x)  # (B, 1, 256, 256)
+            predictions.append(tsdf.squeeze(1))  # (B, 256, 256)
+
+        return torch.stack(predictions, dim=1)  # (B, S, 256, 256)
