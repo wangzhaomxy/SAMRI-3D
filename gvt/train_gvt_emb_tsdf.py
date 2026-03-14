@@ -31,6 +31,7 @@ Usage:
 import os
 import sys
 import csv
+import time
 import argparse
 from glob import glob
 from pathlib import Path
@@ -615,7 +616,7 @@ def train_epoch(
     avg_loss_recon = loss_recon_total / max(num_3d, 1)
     avg_loss_tsdf = loss_tsdf_total / max(num_3d, 1)
 
-    return avg_loss, avg_loss_2d, avg_loss_3d, avg_loss_vol, avg_loss_recon, avg_loss_tsdf
+    return avg_loss, avg_loss_2d, avg_loss_3d, avg_loss_vol, avg_loss_recon, avg_loss_tsdf, num_2d, num_3d
 
 
 # =============================================================================
@@ -930,7 +931,8 @@ def main(rank, world_size, args):
         if not csv_exists:
             csv_writer.writerow([
                 "epoch", "train_loss", "loss_2d", "loss_3d",
-                "loss_vol", "loss_recon", "loss_tsdf"
+                "loss_vol", "loss_recon", "loss_tsdf",
+                "num_2d_samples", "num_3d_samples",
             ])
         csv_file.flush()
 
@@ -947,8 +949,10 @@ def main(rank, world_size, args):
 
         mixed_dataset.reshuffle(epoch)
 
+        epoch_t0 = time.time()
         (avg_loss, avg_loss_2d, avg_loss_3d,
-         avg_loss_vol, avg_loss_recon, avg_loss_tsdf) = train_epoch(
+         avg_loss_vol, avg_loss_recon, avg_loss_tsdf,
+         num_2d_samples, num_3d_samples) = train_epoch(
             model=model,
             predictor=predictor,
             dataloader=train_loader,
@@ -962,17 +966,34 @@ def main(rank, world_size, args):
             tsdf_decoder=tsdf_decoder,
             epoch=epoch,
         )
+        epoch_elapsed = time.time() - epoch_t0
 
         if rank == 0:
-            recon_str = f", Recon={avg_loss_recon:.4f}" if recon_decoder is not None else ""
-            tsdf_str = f", TSDF={avg_loss_tsdf:.4f}" if tsdf_decoder is not None else ""
-            print(f"Epoch {epoch + 1}: Loss={avg_loss:.4f}, 2D={avg_loss_2d:.4f}, "
-                  f"3D={avg_loss_3d:.4f}, Vol={avg_loss_vol:.4f}{recon_str}{tsdf_str}")
-            if recon_decoder is not None:
-                current_lambda_aux = get_lambda_aux(epoch, args)
-                print(f"  λ_aux={current_lambda_aux:.4f}")
-            if tsdf_decoder is not None:
-                print(f"  λ_tsdf={args.lambda_tsdf:.4f}")
+            current_lr = optimizer.param_groups[0]["lr"]
+            recon_str = f"  Recon  : {avg_loss_recon:.6f}" if recon_decoder is not None else ""
+            tsdf_str  = f"  TSDF   : {avg_loss_tsdf:.6f}" if tsdf_decoder is not None else ""
+            lambda_aux_str = (f"  λ_aux  : {get_lambda_aux(epoch, args):.4f}"
+                              if recon_decoder is not None else "")
+            lambda_tsdf_str = (f"  λ_tsdf : {args.lambda_tsdf:.4f}"
+                               if tsdf_decoder is not None else "")
+            print(f"\n{'─'*60}")
+            print(f"  Epoch {epoch + 1}/{args.num_epochs} Summary"
+                  f"  [{epoch_elapsed:.1f}s]")
+            print(f"{'─'*60}")
+            print(f"  Total  : {avg_loss:.6f}  (avg over {len(train_loader)} batches)")
+            print(f"  2D seg : {avg_loss_2d:.6f}  ({num_2d_samples} 2D samples)")
+            print(f"  3D seg : {avg_loss_3d:.6f}  ({num_3d_samples} 3D samples)")
+            print(f"  Vol 3D : {avg_loss_vol:.6f}  (λ_3d={args.lambda_3d})")
+            if recon_str:
+                print(recon_str)
+            if tsdf_str:
+                print(tsdf_str)
+            if lambda_aux_str:
+                print(lambda_aux_str)
+            if lambda_tsdf_str:
+                print(lambda_tsdf_str)
+            print(f"  LR     : {current_lr:.2e}")
+            print(f"{'─'*60}")
 
             if csv_writer is not None:
                 csv_writer.writerow([
@@ -983,6 +1004,8 @@ def main(rank, world_size, args):
                     f"{avg_loss_vol:.6f}",
                     f"{avg_loss_recon:.6f}",
                     f"{avg_loss_tsdf:.6f}",
+                    num_2d_samples,
+                    num_3d_samples,
                 ])
                 csv_file.flush()
 

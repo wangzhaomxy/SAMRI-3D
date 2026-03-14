@@ -44,7 +44,7 @@ INITIAL_CKPT="/scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt"
 # Common Hyperparameters (shared across modes)
 # ============================================================================
 NUM_EPOCHS=50
-BATCH_SIZE=2
+BATCH_SIZE=1
 LR=5e-6
 GRAD_ACCUM=1
 MIX_RATIO_3D=0.8           # 80% 3D samples, 20% 2D samples
@@ -111,12 +111,48 @@ SEED=42
 # Training Execution
 # ============================================================================
 
+# Print common job and hardware info
+echo ""
+echo "############################################################"
+echo "#                  SAMRI2 Training Job                     #"
+echo "############################################################"
+echo "  Job ID       : ${SLURM_JOB_ID:-local}"
+echo "  Node         : $(hostname)"
+echo "  GPUs         : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | sort | uniq -c | tr '\n' ' ' || echo 'N/A')"
+echo "  CPU cores    : ${SLURM_CPUS_PER_TASK:-$(nproc)}"
+echo "  Memory       : ${SLURM_MEM_PER_NODE:-N/A} MB"
+echo "  Started      : $(date '+%Y-%m-%d %H:%M:%S')"
+echo "  Log output   : ${SLURM_STDOUT:-stdout}"
+echo "############################################################"
+echo ""
+echo "  Training mode    : ${TRAINING_MODE}"
+echo "  SAM2 config      : ${SAM2_CONFIG}"
+echo "  Initial ckpt     : ${INITIAL_CKPT}"
+echo ""
+echo "  --- Common Hyperparameters ---"
+echo "  Epochs           : ${NUM_EPOCHS}"
+echo "  Batch size       : ${BATCH_SIZE}"
+echo "  Learning rate    : ${LR}"
+echo "  Grad accum steps : ${GRAD_ACCUM}"
+echo "  Effective batch  : $((BATCH_SIZE * GRAD_ACCUM)) (batch × accum)"
+echo "  Mix ratio 3D     : ${MIX_RATIO_3D}  (3D fraction of batches)"
+echo "  Samples/dataset  : ${SAMPLES_PER_DATASET}  (volumes per dataset per epoch)"
+echo "  Max slices/video : ${MAX_SLICES_PER_VIDEO}"
+echo "  Save every       : ${SAVE_EVERY} epoch(s)"
+echo "  DataLoader wkrs  : ${NUM_WORKERS}"
+echo "  AMP              : enabled"
+echo "############################################################"
+echo ""
+
 if [ "$TRAINING_MODE" == "2d_emb" ]; then
-    echo "=========================================="
-    echo "SAMRI2: 2D Loss Training (from embeddings)"
-    echo "=========================================="
-    echo "Initial checkpoint: ${INITIAL_CKPT}"
-    echo "3D embeddings dir: ${EMBEDDING_DIR_3D}"
+    echo "  *** Mode: 2D Loss from Pre-computed Embeddings ***"
+    echo "  Script           : train_unified_emb.py"
+    echo "  Embeddings dir   : ${EMBEDDING_DIR_3D}"
+    echo "  Save path        : ${SAVE_PATH_2D_EMB}"
+    echo "  Loss             : 2D Dice-Focal (per-slice)"
+    echo "  Lambda 2D        : 1.0  (fixed)"
+    echo "############################################################"
+    echo ""
 
     python train_unified_emb.py \
         --sam2-config ${SAM2_CONFIG} \
@@ -135,12 +171,15 @@ if [ "$TRAINING_MODE" == "2d_emb" ]; then
         --save-every ${SAVE_EVERY}
 
 elif [ "$TRAINING_MODE" == "3d_emb" ]; then
-    echo "=========================================="
-    echo "SAMRI2: 2D + 3D Loss Training (from embeddings)"
-    echo "=========================================="
-    echo "Initial checkpoint: ${INITIAL_CKPT}"
-    echo "3D embeddings dir: ${EMBEDDING_DIR_3D}"
-    echo "Lambda 2D: ${LAMBDA_2D}, Lambda 3D: ${LAMBDA_3D}"
+    echo "  *** Mode: 2D + 3D Loss from Pre-computed Embeddings ***"
+    echo "  Script           : train_unified_emb_3dloss.py"
+    echo "  Embeddings dir   : ${EMBEDDING_DIR_3D}"
+    echo "  Save path        : ${SAVE_PATH_3D_EMB}"
+    echo "  Loss             : 2D Dice-Focal + 3D volumetric Dice"
+    echo "  Lambda 2D        : ${LAMBDA_2D}"
+    echo "  Lambda 3D        : ${LAMBDA_3D}"
+    echo "############################################################"
+    echo ""
 
     python train_unified_emb_3dloss.py \
         --sam2-config ${SAM2_CONFIG} \
@@ -161,11 +200,13 @@ elif [ "$TRAINING_MODE" == "3d_emb" ]; then
         --save-every ${SAVE_EVERY}
 
 elif [ "$TRAINING_MODE" == "2d_img" ]; then
-    echo "=========================================="
-    echo "SAMRI2: 2D Loss Training (from raw images)"
-    echo "=========================================="
-    echo "Initial checkpoint: ${INITIAL_CKPT}"
-    echo "Training list: ${TRAINING_LIST_3D}"
+    echo "  *** Mode: 2D Loss from Raw Images ***"
+    echo "  Script           : train_unified.py"
+    echo "  Training list    : ${TRAINING_LIST_3D}"
+    echo "  Save path        : ${SAVE_PATH_2D_IMG}"
+    echo "  Loss             : 2D Dice-Focal (per-slice, no pre-computed embeddings)"
+    echo "############################################################"
+    echo ""
 
     python train_unified.py \
         --sam2-config ${SAM2_CONFIG} \
@@ -184,23 +225,46 @@ elif [ "$TRAINING_MODE" == "2d_img" ]; then
         --save-every ${SAVE_EVERY}
 
 elif [ "$TRAINING_MODE" == "gvt_tsdf" ]; then
-    echo "=========================================="
-    echo "SAMRI2: GVT v3 TSDF Training (from embeddings)"
-    echo "=========================================="
-    echo "Initial checkpoint: ${INITIAL_CKPT}"
-    echo "3D embeddings dir: ${EMBEDDING_DIR_3D}"
-    echo "Seg loss:    lambda_2d=${LAMBDA_2D}  lambda_3d=${LAMBDA_3D}"
-    echo "GVT encoder: K=${GVT_NUM_TOKENS}  layers=${GVT_NUM_LAYERS}  heads=${GVT_NUM_HEADS}"
+    echo "  *** Mode: GVT v3 — 2D + 3D + Recon + TSDF Shape Prior ***"
+    echo "  Script           : gvt/train_gvt_emb_tsdf.py"
+    echo "  Embeddings dir   : ${EMBEDDING_DIR_3D}"
+    echo "  Save path        : ${SAVE_PATH_GVT_TSDF}"
+    echo ""
+    echo "  --- GVT Encoder ---"
+    echo "  Tokens (K)       : ${GVT_NUM_TOKENS}"
+    echo "  Layers           : ${GVT_NUM_LAYERS}"
+    echo "  Heads            : ${GVT_NUM_HEADS}"
+    echo ""
+    echo "  --- Segmentation Loss ---"
+    echo "  Lambda 2D        : ${LAMBDA_2D}  (Dice-Focal, per-slice)"
+    echo "  Lambda 3D        : ${LAMBDA_3D}  (volumetric Dice; 0 = disabled)"
+    echo "  Lambda Dice      : ${LAMBDA_DICE}  (Dice component of 2D loss)"
+    echo "  Lambda Focal     : ${LAMBDA_FOCAL}  (Focal component of 2D loss)"
+    echo ""
+    echo "  --- Auxiliary Losses ---"
     if [ "$GVT_RECON" == "true" ]; then
-        echo "Recon loss:  enabled  res=${GVT_RECON_RES}  lambda_aux=${LAMBDA_AUX}  warmup=${LAMBDA_AUX_WARMUP_EPOCHS}ep"
+        echo "  Recon loss       : ENABLED"
+        echo "  Recon res        : ${GVT_RECON_RES}x${GVT_RECON_RES}"
+        echo "  Lambda aux       : ${LAMBDA_AUX}  (warmup: ${LAMBDA_AUX_WARMUP} for first ${LAMBDA_AUX_WARMUP_EPOCHS} ep)"
     else
-        echo "Recon loss:  DISABLED"
+        echo "  Recon loss       : DISABLED"
     fi
     if [ "$USE_TSDF" == "true" ]; then
-        echo "TSDF loss:   enabled  tau=${TSDF_TAU}  alpha=${TSDF_ALPHA}  lambda_tsdf=${LAMBDA_TSDF}"
+        echo "  TSDF loss        : ENABLED"
+        echo "  TSDF tau         : ${TSDF_TAU}  (truncation threshold, pixels)"
+        echo "  TSDF alpha       : ${TSDF_ALPHA}  (boundary upweighting)"
+        echo "  Lambda TSDF      : ${LAMBDA_TSDF}"
     else
-        echo "TSDF loss:   DISABLED"
+        echo "  TSDF loss        : DISABLED"
     fi
+    echo ""
+    echo "  --- Sampling ---"
+    echo "  Max labels/sample: ${MAX_LABELS_PER_SAMPLE}  (labels per volume per step)"
+    echo "  Weight decay     : ${WEIGHT_DECAY}"
+    echo "  Max grad norm    : ${MAX_GRAD_NORM}"
+    echo "  Seed             : ${SEED}"
+    echo "############################################################"
+    echo ""
 
     python gvt/train_gvt_emb_tsdf.py \
         --sam2-config ${SAM2_CONFIG} \
@@ -245,6 +309,8 @@ else
     exit 1
 fi
 
-echo "=========================================="
-echo "Training completed!"
-echo "=========================================="
+echo ""
+echo "############################################################"
+echo "  Training completed : $(date '+%Y-%m-%d %H:%M:%S')"
+echo "  Mode               : ${TRAINING_MODE}"
+echo "############################################################"
