@@ -284,7 +284,9 @@ def train_3d_sample_from_embedding_gvt_tsdf(
                     mem_flat = maskmem_features.detach().flatten(2).permute(0, 2, 1)
                     phase1_mem_features[label] = mem_flat
 
-                except Exception:
+                except Exception as e:
+                    import traceback
+                    print(f"[Phase1] label={label} failed: {e}\n{traceback.format_exc()}")
                     phase1_mem_features[label] = None
 
         # Phase 2: compute TSDF losses per label
