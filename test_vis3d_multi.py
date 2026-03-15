@@ -638,6 +638,7 @@ def precompute_slice_features(predictor, vol0: np.ndarray) -> Dict[int, Tuple]:
             backbone_out = predictor.forward_image(image)
             slice_cache[i] = (image, backbone_out)  # keyed by slice_z (==frame_idx for canonical)
     finally:
+        predictor.reset_state(state)  # free leaked N-frame state; slice_cache holds independent refs
         prepared.cleanup()
     return slice_cache
 
@@ -741,6 +742,11 @@ def predict_per_label_semantic(
                 pred0_semantic[binary_vol > 0] = lb
                 added_labels.append(lb)
 
+            except Exception as e:
+                # Isolate per-label failures so a single label error does not
+                # drop the entire case (which would cause model-dependent sample
+                # counts since different models fail on different labels).
+                print(f"[WARN] label {lb} skipped due to error: {e}", file=sys.stderr)
             finally:
                 prepared_L.cleanup()
 
