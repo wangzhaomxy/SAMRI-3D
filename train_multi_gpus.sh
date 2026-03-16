@@ -36,7 +36,7 @@ export MASTER_PORT=$((26000 + RANDOM % 1000))  # Pick a port between 26000 ~ 269
 #   "gvt_v1"   - GVT v1: GVT encoder only (seg loss, no aux decoder)
 #   "gvt_v2"   - GVT v2: GVT encoder + GVTReconDecoder (label-conditioned recon loss)
 #   "gvt_v3"   - GVT v3: GVT encoder + GVTReconDecoder + TSDFDecoder (recon + TSDF)
-TRAINING_MODE="gvt_v3"  # Change this to switch between training modes
+TRAINING_MODE="gvt_v2"  # Change this to switch between training modes
 
 # Common paths
 SAM2_CONFIG="configs/sam2.1/sam2.1_hiera_s.yaml"
