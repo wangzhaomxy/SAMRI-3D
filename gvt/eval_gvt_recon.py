@@ -92,7 +92,12 @@ def load_model_and_decoder(args, device):
         max_slices=256,
         recon_res=args.gvt_recon_res,
     ).to(device)
-    recon_decoder.load_state_dict(sd["gvt_recon_decoder"])
+    missing, unexpected = recon_decoder.load_state_dict(sd["gvt_recon_decoder"], strict=False)
+    if missing:
+        print(f"[eval_gvt_recon] Missing keys in recon decoder (old checkpoint — "
+              f"label_cross_attn will be randomly initialized): {missing}")
+    if unexpected:
+        print(f"[eval_gvt_recon] Unexpected keys in recon decoder: {unexpected}")
     recon_decoder.eval()
 
     return model, recon_decoder
@@ -233,7 +238,10 @@ def main():
             # Run GVT encoder
             gvt_tokens, _ = wrapper.gvt_module(all_embeds)   # (K, 1, 64)
 
-            # Run reconstruction decoder
+            # Run reconstruction decoder (unconditioned — no per-label mem_features).
+            # For checkpoints trained with label conditioning (--gvt-recon + Phase 1),
+            # scores here will be lower than per-label conditioned evaluation since the
+            # decoder cross-attention is bypassed. This is a union-GT sanity check only.
             recon_logits = recon_decoder(gvt_tokens, num_slices=N_total)
             # (1, N, 1, recon_res, recon_res)
 

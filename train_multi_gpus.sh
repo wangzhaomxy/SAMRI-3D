@@ -33,8 +33,10 @@ export MASTER_PORT=$((26000 + RANDOM % 1000))  # Pick a port between 26000 ~ 269
 #   "2d_emb"   - 2D loss from pre-computed embeddings (train_unified_emb.py)
 #   "3d_emb"   - 2D + 3D loss from pre-computed embeddings (train_unified_emb_3dloss.py)
 #   "2d_img"   - 2D loss from raw images (train_unified.py)
-#   "gvt_tsdf" - GVT v3: 2D + 3D + recon + TSDF shape prior (gvt/train_gvt_emb_tsdf.py)
-TRAINING_MODE="gvt_tsdf" # Change this to switch between training modes
+#   "gvt_v1"   - GVT v1: GVT encoder only (seg loss, no aux decoder)
+#   "gvt_v2"   - GVT v2: GVT encoder + GVTReconDecoder (label-conditioned recon loss)
+#   "gvt_v3"   - GVT v3: GVT encoder + GVTReconDecoder + TSDFDecoder (recon + TSDF)
+TRAINING_MODE="gvt_v3"  # Change this to switch between training modes
 
 # Common paths
 SAM2_CONFIG="configs/sam2.1/sam2.1_hiera_s.yaml"
@@ -73,8 +75,10 @@ TRAINING_LIST_3D="/scratch/user/s4670484/training_lists/training_list_3d.pkl"
 SAVE_PATH_2D_IMG="/scratch/user/s4670484/Model_save/samri2_2d_img/"
 
 # ============================================================================
-# GVT v3 Configuration (gvt/train_gvt_emb_tsdf.py)
+# GVT Configuration (gvt/train_gvt_emb_tsdf.py) — used by gvt_v1/v2/v3
 # ============================================================================
+SAVE_PATH_GVT_V1="/scratch/user/s4670484/Model_save/samri2_gvt1_K16/"
+SAVE_PATH_GVT_V2="/scratch/user/s4670484/Model_save/samri2_gvt2_recon_K16_rec32/"
 SAVE_PATH_GVT_TSDF="/scratch/user/s4670484/Model_save/samri2_gvt3_tsdf_K16_rec32_AUX1/"
 
 # GVT encoder
@@ -106,6 +110,35 @@ MAX_LABELS_PER_SAMPLE=1     # Labels sampled per volume per epoch
 LAMBDA_DICE=1.0             # Dice component weight within 2D loss
 LAMBDA_FOCAL=1.0            # Focal component weight within 2D loss
 SEED=42
+
+# ============================================================================
+# GVT Version Normalization
+# Translate gvt_v1/v2/v3 aliases into gvt_tsdf mode with appropriate flag overrides.
+# This avoids duplicating the python invocation for each GVT variant.
+# ============================================================================
+GVT_VERSION_LABEL=""  # Human-readable label printed in job header
+
+if [ "$TRAINING_MODE" == "gvt_v1" ]; then
+    GVT_VERSION_LABEL="v1 (encoder only — seg loss, no aux decoder)"
+    GVT_RECON=false
+    USE_TSDF=false
+    SAVE_PATH_GVT_TSDF="${SAVE_PATH_GVT_V1}"
+    TRAINING_MODE="gvt_tsdf"
+
+elif [ "$TRAINING_MODE" == "gvt_v2" ]; then
+    GVT_VERSION_LABEL="v2 (encoder + GVTReconDecoder — label-conditioned recon loss)"
+    GVT_RECON=true
+    USE_TSDF=false
+    SAVE_PATH_GVT_TSDF="${SAVE_PATH_GVT_V2}"
+    TRAINING_MODE="gvt_tsdf"
+
+elif [ "$TRAINING_MODE" == "gvt_v3" ]; then
+    GVT_VERSION_LABEL="v3 (encoder + GVTReconDecoder + TSDFDecoder)"
+    GVT_RECON=true
+    USE_TSDF=true
+    # SAVE_PATH_GVT_TSDF already set above
+    TRAINING_MODE="gvt_tsdf"
+fi
 
 # ============================================================================
 # Training Execution
@@ -225,7 +258,7 @@ elif [ "$TRAINING_MODE" == "2d_img" ]; then
         --save-every ${SAVE_EVERY}
 
 elif [ "$TRAINING_MODE" == "gvt_tsdf" ]; then
-    echo "  *** Mode: GVT v3 — 2D + 3D + Recon + TSDF Shape Prior ***"
+    echo "  *** Mode: GVT ${GVT_VERSION_LABEL} ***"
     echo "  Script           : gvt/train_gvt_emb_tsdf.py"
     echo "  Embeddings dir   : ${EMBEDDING_DIR_3D}"
     echo "  Save path        : ${SAVE_PATH_GVT_TSDF}"
@@ -304,7 +337,7 @@ elif [ "$TRAINING_MODE" == "gvt_tsdf" ]; then
         --save-every ${SAVE_EVERY}
 
 else
-    echo "Error: TRAINING_MODE must be '2d_emb', '3d_emb', '2d_img', or 'gvt_tsdf'"
+    echo "Error: TRAINING_MODE must be one of: '2d_emb', '3d_emb', '2d_img', 'gvt_v1', 'gvt_v2', 'gvt_v3'"
     echo "Current value: ${TRAINING_MODE}"
     exit 1
 fi

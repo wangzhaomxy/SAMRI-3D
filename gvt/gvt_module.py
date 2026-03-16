@@ -17,7 +17,6 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class GVTModule(nn.Module):
@@ -129,8 +128,11 @@ class GVTReconDecoder(nn.Module):
 
     Architecture:
         Input:  gvt_tokens (K, 1, C_mem) from GVT encoder
+                mem_features (1, M, C_mem) label-conditioned memory from cut slice (optional)
+        Label conditioning (when mem_features provided):
+                Cross-attention: Q=GVT tokens, K/V=mem_features → conditioned GVT tokens
         Query:  sinusoidal slice PE (N, C_mem) — same PE as GVTModule
-        Decoder: 2-layer TransformerDecoder (N slice queries cross-attend to K tokens)
+        Decoder: 2-layer TransformerDecoder (N slice queries cross-attend to conditioned tokens)
         Head:   Linear → (N, recon_res * recon_res) → reshape to (1, N, 1, R, R)
     """
 
@@ -144,6 +146,12 @@ class GVTReconDecoder(nn.Module):
             GVTModule._build_sinusoidal_pe(max_slices, C_mem),
         )
 
+        # Label conditioning: GVT tokens (Q) attend to cut-slice memory features (K/V)
+        self.label_cross_attn = nn.MultiheadAttention(
+            embed_dim=C_mem, num_heads=4, batch_first=True
+        )
+        self.label_cross_attn_norm = nn.LayerNorm(C_mem)
+
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=C_mem, nhead=4, dim_feedforward=128, batch_first=True
         )
@@ -155,26 +163,40 @@ class GVTReconDecoder(nn.Module):
             nn.Linear(C_mem * 2, recon_res * recon_res),
         )
 
-    def forward(self, gvt_tokens: torch.Tensor, num_slices: int) -> torch.Tensor:
+    def forward(
+        self,
+        gvt_tokens: torch.Tensor,
+        num_slices: int,
+        mem_features: torch.Tensor = None,
+    ) -> torch.Tensor:
         """
         Args:
-            gvt_tokens: (K, 1, C_mem) — output of GVT encoder.
-            num_slices: int — N slices in this volume.
+            gvt_tokens:   (K, 1, C_mem) — output of GVT encoder.
+            num_slices:   int — N slices in this volume.
+            mem_features: (1, M, C_mem) — label-conditioned memory features from the
+                          cut slice (Phase 1 output). When provided, GVT tokens are
+                          conditioned on this label before slice reconstruction.
         Returns:
             recon_logits: (1, N, 1, recon_res, recon_res)
         """
-        # Normalise to (1, K, C_mem) for batch_first TransformerDecoder
+        # Normalise to (1, K, C_mem) for batch_first attention
         if gvt_tokens.shape[1] == 1:
-            memory = gvt_tokens.transpose(0, 1)  # (K, 1, C_mem) → (1, K, C_mem)
+            tokens = gvt_tokens.transpose(0, 1)  # (K, 1, C_mem) → (1, K, C_mem)
         else:
-            memory = gvt_tokens  # already (1, K, C_mem)
+            tokens = gvt_tokens  # already (1, K, C_mem)
 
-        # Slice queries from sinusoidal PE — match dtype/device of memory
-        queries = self.slice_pos_enc[:num_slices].unsqueeze(0)          # (1, N, C_mem)
-        queries = queries.to(device=memory.device, dtype=memory.dtype)
+        # Label conditioning: cross-attend GVT tokens to cut-slice memory features
+        if mem_features is not None:
+            kv = mem_features.to(device=tokens.device, dtype=tokens.dtype)
+            attn_out, _ = self.label_cross_attn(query=tokens, key=kv, value=kv)
+            tokens = self.label_cross_attn_norm(tokens + attn_out)  # (1, K, C_mem)
 
-        decoded = self.decoder(queries, memory)                          # (1, N, C_mem)
-        masks = self.mask_head(decoded.float())                          # (1, N, recon_res^2)
+        # Slice queries from sinusoidal PE — match dtype/device of tokens
+        queries = self.slice_pos_enc[:num_slices].unsqueeze(0)   # (1, N, C_mem)
+        queries = queries.to(device=tokens.device, dtype=tokens.dtype)
+
+        decoded = self.decoder(queries, tokens)                   # (1, N, C_mem)
+        masks = self.mask_head(decoded.float())                   # (1, N, recon_res^2)
         return masks.view(1, num_slices, 1, self.recon_res, self.recon_res)
 
 

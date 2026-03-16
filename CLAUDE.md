@@ -174,7 +174,7 @@ sbatch train_multi_gpus.sh
 - `train_unified.py` - Unified training from raw images (2D loss)
 - `train_unified_emb.py` - Unified training from pre-computed embeddings (2D loss)
 - `train_unified_emb_3dloss.py` - Unified training from embeddings (2D + 3D volumetric loss)
-- `gvt/train_gvt_emb_tsdf.py` - GVT v3 training: 2D + 3D + recon + TSDF shape prior (current default)
+- `gvt/train_gvt_emb_tsdf.py` - GVT unified training script: supports v1 (GVT encoder only), v2 (+recon loss), and v3 (+TSDF shape prior). This is the canonical GVT training script — `gvt/train_gvt_emb_3dloss.py` has been merged into this file and deleted.
 - `utils/tsdf_utils.py` - TSDF computation, target preparation, and boundary-weighted loss
 
 **sam2/** - Meta's SAM2 package with:
@@ -236,7 +236,11 @@ img = np.clip((img - lo) / (hi - lo), 0.0, 1.0)
 `test_vis3d_multi.py` runs one propagation per label using a per-label cut
 slice (the slice with maximum foreground for that specific label).  To avoid
 re-running the image encoder (O(N) cost) for every label, all N slices are
-pre-encoded once and injected into each label's inference state:
+pre-encoded once and injected into each label's inference state.
+
+**Bug fixes (this session):**
+- **Per-label exception isolation**: A single label's inference failure previously propagated to the outer handler and dropped the entire test case (causing model-dependent sample counts). Fixed: each label is wrapped in `except Exception` so failures skip that label only, not the whole case.
+- **VRAM memory leak in `precompute_slice_features`**: This function called `init_state_compat` to borrow a video state for N forward_image calls, but never called `reset_state` afterward. The leaked N-frame state (~27 MB/slice × N slices) accumulated across cases. Fixed: `predictor.reset_state(state)` is now called in a `finally` block.
 
 ```python
 # Pre-encode all N slices once; keyed by slice index
@@ -469,7 +473,7 @@ GVT injects volume-level context into SAM2's memory bank without modifying any S
 
 **GVT versions:**
 - **GVT v1**: GVT encoder only. K tokens appended to memory bank; training signal comes solely from segmentation loss. Limited by weak/indirect gradient path to GVT encoder.
-- **GVT v2**: Adds `GVTReconDecoder` auxiliary reconstruction loss. Explicitly forces GVT encoder to learn spatially meaningful representations via a direct, short gradient path.
+- **GVT v2**: Adds `GVTReconDecoder` auxiliary reconstruction loss with **label conditioning**. `GVTReconDecoder` cross-attends GVT tokens (Q) to the cut-slice `maskmem_features` (K/V) from Phase 1, conditioning on the specific label before reconstructing per-slice low-res masks. Each label gets its own GT binary mask (not union). Explicitly forces GVT encoder to learn spatially meaningful representations via a direct, short gradient path.
 - **GVT v3** (current): Replaces binary reconstruction with a **TSDF shape prior**. `TSDFDecoder` predicts full-resolution (256×256) Truncated Signed Distance Fields per slice, conditioned on label-prompted memory features via cross-attention. TSDF encodes boundary geometry explicitly (positive inside, negative outside, clamped to ±τ), giving the decoder a richer supervision signal than binary masks. Both `GVTReconDecoder` and `TSDFDecoder` are discarded at inference — zero overhead.
 
 **GVT v3 loss formulation:**
@@ -484,16 +488,34 @@ total_loss = L_seg + lambda_aux * L_recon + lambda_tsdf * L_tsdf
 **Three-phase per-volume training loop (`train_gvt_emb_tsdf.py`):**
 ```
 Phase 1 — no_grad: for each label, run prompted forward pass on cut slice to extract
-           maskmem_features (label-conditioned memory features for TSDFDecoder K/V)
+           maskmem_features (label-conditioned memory features). Shared by BOTH
+           GVTReconDecoder (v2) and TSDFDecoder (v3). Phase 1 runs when either
+           recon_decoder or tsdf_decoder is active (not only when --use-tsdf is set).
 
-Phase 2 — TSDF auxiliary loss: TSDFDecoder(gvt_tokens, maskmem_features, slice_indices)
-           → predict 256×256 TSDF per slice → tsdf_loss vs prepare_tsdf_targets
+Phase 2a — Recon auxiliary loss (v2): GVTReconDecoder(gvt_tokens, num_slices, mem_features)
+            per label → per-label binary GT → BCE + soft Dice → mean over labels
+
+Phase 2b — TSDF auxiliary loss (v3): TSDFDecoder(gvt_tokens, maskmem_features, slice_indices)
+            per label → predict 256×256 TSDF per slice → tsdf_loss vs prepare_tsdf_targets
 
 Phase 3 — Seg loss: process_video_with_memory_3dloss(v1, v2) for each label
            → collect per-slice predictions → 2D Dice-Focal + 3D volumetric Dice
 ```
 
-**`TSDFDecoder` architecture:**
+**`GVTReconDecoder` architecture (v2):**
+```
+Input:  gvt_tokens (K, 1, C_mem) + num_slices + mem_features (1, M, C_mem) [optional]
+  1. Transpose tokens to (1, K, C_mem) [batch_first]
+  2. Label conditioning (when mem_features provided):
+       cross-attention: Q=GVT tokens, K/V=mem_features → label_cross_attn_norm(residual)
+  3. Slice queries from sinusoidal PE: (1, N, C_mem)
+  4. 2-layer TransformerDecoder: Q=slice_queries, KV=conditioned tokens → (1, N, C_mem)
+  5. Linear head: (1, N, C_mem) → (1, N, recon_res²) → reshape (1, N, 1, R, R)
+Output: (1, N, 1, recon_res, recon_res) logits
+Note:   mem_features=None skips conditioning; backward-compatible with v1-era usage.
+```
+
+**`TSDFDecoder` architecture (v3):**
 ```
 Input:  gvt_tokens (B, K, C_mem=64) + mem_features (B, M, 64) + slice_indices (S,)
 Per slice:
@@ -529,11 +551,13 @@ Output: (B, S, 256, 256) TSDF predictions
 ```
 compute_gvt_tokens(model, image_embeds[all N], ...)   # K tokens from ALL N slices — never capped
    → wrapper.gvt_tokens_cache = (gvt_tokens, gvt_pos)
-prepare_tsdf_targets(gt_masks_3d, label_ids)          # precompute TSDF GT for all labels
+prepare_tsdf_targets(gt_masks_3d, label_ids)          # precompute TSDF GT for all labels (v3 only)
 
 for each label:
     Phase 1 (no_grad): extract maskmem_features from cut slice
-    Phase 2: TSDFDecoder(gvt_tokens, maskmem_features) → L_tsdf (capped at max_slices)
+                       [runs when recon_decoder or tsdf_decoder is active]
+    Phase 2a (v2): GVTReconDecoder(gvt_tokens, N, mem_features) → L_recon (per-label binary GT)
+    Phase 2b (v3): TSDFDecoder(gvt_tokens, maskmem_features) → L_tsdf (capped at max_slices)
     Phase 3: propagate v1 + v2 → L_seg (capped at max_slices per video)
 
 clear_gvt_cache(model)
@@ -541,8 +565,16 @@ clear_gvt_cache(model)
 
 **Checkpoint keys:**
 - `"model"`: full SAM2 + GVTModule state dict (including `memory_attention` wrapper)
-- `"recon_decoder"`: `GVTReconDecoder` state dict
+- `"gvt_recon_decoder"`: `GVTReconDecoder` state dict (key name is `"gvt_recon_decoder"`, not `"recon_decoder"`)
 - `"tsdf_decoder"`: `TSDFDecoder` state dict
+
+**DDP for auxiliary decoders (IMPORTANT):**
+Both `recon_decoder` and `tsdf_decoder` are wrapped in DDP for gradient all-reduction across GPUs. Save checkpoints using `.module.state_dict()`:
+```python
+ckpt["gvt_recon_decoder"] = recon_decoder.module.state_dict()
+ckpt["tsdf_decoder"] = tsdf_decoder.module.state_dict()
+```
+When loading in `eval_gvt_recon.py`, old checkpoints missing `label_cross_attn` keys load with `strict=False` and a warning; the new cross-attention weights are randomly initialized (eval Dice is a lower-bound sanity check only for such checkpoints).
 
 **GPU load balance (IMPORTANT — do not regress):**
 `compute_gvt_tokens` intentionally processes all N slices for global context. Both `TSDFDecoder` and `GVTReconDecoder` must be capped at `max_slices_per_video` to balance per-sample GPU cost. Without caps, large-N volumes (N=200) cause one GPU to run 2× longer, leaving others idle during NCCL allreduce.

@@ -4,17 +4,18 @@
 """
 train_gvt_emb_tsdf.py
 
-GVT v3: Training from pre-computed 3D embeddings with GVT and combined
-2D + 3D volumetric loss + TSDF shape prior auxiliary loss.
-
-Extends train_gvt_emb_3dloss.py by adding a TSDFDecoder auxiliary loss.
+Unified GVT training script covering v1, v2, and v3:
+  v1  --use-gvt                          GVT encoder only (segmentation loss)
+  v2  --use-gvt --gvt-recon              + GVTReconDecoder auxiliary reconstruction loss
+  v3  --use-gvt --use-tsdf               + TSDFDecoder shape prior auxiliary loss
 
 Three-phase training loop per volume:
-  Phase 1 (no_grad): collect prompted memory features after add_new_points_or_box
-  Phase 2:           TSDF auxiliary loss (TSDFDecoder, capped at max_slices)
-  Phase 3:           Standard seg loss (existing v2 per-label propagation, unchanged)
+  Phase 1 (no_grad): collect per-label prompted memory features from cut slice
+                     (runs when --gvt-recon or --use-tsdf is active; shared by v2 + v3)
+  Phase 2:           Auxiliary losses — recon (v2) and/or TSDF (v3), capped at max_slices
+  Phase 3:           Segmentation loss — per-label 2D Dice-Focal + 3D volumetric Dice
 
-Total loss = L_seg + lambda_tsdf * L_tsdf   (additive, NOT averaged)
+Total loss = L_seg + lambda_aux * L_recon + lambda_tsdf * L_tsdf   (additive, NOT averaged)
 
 Usage:
     python gvt/train_gvt_emb_tsdf.py \\
@@ -33,6 +34,7 @@ import sys
 import csv
 import time
 import argparse
+import traceback
 from glob import glob
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -80,11 +82,42 @@ from train_unified_emb_3dloss import (
     process_video_with_memory_3dloss,
 )
 
-# Re-import helpers from GVT v2 training script
-from gvt.train_gvt_emb_3dloss import (
-    get_lambda_aux,
-    _build_gt_volume_binary,
-)
+
+def get_lambda_aux(epoch: int, args) -> float:
+    """Return λ_aux for the current epoch (supports optional warmup schedule)."""
+    if getattr(args, "lambda_aux_warmup", 0) > 0 and epoch < getattr(args, "lambda_aux_warmup_epochs", 10):
+        return args.lambda_aux_warmup
+    return args.lambda_aux
+
+
+def _build_gt_volume_binary(masks, labels, N_total: int, ori_h: int, ori_w: int, device) -> torch.Tensor:
+    """
+    Build a binary foreground GT volume (N, 1, H, W) as the union of all labels.
+    Used as the reconstruction target for GVT v2.
+    """
+    if isinstance(masks, np.ndarray) and masks.ndim == 3:
+        masks_t = torch.from_numpy(masks).to(device)
+        any_fg = torch.zeros(N_total, masks_t.shape[1], masks_t.shape[2],
+                             dtype=torch.float32, device=device)
+        for lbl in labels:
+            any_fg += (masks_t == int(lbl))
+        return any_fg.clamp(max=1.0).unsqueeze(1)
+
+    gt_vol_list = []
+    for idx in range(N_total):
+        m = masks[idx]
+        if isinstance(m, np.ndarray):
+            m_t = torch.from_numpy(m.astype(np.int32))
+        elif isinstance(m, torch.Tensor):
+            m_t = m.int()
+        else:
+            gt_vol_list.append(torch.zeros(1, ori_h, ori_w))
+            continue
+        any_fg = torch.zeros(m_t.shape, dtype=torch.float32)
+        for lbl in labels:
+            any_fg = any_fg + (m_t == int(lbl)).float()
+        gt_vol_list.append(any_fg.clamp(max=1.0).unsqueeze(0))
+    return torch.stack(gt_vol_list, dim=0).to(device)
 
 
 # =============================================================================
@@ -143,7 +176,7 @@ def train_3d_sample_from_embedding_gvt_tsdf(
     max_labels_per_sample = getattr(args, 'max_labels_per_sample', 1)
     active_labels = labels
     if len(active_labels) > max_labels_per_sample:
-        rng = np.random.RandomState()
+        rng = np.random.RandomState(getattr(args, 'seed', 42) + epoch)
         active_labels = rng.choice(active_labels, size=max_labels_per_sample, replace=False).tolist()
 
     masks_np = masks if isinstance(masks, np.ndarray) else (
@@ -151,65 +184,18 @@ def train_3d_sample_from_embedding_gvt_tsdf(
     )
 
     # -------------------------------------------------------------------------
-    # GVT v2: Reconstruction loss (same as train_gvt_emb_3dloss.py)
+    # Phase 1: Extract per-label prompted memory features (shared by v2 + v3).
+    # Runs whenever either recon_decoder or tsdf_decoder is active.
+    # Each label's mem_feat comes from a single prompted slice (the cut slice
+    # with max foreground for that label), providing label-specific conditioning.
     # -------------------------------------------------------------------------
-    recon_loss_scalar = torch.tensor(0.0, device=device)
-    recon_loss_val = None
-    if recon_decoder is not None and has_gvt(base_model):
-        wrapper = base_model.memory_attention
-        gvt_tokens_tensor, _ = wrapper.gvt_tokens_cache   # (K, 1, 64)
-        N_total = image_embeds.shape[0] if hasattr(image_embeds, "shape") else len(image_embeds)
-        recon_slice_indices = list(range(N_total))
-        if N_total > max_slices:
-            recon_slice_indices = subsample_slices(recon_slice_indices, max_slices)
-        N_recon = len(recon_slice_indices)
-        recon_masks = masks[np.array(recon_slice_indices)] if N_recon < N_total else masks
-        gt_vol = _build_gt_volume_binary(recon_masks, active_labels, N_recon, ori_h, ori_w, device)
-        with torch.amp.autocast("cuda", enabled=args.use_amp):
-            recon_logits = recon_decoder(gvt_tokens_tensor, num_slices=N_recon)
-            recon_loss_val = gvt_recon_loss(recon_logits, gt_vol, recon_res=args.gvt_recon_res)
-        recon_loss_scalar = recon_loss_val.detach()
-
-    # -------------------------------------------------------------------------
-    # Phase 1 + Phase 2: TSDF auxiliary loss
-    # -------------------------------------------------------------------------
-    tsdf_loss_val = None
-    tsdf_loss_scalar = torch.tensor(0.0, device=device)
-
-    if tsdf_decoder is not None and has_gvt(base_model) and len(active_labels) > 0:
-        wrapper = base_model.memory_attention
-        gvt_tokens_raw, _ = wrapper.gvt_tokens_cache   # (K, 1, C_mem)
-        # Reshape: (K, 1, C_mem) → (1, K, C_mem) for TSDFDecoder
-        gvt_tokens_for_tsdf = gvt_tokens_raw.transpose(0, 1)  # (1, K, C_mem)
-
-        N_total = image_embeds.shape[0] if hasattr(image_embeds, "shape") else len(image_embeds)
-
-        # Determine which slices to use for TSDF (capped at max_slices)
-        all_slice_indices = list(range(N_total))
-        tsdf_slice_indices = subsample_slices(all_slice_indices, max_slices)
-
-        # Prepare TSDF ground truth targets (on CPU first, move to device later)
-        tsdf_tau = getattr(args, 'tsdf_tau', 32.0)
-        if isinstance(masks, np.ndarray):
-            tsdf_targets = prepare_tsdf_targets(
-                gt_masks_3d=masks,
-                label_ids=active_labels,
-                target_size=256,
-                tau=tsdf_tau,
-            )
-        else:
-            # Convert to numpy if needed
-            masks_np = masks.numpy() if isinstance(masks, torch.Tensor) else np.array(masks)
-            tsdf_targets = prepare_tsdf_targets(
-                gt_masks_3d=masks_np,
-                label_ids=active_labels,
-                target_size=256,
-                tau=tsdf_tau,
-            )
-
-        # Phase 1: collect prompted memory features per label (no_grad)
-        # Use per-label cut slice as init frame — guaranteed to contain the label.
-        phase1_mem_features: Dict[int, Optional[torch.Tensor]] = {}
+    phase1_mem_features: Dict[int, Optional[torch.Tensor]] = {}
+    need_phase1 = (
+        (recon_decoder is not None or tsdf_decoder is not None)
+        and has_gvt(base_model)
+        and len(active_labels) > 0
+    )
+    if need_phase1:
         with torch.no_grad():
             for label in active_labels:
                 fg_counts_p1 = (masks_np == label).sum(axis=(1, 2))
@@ -221,7 +207,7 @@ def train_3d_sample_from_embedding_gvt_tsdf(
                 label_arr = masks_np[init_slice]
                 binary = (label_arr == label).astype(np.float32)
 
-                # Build bounding box from GT
+                # Build bounding box from GT mask on the cut slice
                 rows = np.any(binary, axis=1)
                 cols = np.any(binary, axis=0)
                 rmin, rmax = np.where(rows)[0][[0, -1]]
@@ -251,14 +237,11 @@ def train_3d_sample_from_embedding_gvt_tsdf(
                         hr1 = hr1.to(device)
 
                     with torch.amp.autocast("cuda", enabled=args.use_amp):
-                        # Encode prompt
                         sparse_embeddings, dense_embeddings = predictor.sam_prompt_encoder(
                             points=None,
                             boxes=box_t,
                             masks=None,
                         )
-
-                        # Decode mask; capture object_score_logits for _encode_new_memory
                         low_res_masks, _, _, object_score_logits = predictor.sam_mask_decoder(
                             image_embeddings=embed_t,
                             image_pe=predictor.sam_prompt_encoder.get_dense_pe(),
@@ -268,13 +251,8 @@ def train_3d_sample_from_embedding_gvt_tsdf(
                             repeat_image=False,
                             high_res_features=[hr0, hr1],
                         )
-
-                        # _encode_new_memory feeds masks through MaskDownSampler
-                        # (total_stride=16, strided convolutions). It expects input at
-                        # image_size × image_size (e.g. 1024×1024) so it downsamples to
-                        # 64×64 matching pix_feat. Passing low_res_masks (256×256) would
-                        # downsample to 16×16, causing a shape mismatch with pix_feat.
-                        # Replicate _forward_sam_heads: upsample to image_size first.
+                        # _encode_new_memory expects image_size × image_size input
+                        # (MaskDownSampler stride=16: 1024→64). Upsample from 256 first.
                         image_size = predictor.image_size
                         high_res_masks = F.interpolate(
                             low_res_masks.float(),
@@ -282,9 +260,6 @@ def train_3d_sample_from_embedding_gvt_tsdf(
                             mode="bilinear",
                             align_corners=False,
                         )
-
-                        # Encode prediction into memory features
-                        # current_vision_feats: list of (HW, B, C) tensors per scale
                         feat_hw = embed_t.shape[2], embed_t.shape[3]
                         current_vision_feats = [embed_t.flatten(2).permute(2, 0, 1)]
                         maskmem_features, _ = predictor._encode_new_memory(
@@ -296,64 +271,106 @@ def train_3d_sample_from_embedding_gvt_tsdf(
                         )
 
                     # maskmem_features: (1, C_mem, H_mem, W_mem) → (1, H*W, C_mem)
-                    mem_flat = maskmem_features.detach().flatten(2).permute(0, 2, 1)
-                    phase1_mem_features[label] = mem_flat
+                    phase1_mem_features[label] = maskmem_features.detach().flatten(2).permute(0, 2, 1)
 
                 except Exception as e:
-                    import traceback
                     print(f"[Phase1] label={label} init_slice={init_slice} failed: {e}\n"
                           f"{traceback.format_exc()}")
                     phase1_mem_features[label] = None
 
-        # Phase 2: compute TSDF losses per label
-        tsdf_label_losses = []
-        tsdf_alpha = getattr(args, 'tsdf_alpha', 4.0)
+    # -------------------------------------------------------------------------
+    # GVT v2: Per-label reconstruction loss.
+    # Each label reconstructs its own binary volume, conditioned on the Phase 1
+    # single-slice memory features for that label via cross-attention in
+    # GVTReconDecoder. Labels where Phase 1 failed are skipped.
+    # -------------------------------------------------------------------------
+    recon_loss_scalar = torch.tensor(0.0, device=device)
+    recon_loss_val = None
+    if recon_decoder is not None and has_gvt(base_model):
+        wrapper = base_model.memory_attention
+        gvt_tokens_tensor, _ = wrapper.gvt_tokens_cache   # (K, 1, 64)
+        N_total_r = image_embeds.shape[0] if hasattr(image_embeds, "shape") else len(image_embeds)
+        recon_slice_indices = list(range(N_total_r))
+        if N_total_r > max_slices:
+            recon_slice_indices = subsample_slices(recon_slice_indices, max_slices)
+        N_recon = len(recon_slice_indices)
+        # Use masks_np (always ndarray) for safe numpy indexing
+        recon_masks_sub = masks_np[np.array(recon_slice_indices)] if N_recon < N_total_r else masks_np
 
-        # Pre-compute per-phase constants (same for all labels)
-        slice_idx_tensor = torch.tensor(tsdf_slice_indices, dtype=torch.long, device=device)
-        # float32 cast for cross-attention stability (GVT tokens are small, no OOM risk)
-        gvt_tokens_fp32 = gvt_tokens_for_tsdf.float()
-        masks_np = masks if isinstance(masks, np.ndarray) else (
-            masks.numpy() if isinstance(masks, torch.Tensor) else np.array(masks)
-        )
-
+        recon_label_losses = []
         for label in active_labels:
             mem_feat = phase1_mem_features.get(label, None)
             if mem_feat is None:
                 continue
+            # Per-label binary GT: only this label's foreground
+            gt_vol = _build_gt_volume_binary(recon_masks_sub, [label], N_recon, ori_h, ori_w, device)
+            with torch.amp.autocast("cuda", enabled=args.use_amp):
+                recon_logits = recon_decoder(
+                    gvt_tokens_tensor,
+                    num_slices=N_recon,
+                    mem_features=mem_feat,
+                )
+                loss_label = gvt_recon_loss(recon_logits, gt_vol, recon_res=args.gvt_recon_res)
+            recon_label_losses.append(loss_label)
 
-            # Get TSDF targets for this label at the subsampled slices
+        if recon_label_losses:
+            recon_loss_val = torch.stack(recon_label_losses).mean()
+            recon_loss_scalar = recon_loss_val.detach()
+
+    # -------------------------------------------------------------------------
+    # GVT v3: Per-label TSDF auxiliary loss.
+    # Each label conditioned on its Phase 1 single-slice memory features.
+    # -------------------------------------------------------------------------
+    tsdf_loss_val = None
+    tsdf_loss_scalar = torch.tensor(0.0, device=device)
+
+    if tsdf_decoder is not None and has_gvt(base_model) and len(active_labels) > 0:
+        wrapper = base_model.memory_attention
+        gvt_tokens_raw, _ = wrapper.gvt_tokens_cache   # (K, 1, C_mem)
+        # Reshape: (K, 1, C_mem) → (1, K, C_mem) for TSDFDecoder
+        gvt_tokens_for_tsdf = gvt_tokens_raw.transpose(0, 1)  # (1, K, C_mem)
+
+        N_total = image_embeds.shape[0] if hasattr(image_embeds, "shape") else len(image_embeds)
+        tsdf_slice_indices = subsample_slices(list(range(N_total)), max_slices)
+
+        tsdf_tau = getattr(args, 'tsdf_tau', 32.0)
+        tsdf_targets = prepare_tsdf_targets(
+            gt_masks_3d=masks_np,
+            label_ids=active_labels,
+            target_size=256,
+            tau=tsdf_tau,
+        )
+
+        slice_idx_tensor = torch.tensor(tsdf_slice_indices, dtype=torch.long, device=device)
+        gvt_tokens_fp32 = gvt_tokens_for_tsdf.float()
+        tsdf_alpha = getattr(args, 'tsdf_alpha', 4.0)
+
+        tsdf_label_losses = []
+        for label in active_labels:
+            mem_feat = phase1_mem_features.get(label, None)
+            if mem_feat is None:
+                continue
             if label not in tsdf_targets:
                 continue
+
             tsdf_gt_full = tsdf_targets[label]  # (D, 256, 256)
-            tsdf_gt_sub = tsdf_gt_full[tsdf_slice_indices].to(device)  # (N_tsdf, 256, 256)
-            tsdf_gt_sub = tsdf_gt_sub.unsqueeze(0)  # (1, N_tsdf, 256, 256)
-
-            # Compute label area for normalization
+            tsdf_gt_sub = tsdf_gt_full[tsdf_slice_indices].to(device).unsqueeze(0)  # (1, N_tsdf, 256, 256)
             label_area = float((masks_np == label).sum())
-
-            mem_feat_fp32 = mem_feat.float()
 
             with torch.amp.autocast("cuda", enabled=args.use_amp):
                 tsdf_pred = tsdf_decoder(
                     gvt_tokens=gvt_tokens_fp32,
-                    mem_features=mem_feat_fp32,
+                    mem_features=mem_feat.float(),
                     slice_indices=slice_idx_tensor,
                 )  # (1, N_tsdf, 256, 256)
-
-                # Cast GT to same dtype as pred
-                tsdf_gt_sub = tsdf_gt_sub.to(tsdf_pred.dtype)
-
                 loss_label = tsdf_loss(
                     tsdf_pred=tsdf_pred,
-                    tsdf_gt=tsdf_gt_sub,
+                    tsdf_gt=tsdf_gt_sub.to(tsdf_pred.dtype),
                     alpha=tsdf_alpha,
                     sigma=tsdf_tau / 3.0,
-                    # Normalize by sqrt(area) when training multiple labels to balance
-                    # small vs large structures. Skip normalization in single-label mode.
                     label_area=label_area if not getattr(args, 'tsdf_single_label', False) else None,
                 )
-                tsdf_label_losses.append(loss_label)
+            tsdf_label_losses.append(loss_label)
 
         if tsdf_label_losses:
             tsdf_loss_val = torch.stack(tsdf_label_losses).mean()
@@ -856,6 +873,24 @@ def main(rank, world_size, args):
         find_unused_parameters=True,
     )
 
+    # Wrap auxiliary decoders in DDP so their gradients are all-reduced across GPUs.
+    # They are trainable (gradient flows back to the GVT encoder through them) and
+    # must be synchronized just like the main model.
+    if recon_decoder is not None:
+        recon_decoder = DDP(
+            recon_decoder,
+            device_ids=[rank],
+            gradient_as_bucket_view=True,
+            find_unused_parameters=False,
+        )
+    if tsdf_decoder is not None:
+        tsdf_decoder = DDP(
+            tsdf_decoder,
+            device_ids=[rank],
+            gradient_as_bucket_view=True,
+            find_unused_parameters=False,
+        )
+
     # Include all auxiliary decoder parameters in the optimizer
     trainable = [p for p in model.parameters() if p.requires_grad]
     if recon_decoder is not None:
@@ -1028,9 +1063,9 @@ def main(rank, world_size, args):
                     } if args.use_tsdf else None,
                 }
                 if recon_decoder is not None:
-                    ckpt["gvt_recon_decoder"] = recon_decoder.state_dict()
+                    ckpt["gvt_recon_decoder"] = recon_decoder.module.state_dict()
                 if tsdf_decoder is not None:
-                    ckpt["tsdf_decoder"] = tsdf_decoder.state_dict()
+                    ckpt["tsdf_decoder"] = tsdf_decoder.module.state_dict()
                 torch.save(ckpt, save_name)
                 print(f"Checkpoint saved: {save_name}")
 
@@ -1053,9 +1088,9 @@ def main(rank, world_size, args):
             } if args.use_tsdf else None,
         }
         if recon_decoder is not None:
-            ckpt["gvt_recon_decoder"] = recon_decoder.state_dict()
+            ckpt["gvt_recon_decoder"] = recon_decoder.module.state_dict()
         if tsdf_decoder is not None:
-            ckpt["tsdf_decoder"] = tsdf_decoder.state_dict()
+            ckpt["tsdf_decoder"] = tsdf_decoder.module.state_dict()
         torch.save(ckpt, save_name)
         print(f"Final checkpoint saved: {save_name}")
 
