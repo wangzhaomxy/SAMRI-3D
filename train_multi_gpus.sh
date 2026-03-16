@@ -78,8 +78,8 @@ SAVE_PATH_2D_IMG="/scratch/user/s4670484/Model_save/samri2_2d_img/"
 # GVT Configuration (gvt/train_gvt_emb_tsdf.py) — used by gvt_v1/v2/v3
 # ============================================================================
 SAVE_PATH_GVT_V1="/scratch/user/s4670484/Model_save/samri2_gvt1_K16/"
-SAVE_PATH_GVT_V2="/scratch/user/s4670484/Model_save/samri2_gvt2_recon_K16_rec32/"
-SAVE_PATH_GVT_TSDF="/scratch/user/s4670484/Model_save/samri2_gvt3_tsdf_K16_rec32_AUX1/"
+SAVE_PATH_GVT_V2="/scratch/user/s4670484/Model_save/samri2_gvt2_recon_K16_rec32_new/"
+SAVE_PATH_GVT_TSDF="/scratch/user/s4670484/Model_save/samri2_gvt3_tsdf_K16_rec32_AUX1_new/"
 
 # GVT encoder
 GVT_NUM_TOKENS=16
