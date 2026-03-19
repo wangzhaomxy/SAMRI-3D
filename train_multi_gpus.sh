@@ -4,11 +4,11 @@
 #SBATCH --cpus-per-task=48
 #SBATCH --mem=300G
 #SBATCH --job-name=SAMRI2
-#SBATCH --time=3-00:00:00
-#SBATCH --partition=gpu_rocm        # gpu_rocm      gpu_rocm    gpu_cuda
-#SBATCH --gres=gpu:mi300x:7         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2
+#SBATCH --time=4-00:00:00
+#SBATCH --partition=gpu_cuda        # gpu_rocm      gpu_rocm    gpu_cuda
+#SBATCH --gres=gpu:h100:2         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2
 #SBATCH --account=a_ai_collab
-#SBATCH --qos=sdf                   # sdf           gpu         gpu
+#SBATCH --qos=gpu                   # sdf           gpu         gpu
 #SBATCH -o /scratch/user/s4670484/SAMRI2_log/slurm-samri2-%j.output
 #SBATCH -e /scratch/user/s4670484/SAMRI2_log/slurm-samri2-%j.error
 #SBATCH --mail-type=ALL
@@ -46,7 +46,7 @@ INITIAL_CKPT="/scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt"
 # Common Hyperparameters (shared across modes)
 # ============================================================================
 NUM_EPOCHS=50
-BATCH_SIZE=2
+BATCH_SIZE=1
 LR=5e-6
 GRAD_ACCUM=1
 MIX_RATIO_3D=0.8           # 80% 3D samples, 20% 2D samples
