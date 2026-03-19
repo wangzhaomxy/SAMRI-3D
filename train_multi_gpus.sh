@@ -5,8 +5,8 @@
 #SBATCH --mem=300G
 #SBATCH --job-name=SAMRI2
 #SBATCH --time=4-00:00:00
-#SBATCH --partition=gpu_cuda        # gpu_rocm      gpu_rocm    gpu_cuda
-#SBATCH --gres=gpu:h100:2         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2
+#SBATCH --partition=gpu_rocm        # gpu_rocm      gpu_rocm    gpu_cuda
+#SBATCH --gres=gpu:mi210:2         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2
 #SBATCH --account=a_ai_collab
 #SBATCH --qos=gpu                   # sdf           gpu         gpu
 #SBATCH -o /scratch/user/s4670484/SAMRI2_log/slurm-samri2-%j.output
@@ -19,7 +19,7 @@ mkdir -p /scratch/user/s4670484/SAMRI2_log
 
 module load anaconda3/2023.09-0
 source $EBROOTANACONDA3/etc/profile.d/conda.sh
-conda activate samri  # samri samri-mi300
+conda activate samri-mi300  # samri samri-mi300
 
 # Dynamically assign port from job ID to avoid collisions
 export MASTER_ADDR=localhost
