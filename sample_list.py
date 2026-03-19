@@ -14,24 +14,20 @@ sample_name        : image file stem (without extension)
 image_path         : absolute path to image file
 mask_path          : absolute path to mask file
 shape_z/y/x        : volume dimensions in SITK [z, y, x] order
-spacing_z/y/x_mm   : voxel spacing in mm
-origin_x/y/z       : image origin
 primary_axis       : axis used for slicing (shortest dim: 0=z,1=y,2=x)
 n_slices           : size along primary_axis
 n_labels           : number of unique non-background labels
 labels             : semicolon-separated label ids  (e.g. "1;2;3")
 label_voxel_counts : semicolon-separated voxel count per label
-label_volumes_mm3  : semicolon-separated physical volume (mm³) per label
 image_min          : image intensity minimum
 image_max          : image intensity maximum
 image_mean         : image intensity mean
 image_std          : image intensity standard deviation
 warnings           : pipe-separated non-fatal issues detected (empty = clean)
                      possible values:
-                       shape_mismatch         — image and mask shapes differ
-                       spacing_may_be_default — all spacings are 1.0 (header may be missing)
-                       empty_mask             — mask has no foreground labels
-                       blank_image            — image intensity is all near-zero
+                       shape_mismatch — image and mask shapes differ
+                       empty_mask     — mask has no foreground labels
+                       blank_image    — image intensity is all near-zero
 
 Usage
 -----
@@ -199,12 +195,7 @@ def process_pair(
                   file=sys.stderr)
             return None
 
-        spacing = sitk_img.GetSpacing()   # (x, y, z) in SimpleITK
-        origin  = sitk_img.GetOrigin()    # (x, y, z)
-
         shape_z, shape_y, shape_x = arr.shape
-        spacing_x, spacing_y, spacing_z = spacing
-        origin_x, origin_y, origin_z = origin
 
         # ---- Non-fatal checks: collect warnings, keep the row ----
         warnings: List[str] = []
@@ -216,11 +207,6 @@ def process_pair(
             )
             print(f"[WARN] {img_path}: image/mask shape mismatch "
                   f"{arr.shape} vs {msk.shape}", file=sys.stderr)
-
-        # Default spacing (1, 1, 1) suggests the header is missing physical metadata;
-        # label_volumes_mm3 will be in voxels, not mm³
-        if all(abs(s - 1.0) < 1e-6 for s in spacing):
-            warnings.append("spacing_may_be_default:physical_volumes_unreliable")
 
         # Empty mask — no foreground labels
         if msk.max() == 0:
@@ -235,9 +221,7 @@ def process_pair(
 
         # Label statistics — computed on mask as-is even if shape mismatch warned above
         labels = sorted(int(v) for v in np.unique(msk) if v != 0)
-        voxel_vol_mm3 = float(spacing_x * spacing_y * spacing_z)
         label_voxel_counts = [int((msk == lb).sum()) for lb in labels]
-        label_volumes_mm3  = [round(cnt * voxel_vol_mm3, 4) for cnt in label_voxel_counts]
 
         # Image intensity statistics (use float32 to avoid overflow on int16)
         arr_f = arr.astype(np.float32)
@@ -255,18 +239,11 @@ def process_pair(
             "shape_z":             shape_z,
             "shape_y":             shape_y,
             "shape_x":             shape_x,
-            "spacing_z_mm":        round(spacing_z, 6),
-            "spacing_y_mm":        round(spacing_y, 6),
-            "spacing_x_mm":        round(spacing_x, 6),
-            "origin_x":            round(origin_x, 4),
-            "origin_y":            round(origin_y, 4),
-            "origin_z":            round(origin_z, 4),
             "primary_axis":        primary_axis,
             "n_slices":            n_slices,
             "n_labels":            len(labels),
             "labels":              ";".join(str(lb) for lb in labels),
             "label_voxel_counts":  ";".join(str(c) for c in label_voxel_counts),
-            "label_volumes_mm3":   ";".join(str(v) for v in label_volumes_mm3),
             "image_min":           round(img_min, 4),
             "image_max":           round(img_max, 4),
             "image_mean":          round(img_mean, 4),
@@ -291,10 +268,8 @@ def _worker(args):
 FIELDNAMES = [
     "dataset_name", "split", "sample_name", "image_path", "mask_path",
     "shape_z", "shape_y", "shape_x",
-    "spacing_z_mm", "spacing_y_mm", "spacing_x_mm",
-    "origin_x", "origin_y", "origin_z",
     "primary_axis", "n_slices",
-    "n_labels", "labels", "label_voxel_counts", "label_volumes_mm3",
+    "n_labels", "labels", "label_voxel_counts",
     "image_min", "image_max", "image_mean", "image_std",
     "warnings",
 ]
