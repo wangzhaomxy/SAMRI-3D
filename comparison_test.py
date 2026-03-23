@@ -42,15 +42,15 @@ with the correct fork, then restore SAMRI2's sam2 on exit.
 Weights directory layout
 ------------------------
 <weights_dir>/
-├── SAM-Med3D/
+├── sam_med3d/
 │   └── sam_med3d_turbo.pth          (https://huggingface.co/blueyo0/SAM-Med3D)
 ├── MedSAM2/
 │   └── MedSAM2_latest.pt            (https://huggingface.co/wanglab/MedSAM2)
-├── Medical-SAM2/
+├── medica_sam2/
 │   └── checkpoint.pt                (https://huggingface.co/jiayuanz3/MedSAM2_pretrain)
-├── SAMed-2/
+├── samed2/
 │   └── samed2.pth                   (SAMed-2 GitHub page)
-└── MA-SAM/
+└── masam/
     ├── sam_vit_h_4b8939.pth         (Meta SAM ViT-H base)
     └── ma_sam_btcv.pth              (MA-SAM Google Drive — see comparison/MA-SAM-main/README.md)
 
@@ -238,7 +238,7 @@ def run_sam_med3d(
         sys.path.insert(0, str(sam_med3d_root))
     from utils.infer_utils import validate_paired_img_gt  # noqa: PLC0415
 
-    ckpt_path = Path(weights_dir) / "SAM-Med3D" / "sam_med3d_turbo.pth"
+    ckpt_path = Path(weights_dir) / "sam_med3d" / "sam_med3d_turbo.pth"
     if not ckpt_path.exists():
         raise FileNotFoundError(
             f"SAM-Med3D checkpoint not found: {ckpt_path}\n"
@@ -303,14 +303,22 @@ def run_medsam2(
         )
 
     cfg_candidates = [
+        medsam2_root / "sam2" / "configs" / "sam2.1_hiera_t512.yaml",
+        medsam2_root / "sam2" / "configs" / "sam2.1_hiera_t.yaml",
         medsam2_root / "configs" / "sam2.1_hiera_t512.yaml",
-        medsam2_root / "sam2" / "configs" / "sam2.1" / "sam2.1_hiera_t.yaml",
     ]
     cfg_path = next((c for c in cfg_candidates if c.exists()), None)
+    if cfg_path is None:
+        # Fallback: search recursively for any 512 config
+        hits = list(medsam2_root.rglob("sam2.1_hiera_t512.yaml"))
+        if not hits:
+            hits = list(medsam2_root.rglob("sam2.1_hiera_t*.yaml"))
+        cfg_path = hits[0] if hits else None
     if cfg_path is None:
         raise FileNotFoundError(
             "MedSAM2 config YAML not found. Searched:\n"
             + "\n".join(f"  {c}" for c in cfg_candidates)
+            + f"\n  (also tried rglob under {medsam2_root})"
         )
 
     # Build predictor using MedSAM2's own sam2 fork (temporarily swap sys.modules)
@@ -394,7 +402,7 @@ def run_medical_sam2(
     if str(med_sam2_root) not in sys.path:
         sys.path.insert(0, str(med_sam2_root))
 
-    ckpt_path = Path(weights_dir) / "Medical-SAM2" / "checkpoint.pt"
+    ckpt_path = Path(weights_dir) / "medica_sam2" / "checkpoint.pt"
     if not ckpt_path.exists():
         raise FileNotFoundError(
             f"Medical-SAM2 checkpoint not found: {ckpt_path}\n"
@@ -490,7 +498,7 @@ def run_samed2(
     if str(samed2_root) not in sys.path:
         sys.path.insert(0, str(samed2_root))
 
-    ckpt_path = Path(weights_dir) / "SAMed-2" / "samed2.pth"
+    ckpt_path = Path(weights_dir) / "samed2" / "samed2.pth"
     if not ckpt_path.exists():
         raise FileNotFoundError(
             f"SAMed-2 checkpoint not found: {ckpt_path}\n"
@@ -561,7 +569,7 @@ def run_ma_sam(
     pickle data (2Dimage_* / 2Dmask_*), not NIfTI.
     A NIfTI→Synapse-pickle conversion wrapper is required.
 
-    Required checkpoints in <weights_dir>/MA-SAM/:
+    Required checkpoints in <weights_dir>/masam/:
         sam_vit_h_4b8939.pth   — base SAM ViT-H
         ma_sam_btcv.pth        — MA-SAM adapted weights (see comparison/MA-SAM-main/README.md)
     """
