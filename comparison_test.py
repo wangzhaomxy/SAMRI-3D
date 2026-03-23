@@ -41,18 +41,19 @@ with the correct fork, then restore SAMRI2's sam2 on exit.
 
 Weights directory layout
 ------------------------
+Each subfolder must contain exactly one checkpoint file (.pt/.pth/.pkl/.bin/.safetensors).
+The filename does not matter — the script picks up whichever file is present.
+
 <weights_dir>/
-├── sam_med3d/
-│   └── sam_med3d_turbo.pth          (https://huggingface.co/blueyo0/SAM-Med3D)
-├── MedSAM2/
-│   └── MedSAM2_latest.pt            (https://huggingface.co/wanglab/MedSAM2)
-├── medica_sam2/
-│   └── checkpoint.pt                (https://huggingface.co/jiayuanz3/MedSAM2_pretrain)
-├── samed2/
-│   └── samed2.pth                   (SAMed-2 GitHub page)
+├── sam_med3d/      <one .pth>   (https://huggingface.co/blueyo0/SAM-Med3D)
+├── MedSAM2/        <one .pt>    (https://huggingface.co/wanglab/MedSAM2)
+├── medica_sam2/    <one .pt>    (https://huggingface.co/jiayuanz3/MedSAM2_pretrain)
+│                                (override with --medical-sam2-ckpt /explicit/path)
+├── samed2/         <one .pth>   (SAMed-2 GitHub page)
+│                                (override with --samed2-ckpt /explicit/path)
 └── masam/
-    ├── sam_vit_h_4b8939.pth         (Meta SAM ViT-H base)
-    └── ma_sam_btcv.pth              (MA-SAM Google Drive — see comparison/MA-SAM-main/README.md)
+    ├── sam_vit_h_4b8939.pth    (Meta SAM ViT-H base)
+    └── ma_sam_btcv.pth         (MA-SAM Google Drive — see comparison/MA-SAM-main/README.md)
 
 Usage
 -----
@@ -207,13 +208,36 @@ def _resize_mask_to_hw(mask_pred: np.ndarray, H: int, W: int) -> np.ndarray:
     ) > 127
 
 
+def _find_checkpoint(folder: Path, model_name: str) -> Path:
+    """Return the single checkpoint file inside *folder*.
+
+    Raises FileNotFoundError with a clear message if the folder is missing or empty.
+    """
+    if not folder.is_dir():
+        raise FileNotFoundError(
+            f"{model_name} checkpoint folder not found: {folder}"
+        )
+    ckpts = [p for p in folder.iterdir()
+             if p.suffix in (".pt", ".pth", ".pkl", ".bin", ".safetensors")
+             and p.is_file()]
+    if not ckpts:
+        raise FileNotFoundError(
+            f"{model_name}: no checkpoint file found in {folder}\n"
+            f"  (looked for .pt / .pth / .pkl / .bin / .safetensors)"
+        )
+    if len(ckpts) > 1:
+        # Deterministic fallback: alphabetically first
+        ckpts.sort()
+    return ckpts[0]
+
+
 # ─── SAM-Med3D runner ─────────────────────────────────────────────────────────
 
 def run_sam_med3d(
     img_path: str, gt_path: str, label_id: int,
     img_zyx: np.ndarray, gt_zyx: np.ndarray,
     spacing_zyx: Tuple, weights_dir: str, device: str,
-    comparison_dir: str, tmp_dir: str,
+    comparison_dir: str, tmp_dir: str, **_,
 ) -> np.ndarray:
     """
     SAM-Med3D inference via the original validate_paired_img_gt helper.
@@ -238,12 +262,7 @@ def run_sam_med3d(
         sys.path.insert(0, str(sam_med3d_root))
     from utils.infer_utils import validate_paired_img_gt  # noqa: PLC0415
 
-    ckpt_path = Path(weights_dir) / "sam_med3d" / "sam_med3d_turbo.pth"
-    if not ckpt_path.exists():
-        raise FileNotFoundError(
-            f"SAM-Med3D checkpoint not found: {ckpt_path}\n"
-            "Download from: https://huggingface.co/blueyo0/SAM-Med3D"
-        )
+    ckpt_path = _find_checkpoint(Path(weights_dir) / "sam_med3d", "SAM-Med3D")
 
     # Cache model across labels/cases
     cache_key = str(ckpt_path)
@@ -277,7 +296,7 @@ def run_medsam2(
     img_path: str, gt_path: str, label_id: int,
     img_zyx: np.ndarray, gt_zyx: np.ndarray,
     spacing_zyx: Tuple, weights_dir: str, device: str,
-    comparison_dir: str, tmp_dir: str,
+    comparison_dir: str, tmp_dir: str, **_,
 ) -> np.ndarray:
     """
     MedSAM2 inference using build_sam2_video_predictor_npz.
@@ -295,12 +314,7 @@ def run_medsam2(
     comp = Path(comparison_dir)
     medsam2_root = comp / "MedSAM2-main"
 
-    ckpt_path = Path(weights_dir) / "MedSAM2" / "MedSAM2_latest.pt"
-    if not ckpt_path.exists():
-        raise FileNotFoundError(
-            f"MedSAM2 checkpoint not found: {ckpt_path}\n"
-            "Download from: https://huggingface.co/wanglab/MedSAM2"
-        )
+    ckpt_path = _find_checkpoint(Path(weights_dir) / "MedSAM2", "MedSAM2")
 
     cfg_candidates = [
         medsam2_root / "sam2" / "configs" / "sam2.1_hiera_t512.yaml",
@@ -328,8 +342,11 @@ def run_medsam2(
             sys.path.insert(0, str(medsam2_root))
         with _swap_sam2(medsam2_root):
             from sam2.build_sam import build_sam2_video_predictor_npz  # noqa: PLC0415
+            # Hydra expects a config name (e.g. "sam2.1_hiera_t512"), not a
+            # full path.  It resolves the name against pkg://sam2 (the configs/
+            # subdirectory of MedSAM2's own sam2 package).
             predictor = build_sam2_video_predictor_npz(
-                str(cfg_path), str(ckpt_path), device=device)
+                cfg_path.stem, str(ckpt_path), device=device)
         run_medsam2._cache = (cache_key, predictor)
     predictor = run_medsam2._cache[1]
 
@@ -385,6 +402,7 @@ def run_medical_sam2(
     img_zyx: np.ndarray, gt_zyx: np.ndarray,
     spacing_zyx: Tuple, weights_dir: str, device: str,
     comparison_dir: str, tmp_dir: str,
+    medical_sam2_ckpt: str = None, **_,
 ) -> np.ndarray:
     """
     Medical-SAM2 inference using sam2_train video predictor.
@@ -402,12 +420,8 @@ def run_medical_sam2(
     if str(med_sam2_root) not in sys.path:
         sys.path.insert(0, str(med_sam2_root))
 
-    ckpt_path = Path(weights_dir) / "medica_sam2" / "checkpoint.pt"
-    if not ckpt_path.exists():
-        raise FileNotFoundError(
-            f"Medical-SAM2 checkpoint not found: {ckpt_path}\n"
-            "Download from: https://huggingface.co/jiayuanz3/MedSAM2_pretrain"
-        )
+    ckpt_path = (Path(medical_sam2_ckpt) if medical_sam2_ckpt else
+                 _find_checkpoint(Path(weights_dir) / "medica_sam2", "Medical-SAM2"))
 
     # Medical-SAM2 ships its own sam2_train package (no conflict with sam2)
     from sam2_train.build_sam import build_sam2_video_predictor  # noqa: PLC0415
@@ -481,6 +495,7 @@ def run_samed2(
     img_zyx: np.ndarray, gt_zyx: np.ndarray,
     spacing_zyx: Tuple, weights_dir: str, device: str,
     comparison_dir: str, tmp_dir: str,
+    samed2_ckpt: str = None, **_,
 ) -> np.ndarray:
     """
     SAMed-2 inference using MedicalSegmenter.predict() (2D, box-prompted).
@@ -498,12 +513,8 @@ def run_samed2(
     if str(samed2_root) not in sys.path:
         sys.path.insert(0, str(samed2_root))
 
-    ckpt_path = Path(weights_dir) / "samed2" / "samed2.pth"
-    if not ckpt_path.exists():
-        raise FileNotFoundError(
-            f"SAMed-2 checkpoint not found: {ckpt_path}\n"
-            "Download from the SAMed-2 GitHub page."
-        )
+    ckpt_path = (Path(samed2_ckpt) if samed2_ckpt else
+                 _find_checkpoint(Path(weights_dir) / "samed2", "SAMed-2"))
 
     cache_key = str(ckpt_path)
     if not hasattr(run_samed2, "_cache") or run_samed2._cache[0] != cache_key:
@@ -602,6 +613,8 @@ def evaluate_model(
     comparison_dir: str,
     device: str,
     max_cases: Optional[int] = None,
+    medical_sam2_ckpt: str = None,
+    samed2_ckpt: str = None,
 ) -> Dict:
     """
     Evaluate one model across all datasets.
@@ -680,6 +693,8 @@ def evaluate_model(
                             device=device,
                             comparison_dir=comparison_dir,
                             tmp_dir=tmp_dir,
+                            medical_sam2_ckpt=medical_sam2_ckpt,
+                            samed2_ckpt=samed2_ckpt,
                         )
 
                         dsc = dice_3d(pred_binary, gt_binary)
@@ -801,6 +816,12 @@ def parse_args():
     p.add_argument("--device", default="cuda")
     p.add_argument("--max-cases", type=int, default=None,
                    help="Limit cases per dataset (for debugging).")
+    p.add_argument("--medical-sam2-ckpt", default=None,
+                   help="Explicit checkpoint path for Medical-SAM2 "
+                        "(overrides <weights-dir>/medica_sam2/checkpoint.pt).")
+    p.add_argument("--samed2-ckpt", default=None,
+                   help="Explicit checkpoint path for SAMed-2 "
+                        "(overrides <weights-dir>/samed2/samed2.pth).")
     return p.parse_args()
 
 
@@ -864,6 +885,8 @@ def main():
             comparison_dir=args.comparison_dir,
             device=device,
             max_cases=args.max_cases,
+            medical_sam2_ckpt=args.medical_sam2_ckpt,
+            samed2_ckpt=args.samed2_ckpt,
         )
         all_results[model_name] = record
         print_summary(record, model_name)
