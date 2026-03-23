@@ -85,7 +85,10 @@ class GVTMemoryAttentionWrapper(nn.Module):
         )
 
         if self.use_gated_attention and self.gvt_tokens_cache is not None:
-            output = self.memory_gate(x=curr, y=output)
+            # SAM2 passes curr as a list of multi-scale features; the main
+            # attention target (matching output shape) is the last element.
+            curr_feat = curr[-1] if isinstance(curr, (list, tuple)) else curr
+            output = self.memory_gate(x=curr_feat, y=output)
 
         return output
 
