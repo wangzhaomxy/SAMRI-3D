@@ -6,7 +6,7 @@
 #SBATCH --job-name=SAMRI2
 #SBATCH --time=4-00:00:00
 #SBATCH --partition=gpu_rocm        # gpu_rocm      gpu_rocm    gpu_cuda
-#SBATCH --gres=gpu:mi300x:2         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2
+#SBATCH --gres=gpu:mi300x:3         # gpu:mi300x:8  gpu:mi210:2 gpu:h100:2
 #SBATCH --account=a_ai_collab
 #SBATCH --qos=gpu                   # sdf           gpu         gpu
 #SBATCH -o /scratch/user/s4670484/SAMRI2_log/slurm-samri2-%j.output
@@ -36,7 +36,7 @@ export MASTER_PORT=$((26000 + RANDOM % 1000))  # Pick a port between 26000 ~ 269
 #   "gvt_v1"   - GVT v1: GVT encoder only (seg loss, no aux decoder)
 #   "gvt_v2"   - GVT v2: GVT encoder + GVTReconDecoder (label-conditioned recon loss)
 #   "gvt_v3"   - GVT v3: GVT encoder + GVTReconDecoder + TSDFDecoder (recon + TSDF)
-TRAINING_MODE="gvt_v2"  # Change this to switch between training modes
+TRAINING_MODE="gvt_v3"  # Change this to switch between training modes
 
 # Common paths
 SAM2_CONFIG="configs/sam2.1/sam2.1_hiera_s.yaml"
@@ -79,7 +79,7 @@ SAVE_PATH_2D_IMG="/scratch/user/s4670484/Model_save/samri2_2d_img/"
 # ============================================================================
 SAVE_PATH_GVT_V1="/scratch/user/s4670484/Model_save/samri2_gvt1_K16/"
 SAVE_PATH_GVT_V2="/scratch/user/s4670484/Model_save/samri2_gvt2_recon_K16_rec32_new/"
-SAVE_PATH_GVT_TSDF="/scratch/user/s4670484/Model_save/samri2_gvt3_tsdf_K16_rec32_AUX1_new/"
+SAVE_PATH_GVT_TSDF="/scratch/user/s4670484/Model_save/samri2_gvt3_tsdf_K16_AUX1_gated/"
 
 # GVT encoder
 GVT_NUM_TOKENS=16
@@ -102,6 +102,10 @@ LAMBDA_TSDF=1.0             # Weight for TSDF loss (additive)
 TSDF_TAU=32.0               # Truncation threshold in pixels
 TSDF_ALPHA=4.0              # Boundary upweighting factor
 # Add --tsdf-single-label to the python call below to disable per-label sqrt(area) normalization
+
+# Gated Attention (Priority 1 experiment)
+# Set to "true" to enable Y' = Y ⊙ σ(X·W_G) gating on memory attention output
+USE_GATED_ATTENTION=true
 
 # Additional GVT v3 training args
 WEIGHT_DECAY=0.01
@@ -290,6 +294,11 @@ elif [ "$TRAINING_MODE" == "gvt_tsdf" ]; then
     else
         echo "  TSDF loss        : DISABLED"
     fi
+    if [ "$USE_GATED_ATTENTION" == "true" ]; then
+        echo "  Gated attention  : ENABLED  (Y' = Y ⊙ σ(X·W_G), init_bias=-2.0)"
+    else
+        echo "  Gated attention  : DISABLED"
+    fi
     echo ""
     echo "  --- Sampling ---"
     echo "  Max labels/sample: ${MAX_LABELS_PER_SAMPLE}  (labels per volume per step)"
@@ -315,6 +324,7 @@ elif [ "$TRAINING_MODE" == "gvt_tsdf" ]; then
         --lambda-aux-warmup-epochs ${LAMBDA_AUX_WARMUP_EPOCHS} \
         $([ "$USE_TSDF" == "true" ] && echo "--use-tsdf") \
         --lambda-tsdf ${LAMBDA_TSDF} \
+        $([ "$USE_GATED_ATTENTION" == "true" ] && echo "--use-gated-attention") \
         --tsdf-tau ${TSDF_TAU} \
         --tsdf-alpha ${TSDF_ALPHA} \
         --mix-ratio-3d ${MIX_RATIO_3D} \
