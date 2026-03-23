@@ -796,8 +796,39 @@ def parse_args():
     return p.parse_args()
 
 
+class _Tee:
+    """Write to both the original stream and a log file simultaneously."""
+    def __init__(self, original, log_file):
+        self._orig = original
+        self._log  = log_file
+
+    def write(self, data):
+        self._orig.write(data)
+        self._orig.flush()
+        self._log.write(data)
+        self._log.flush()
+
+    def flush(self):
+        self._orig.flush()
+        self._log.flush()
+
+    def fileno(self):          # needed by some libraries that check for a real fd
+        return self._orig.fileno()
+
+
 def main():
     args = parse_args()
+
+    # ── Tee stdout + stderr → <save_path_dir>/log.txt ──────────────────────
+    log_dir  = Path(args.save_path).parent
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "log.txt"
+    _log_fh  = open(log_path, "w", buffering=1)
+    sys.stdout = _Tee(sys.__stdout__, _log_fh)
+    sys.stderr = _Tee(sys.__stderr__, _log_fh)
+    print(f"Logging to: {log_path}")
+    # ────────────────────────────────────────────────────────────────────────
+
     device = args.device if torch.cuda.is_available() else "cpu"
     models_to_run = list(RUNNERS) if args.model == "all" else [args.model]
 
@@ -836,6 +867,12 @@ def main():
         print(f"\nCombined results saved → {args.save_path}")
 
     print(f"\nTotal elapsed: {time.time() - t0:.1f}s")
+
+    # Restore original streams and close log file
+    sys.stdout = sys.__stdout__
+    sys.stderr = sys.__stderr__
+    _log_fh.close()
+    print(f"Log saved → {log_path}")
 
 
 if __name__ == "__main__":
