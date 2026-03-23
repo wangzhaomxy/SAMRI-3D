@@ -72,19 +72,19 @@ python comparison_test.py \\
     --device cuda:0
 
 # Debug: limit to 2 cases per dataset
-python comparison_test.py \\
-    --model samed2 \\
-    --dataset-path /path/to/Test_3d/ \\
-    --weights-dir /path/to/weights/ \\
-    --save-path results/samed2_debug.pkl \\
-    --max-cases 2
+python comparison_test.py \
+--model all \
+--dataset-path /scratch/user/s4670484/Datasets/SAMRI_datasets_3D/ /scratch/user/s4670484/Datasets/Zeroshot3D/ \
+--weights-dir /scratch/user/s4670484/comparison_ckpt/ \
+--save-path /scratch/user/s4670484/Eval_results/comparison/samed2_debug.pkl \
+--max-cases 2
 
 example:
 python comparison_test.py \
 --model medsam2 \
---dataset-path /scratch/user/s4670484/SAMRI2_data/Test_3d/ /scratch/user/s4670484/SAMRI2_data/ZeroShot/ \
---weights-dir /scratch/user/s4670484/Model_save/ \
---save-path /scratch/user/s4670484/SAMRI2_results/medsam2.pkl
+--dataset-path /scratch/user/s4670484/Datasets/SAMRI_datasets_3D/ /scratch/user/s4670484/Datasets/Zeroshot3D/ \
+--weights-dir /scratch/user/s4670484/comparison_ckpt/ \
+--save-path /scratch/user/s4670484/Eval_results/comparison/medsam2.pkl
 """
 
 from __future__ import annotations
@@ -607,12 +607,16 @@ def evaluate_model(
     final_record: Dict[str, List[Dict]] = {}
 
     test_folders = collect_test_folders(dataset_paths)
+    print(f"  Found {len(test_folders)} test folder(s):")
+    for tf_ in test_folders:
+        print(f"    {tf_}")
 
     for test_folder in test_folders:
         tf = Path(test_folder).resolve()
         ds_name = tf.parent.name if tf.name == "testing" else tf.name
 
         pairs = scan_pairs_same_folder(test_folder)
+        print(f"  [{ds_name}] {len(pairs)} pair(s) found in {test_folder}")
         if not pairs:
             final_record[ds_name] = []
             continue
