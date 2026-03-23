@@ -682,6 +682,10 @@ def parse_args():
     parser.add_argument("--gvt-num-tokens", type=int, default=16)
     parser.add_argument("--gvt-num-layers", type=int, default=2)
     parser.add_argument("--gvt-num-heads", type=int, default=4)
+    parser.add_argument("--use-gated-attention", action="store_true",
+                        help="Enable Gated Attention on SAM2 memory attention output. "
+                             "Allows per-frame adaptive suppression/amplification of GVT tokens: "
+                             "Y' = Y ⊙ σ(X·W_G).  Init bias=-2.0 → gate≈0.12 at start.")
 
     # GVT v2: auxiliary reconstruction loss
     parser.add_argument("--gvt-recon", action="store_true",
@@ -776,6 +780,7 @@ def main(rank, world_size, args):
             num_layers=args.gvt_num_layers,
             num_heads=args.gvt_num_heads,
             device=device,
+            use_gated_attention=args.use_gated_attention,
         )
         load_gvt_checkpoint(model, ckpt_path, device=device)
         if rank == 0:
@@ -796,12 +801,16 @@ def main(rank, world_size, args):
                 num_layers=args.gvt_num_layers,
                 num_heads=args.gvt_num_heads,
                 device=device,
+                use_gated_attention=args.use_gated_attention,
             )
 
     if args.use_gvt and rank == 0:
         gvt_params = sum(p.numel() for p in model.memory_attention.gvt_module.parameters())
         print(f"GVT enabled: {args.gvt_num_tokens} tokens, "
               f"{args.gvt_num_layers} layers, {gvt_params:,} parameters")
+        if args.use_gated_attention:
+            gate_params = sum(p.numel() for p in model.memory_attention.memory_gate.parameters())
+            print(f"Gated Attention enabled: {gate_params:,} parameters, init_bias=-2.0")
 
     # GVT v2: reconstruction decoder
     recon_decoder = None

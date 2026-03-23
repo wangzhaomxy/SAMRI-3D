@@ -308,3 +308,40 @@ class TSDFDecoder(nn.Module):
             predictions.append(tsdf.squeeze(1))  # (B, 256, 256)
 
         return torch.stack(predictions, dim=1)  # (B, S, 256, 256)
+
+
+class GatedAttentionHead(nn.Module):
+    """
+    Gated Attention (Qiu et al., NeurIPS 2025).
+
+    Applies element-wise sigmoid gating to the memory attention output:
+        Y' = Y ⊙ σ(X · W_G)
+
+    where Y is the memory attention output, X is the current-frame query
+    features, W_G is a learnable projection, and σ is sigmoid.
+
+    The gate is initialised conservatively (σ(−2) ≈ 0.12), so GVT tokens
+    start nearly suppressed.  During training the TSDF/segmentation loss
+    gradually opens the gates for frames where global context is useful.
+
+    Args:
+        embed_dim: Memory attention feature dimension (C_mem = 64).
+        init_bias: Initial gate-projection bias.  Negative → near-zero gate.
+    """
+
+    def __init__(self, embed_dim: int = 64, init_bias: float = -2.0):
+        super().__init__()
+        self.gate_proj = nn.Linear(embed_dim, embed_dim, bias=True)
+        nn.init.zeros_(self.gate_proj.weight)
+        nn.init.constant_(self.gate_proj.bias, init_bias)
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Query input to the attention layer (current frame features).
+               Shape: (..., C) — works with both (HW, B, C) and (B, HW, C).
+            y: Memory attention output.  Same shape as x.
+        Returns:
+            Gated output: y * sigmoid(gate_proj(x)).
+        """
+        return y * torch.sigmoid(self.gate_proj(x))

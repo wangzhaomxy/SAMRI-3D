@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-from gvt.gvt_module import GVTModule
+from gvt.gvt_module import GVTModule, GatedAttentionHead
 
 
 class GVTMemoryAttentionWrapper(nn.Module):
@@ -34,7 +34,8 @@ class GVTMemoryAttentionWrapper(nn.Module):
     spatial RoPE (like object pointer tokens) since they have no spatial structure.
     """
 
-    def __init__(self, original_memory_attention: nn.Module, gvt_module: GVTModule):
+    def __init__(self, original_memory_attention: nn.Module, gvt_module: GVTModule,
+                 use_gated_attention: bool = False):
         super().__init__()
         self.original = original_memory_attention
         self.gvt_module = gvt_module
@@ -42,6 +43,11 @@ class GVTMemoryAttentionWrapper(nn.Module):
 
         # Expose original attributes that SAM2Base accesses
         self.d_model = original_memory_attention.d_model
+
+        # Optional gated attention: Y' = Y ⊙ σ(X · W_G)
+        self.use_gated_attention = use_gated_attention
+        if use_gated_attention:
+            self.memory_gate = GatedAttentionHead(embed_dim=self.d_model, init_bias=-2.0)
 
     def forward(
         self,
@@ -70,13 +76,18 @@ class GVTMemoryAttentionWrapper(nn.Module):
             # Exclude GVT tokens from spatial RoPE
             num_obj_ptr_tokens += gvt_tokens.shape[0]
 
-        return self.original(
+        output = self.original(
             curr=curr,
             memory=memory,
             curr_pos=curr_pos,
             memory_pos=memory_pos,
             num_obj_ptr_tokens=num_obj_ptr_tokens,
         )
+
+        if self.use_gated_attention and self.gvt_tokens_cache is not None:
+            output = self.memory_gate(x=curr, y=output)
+
+        return output
 
 
 def wrap_model_with_gvt(
@@ -86,6 +97,7 @@ def wrap_model_with_gvt(
     num_heads: int = 4,
     dropout: float = 0.1,
     device=None,
+    use_gated_attention: bool = False,
 ):
     """
     Wrap a SAM2 model's memory_attention with GVT injection.
@@ -119,6 +131,7 @@ def wrap_model_with_gvt(
     wrapper = GVTMemoryAttentionWrapper(
         original_memory_attention=model.memory_attention,
         gvt_module=gvt_module,
+        use_gated_attention=use_gated_attention,
     ).to(device)
 
     model.memory_attention = wrapper
