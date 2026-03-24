@@ -597,19 +597,22 @@ def run_samed2(
             margin = IMG_SIZE * 0.1
             box_1024 = [margin, margin, IMG_SIZE - margin, IMG_SIZE - margin]
 
-        # B=1 inference — avoids the B=2 duplication in MedicalSegmenter.predict()
-        # so that empty memory (1, 1, C) matches curr batch dim without patching predict.py
-        img_t   = tform(pil).unsqueeze(0).to(dev)          # (1, 3, 1024, 1024)
-        box_t   = torch.tensor([box_1024], device=dev)      # (1, 4)
+        # SAMed-2's TemporalAdapter requires B divisible by d_size=2, so B must be 2.
+        # predict.py duplicates the image but creates empty memory with B=1 (bug).
+        # We replicate predict.py's inference here with the corrected B=2 memory.
+        img_1  = tform(pil).unsqueeze(0).to(dev)
+        img_t  = torch.cat([img_1, img_1], dim=0)            # (2, 3, 1024, 1024)
+        box_t  = torch.tensor([box_1024, box_1024], device=dev)  # (2, 4)
 
         with torch.no_grad():
             bb_out = model.forward_image(img_t)
             _, v_feats, v_pos, feat_sizes = model._prepare_backbone_features(bb_out)
 
-            B = 1
+            B = 2
             C = model.hidden_dim
             fH, fW = feat_sizes[-1]
 
+            # memory batch dim must match curr (B=2)
             memory     = torch.zeros(1, B, C, device=dev)
             memory_pos = torch.zeros(1, B, C, device=dev)
 
