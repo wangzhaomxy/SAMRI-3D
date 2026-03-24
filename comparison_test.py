@@ -732,16 +732,27 @@ def run_ma_sam(
         if _ma_path not in sys.path:
             sys.path.insert(0, _ma_path)
 
-        # Both segment_anything/__init__.py and sam_fact_tt_image_encoder.py import
-        # SamAutomaticMaskGenerator, which triggers automatic_mask_generator.py →
-        # torchvision → torch.onnx.DiagnosticOptions (removed in newer torch).
-        # Pre-inject a dummy module so Python never executes the real file.
+        # segment_anything's __init__.py imports predictor and automatic_mask_generator,
+        # both of which pull in torchvision.  The torchvision in this environment has a
+        # torch.onnx.DiagnosticOptions incompatibility that crashes on import.
+        # Pre-stub every torchvision-touching submodule before segment_anything loads
+        # so Python never executes those files.  We don't use SamPredictor or
+        # SamAutomaticMaskGenerator at inference — only build_sam and Fact_tt_Sam.
         import types as _types
-        _amg_key = "segment_anything.automatic_mask_generator"
-        if _amg_key not in sys.modules:
-            _amg_stub = _types.ModuleType(_amg_key)
-            _amg_stub.SamAutomaticMaskGenerator = None  # type: ignore[attr-defined]
-            sys.modules[_amg_key] = _amg_stub
+
+        def _stub(key, **attrs):
+            if key not in sys.modules:
+                _m = _types.ModuleType(key)
+                for _k, _v in attrs.items():
+                    setattr(_m, _k, _v)
+                sys.modules[key] = _m
+
+        _stub("segment_anything.utils")
+        _stub("segment_anything.utils.transforms", ResizeLongestSide=None)
+        _stub("segment_anything.utils.onnx")
+        _stub("segment_anything.utils.amg")
+        _stub("segment_anything.predictor", SamPredictor=None)
+        _stub("segment_anything.automatic_mask_generator", SamAutomaticMaskGenerator=None)
 
         from segment_anything.build_sam import sam_model_registry  # noqa: PLC0415
         from sam_fact_tt_image_encoder import Fact_tt_Sam          # noqa: PLC0415
