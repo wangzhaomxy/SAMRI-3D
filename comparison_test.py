@@ -732,7 +732,9 @@ def run_ma_sam(
         if _ma_path not in sys.path:
             sys.path.insert(0, _ma_path)
 
-        from segment_anything import sam_model_registry   # noqa: PLC0415
+        # Import directly from build_sam to avoid __init__.py pulling in
+        # SamAutomaticMaskGenerator → torchvision, which has a torch version conflict.
+        from segment_anything.build_sam import sam_model_registry  # noqa: PLC0415
         from sam_fact_tt_image_encoder import Fact_tt_Sam  # noqa: PLC0415
 
         # Detect num_classes from the adapted checkpoint's mask_decoder keys
