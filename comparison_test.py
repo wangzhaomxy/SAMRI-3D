@@ -74,18 +74,18 @@ python comparison_test.py \\
 
 # Debug: limit to 2 cases per dataset
 python comparison_test.py \
---model medical_sam2 \
+--model ma_sam \
 --dataset-path /scratch/user/s4670484/Datasets/SAMRI_datasets_3D/ /scratch/user/s4670484/Datasets/Zeroshot3D/ \
 --weights-dir /scratch/user/s4670484/comparison_ckpt/ \
---save-path /scratch/user/s4670484/Eval_results/comparison/medical_sam2_debug.pkl \
+--save-path /scratch/user/s4670484/Eval_results/comparison/ma_sam_debug.pkl \
 --max-cases 1
 
 example:
 python comparison_test.py \
---model sam_med3d \
+--model medical_sam2 \
 --dataset-path /scratch/user/s4670484/Datasets/SAMRI_datasets_3D/ /scratch/user/s4670484/Datasets/Zeroshot3D/ \
 --weights-dir /scratch/user/s4670484/comparison_ckpt/ \
---save-path /scratch/user/s4670484/Eval_results/comparison/sam_med3d.pkl
+--save-path /scratch/user/s4670484/Eval_results/comparison/medical_sam2.pkl
 """
 
 from __future__ import annotations
@@ -694,26 +694,117 @@ def run_samed2(
 def run_ma_sam(
     img_path: str, gt_path: str, label_id: int,
     img_zyx: np.ndarray, gt_zyx: np.ndarray,
-    spacing_zyx: Tuple, weights_dir: str = None, **_,
+    spacing_zyx: Tuple, weights_dir: str = None, device: str = "cuda",
+    comparison_dir: str = None, **_,
 ) -> np.ndarray:
     """
-    MA-SAM: SAM ViT-H + FacT adaptation.
+    MA-SAM: SAM ViT-H + FacT-TT + 3D adapters (2.5D per-slice inference).
 
-    Pretrained weights are available (BTCV / prostate on Google Drive) but
-    the inference script (MA-SAM-main/MA-SAM/test.py) expects Synapse-format
-    pickle data (2Dimage_* / 2Dmask_*), not NIfTI.
-    A NIfTI→Synapse-pickle conversion wrapper is required.
+    Inputs are built inline from NIfTI arrays — no pickle conversion needed.
+    Each forward pass takes a 5-slice window (1, 5, 3, 512, 512); the centre
+    slice prediction is used.  Overlapping window averaging is not necessary
+    for a binary-per-label evaluation.
 
-    Required checkpoints in <weights_dir>/masam/:
-        sam_vit_h_4b8939.pth   — base SAM ViT-H
-        ma_sam_btcv.pth        — MA-SAM adapted weights (see comparison/MA-SAM-main/README.md)
+    Required checkpoints in <weights_dir>/ma_sam/:
+        sam_vit_h_4b8939.pth   — base SAM ViT-H  (~2.4 GB)
+        <adapted>.pth          — MA-SAM fine-tuned weights (smaller file)
     """
-    raise NotImplementedError(
-        "MA-SAM requires Synapse-format pickle data (2Dimage_* / 2Dmask_*).\n"
-        "NIfTI input is not directly supported by its test.py.\n"
-        "Add a NIfTI→Synapse-pickle conversion step to enable this runner.\n"
-        "Pretrained weights are available — see comparison/MA-SAM-main/README.md."
-    )
+    from scipy.ndimage import zoom as _zoom
+
+    ma_sam_root = Path(comparison_dir) / "MA-SAM-main" / "MA-SAM"
+    ckpt_dir    = Path(weights_dir) / "ma_sam"
+    ckpts = sorted(ckpt_dir.glob("*.pth")) + sorted(ckpt_dir.glob("*.pt"))
+    if len(ckpts) < 2:
+        raise FileNotFoundError(
+            f"Expected 2 checkpoints in {ckpt_dir} "
+            "(base sam_vit_h_4b8939.pth + MA-SAM adapted weights)"
+        )
+    # Largest file = base SAM ViT-H; smaller = adapted weights
+    ckpts_by_size = sorted(ckpts, key=lambda p: p.stat().st_size, reverse=True)
+    base_ckpt  = ckpts_by_size[0]
+    adapt_ckpt = ckpts_by_size[1]
+
+    cache_key = str(adapt_ckpt)
+    if not hasattr(run_ma_sam, "_cache") or run_ma_sam._cache[0] != cache_key:
+        _ma_path = str(ma_sam_root)
+        if _ma_path not in sys.path:
+            sys.path.insert(0, _ma_path)
+
+        from segment_anything import sam_model_registry   # noqa: PLC0415
+        from sam_fact_tt_image_encoder import Fact_tt_Sam  # noqa: PLC0415
+
+        # Detect num_classes from the adapted checkpoint's mask_decoder keys
+        _sd = torch.load(str(adapt_ckpt), map_location="cpu")
+        num_classes = sum(
+            1 for k in _sd
+            if "mask_decoder.output_hypernetworks_mlps" in k
+            and "layers.0.weight" in k
+        )
+        if num_classes == 0:
+            num_classes = 12  # default: BTCV/Synapse
+
+        sam, _ = sam_model_registry["vit_h"](
+            image_size=512,
+            num_classes=num_classes,
+            checkpoint=str(base_ckpt),
+            pixel_mean=[0., 0., 0.],
+            pixel_std=[1., 1., 1.],
+        )
+        net = Fact_tt_Sam(sam, rank=32, s=1.0).to(device)
+        net.load_parameters(str(adapt_ckpt))
+        net.eval()
+        run_ma_sam._cache = (cache_key, net, num_classes)
+
+    net, num_classes = run_ma_sam._cache[1], run_ma_sam._cache[2]
+    IMG_SIZE = 512
+    D_WINDOW = 5  # 2.5D context window; centre index = 2
+
+    primary_axis = choose_primary_axis(img_zyx.shape)
+    vol_shw = np.moveaxis(img_zyx, primary_axis, 0).astype(np.float32)  # (S, H, W)
+    gt_shw  = np.moveaxis(gt_zyx,  primary_axis, 0)
+    S, H, W = vol_shw.shape
+
+    if (gt_shw == label_id).sum() == 0:
+        return np.zeros(img_zyx.shape, dtype=bool)
+
+    # Per-slice min-max normalise to [0, 1] (MA-SAM uses pixel_mean/std=0/1)
+    norm_vol = np.zeros_like(vol_shw)
+    for i in range(S):
+        sl = vol_shw[i]
+        lo, hi = sl.min(), sl.max()
+        norm_vol[i] = (sl - lo) / (hi - lo + 1e-8)
+
+    pred_shw = np.zeros((S, H, W), dtype=bool)
+    with torch.no_grad():
+        for ind in range(S):
+            # Build 5-slice window (H, W, 5); pad by repeating boundary slices
+            idx5   = [max(0, min(S - 1, ind + k - 2)) for k in range(D_WINDOW)]
+            window = norm_vol[idx5]                      # (5, H, W)
+            window = window.transpose(1, 2, 0)           # (H, W, 5)
+
+            if H != IMG_SIZE or W != IMG_SIZE:
+                window = _zoom(window, (IMG_SIZE / H, IMG_SIZE / W, 1.0), order=3)
+
+            # Replicate test.py: (1,1,H,W,5) → repeat3 → (1,3,H,W,5) → permute → (1,5,3,H,W)
+            t = torch.from_numpy(window).float().to(device)
+            t = t.unsqueeze(0).unsqueeze(0)              # (1, 1, H, W, 5)
+            t = t.repeat(1, 3, 1, 1, 1)                 # (1, 3, H, W, 5)
+            t = t.permute(0, 4, 1, 2, 3)                # (1, 5, 3, H, W)
+
+            outputs   = net(t, multimask_output=True, image_size=IMG_SIZE)
+            masks_out = outputs["masks"]                 # (5, num_classes, IMG_SIZE, IMG_SIZE)
+
+            # Take the centre slice (index 2) prediction
+            centre = masks_out[2]                        # (num_classes, IMG_SIZE, IMG_SIZE)
+            pred_class = centre.argmax(dim=0).cpu().numpy()   # (IMG_SIZE, IMG_SIZE)
+
+            if H != IMG_SIZE or W != IMG_SIZE:
+                pred_class = _zoom(pred_class.astype(np.float32),
+                                   (H / IMG_SIZE, W / IMG_SIZE), order=0).astype(int)
+
+            pred_shw[ind] = (pred_class == label_id)
+
+    return np.moveaxis(pred_shw, 0, primary_axis)
 
 
 # ─── Runner registry ─────────────────────────────────────────────────────────
