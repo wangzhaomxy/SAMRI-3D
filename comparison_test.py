@@ -495,7 +495,10 @@ def run_medical_sam2(
 
     cache_key = str(ckpt_path)
     if not hasattr(run_medical_sam2, "_cache") or run_medical_sam2._cache[0] != cache_key:
-        net = build_sam2_video_predictor(cfg_name, str(ckpt_path), device=device)
+        # apply_postprocessing=False avoids fill_hole_area=8, which requires
+        # the compiled sam2_train._C extension (not built in this environment).
+        net = build_sam2_video_predictor(cfg_name, str(ckpt_path), device=device,
+                                         apply_postprocessing=False)
         net.eval()
         run_medical_sam2._cache = (cache_key, net)
     net = run_medical_sam2._cache[1]
