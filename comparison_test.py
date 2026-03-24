@@ -470,9 +470,17 @@ def run_medical_sam2(
     # Medical-SAM2 ships its own sam2_train package (no conflict with sam2)
     from sam2_train.build_sam import build_sam2_video_predictor  # noqa: PLC0415
 
-    cfg_path = med_sam2_root / "sam2_train" / "configs" / "sam2.1" / "sam2.1_hiera_s.yaml"
-    if not cfg_path.exists():
-        cfgs = sorted((med_sam2_root / "sam2_train").rglob("*.yaml"))
+    # Configs live directly under sam2_train/ (not in configs/sam2.1/).
+    # Prefer hiera_t (tiny) — that is what the released Medical-SAM2 checkpoint uses.
+    sam2_train_pkg_dir = med_sam2_root / "sam2_train"
+    cfg_path = None
+    for _stem in ("sam2_hiera_t", "sam2_hiera_s", "sam2.1_hiera_t", "sam2.1_hiera_s"):
+        _c = sam2_train_pkg_dir / f"{_stem}.yaml"
+        if _c.exists():
+            cfg_path = _c
+            break
+    if cfg_path is None:
+        cfgs = sorted(sam2_train_pkg_dir.rglob("*.yaml"))
         if not cfgs:
             raise FileNotFoundError(
                 f"Medical-SAM2 config YAML not found under {med_sam2_root}")
@@ -480,7 +488,6 @@ def run_medical_sam2(
 
     # Hydra's search path is pkg://sam2_train, so cfg name must be relative to
     # the sam2_train package dir (no extension), not an absolute path.
-    sam2_train_pkg_dir = med_sam2_root / "sam2_train"
     try:
         cfg_name = str(cfg_path.relative_to(sam2_train_pkg_dir).with_suffix(""))
     except ValueError:
