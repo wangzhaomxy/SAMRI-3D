@@ -478,9 +478,17 @@ def run_medical_sam2(
                 f"Medical-SAM2 config YAML not found under {med_sam2_root}")
         cfg_path = cfgs[0]
 
+    # Hydra's search path is pkg://sam2_train, so cfg name must be relative to
+    # the sam2_train package dir (no extension), not an absolute path.
+    sam2_train_pkg_dir = med_sam2_root / "sam2_train"
+    try:
+        cfg_name = str(cfg_path.relative_to(sam2_train_pkg_dir).with_suffix(""))
+    except ValueError:
+        cfg_name = cfg_path.stem
+
     cache_key = str(ckpt_path)
     if not hasattr(run_medical_sam2, "_cache") or run_medical_sam2._cache[0] != cache_key:
-        net = build_sam2_video_predictor(str(cfg_path), str(ckpt_path), device=device)
+        net = build_sam2_video_predictor(cfg_name, str(ckpt_path), device=device)
         net.eval()
         run_medical_sam2._cache = (cache_key, net)
     net = run_medical_sam2._cache[1]
