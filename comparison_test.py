@@ -499,6 +499,9 @@ def run_medical_sam2(
         # the compiled sam2_train._C extension (not built in this environment).
         net = build_sam2_video_predictor(cfg_name, str(ckpt_path), device=device,
                                          apply_postprocessing=False)
+        # Hiera backbone (Flash Attention) returns bf16 activations; cast weights to
+        # match so memory_attention cross-attn doesn't see bf16 vs float32 mismatch.
+        net = net.to(torch.bfloat16)
         net.eval()
         run_medical_sam2._cache = (cache_key, net)
     net = run_medical_sam2._cache[1]
