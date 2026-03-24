@@ -457,11 +457,15 @@ def run_medical_sam2(
     ckpt_path = (Path(medical_sam2_ckpt) if medical_sam2_ckpt else
                  _find_checkpoint(Path(weights_dir) / "medica_sam2", "Medical-SAM2"))
 
-    # sam2_train/__init__.py calls initialize_config_module("sam2_train") unconditionally.
-    # SAMRI2's sam2/__init__.py already initialized GlobalHydra with "sam2", so we must
-    # clear it BEFORE importing sam2_train (the import itself triggers __init__.py).
-    from hydra.core.global_hydra import GlobalHydra  # noqa: PLC0415
-    GlobalHydra.instance().clear()
+    # sam2_train/__init__.py calls initialize_config_module("sam2_train") unconditionally
+    # (no is_initialized() guard).  SAMRI2's sam2/__init__.py already initialized
+    # GlobalHydra with "sam2", so we must clear it BEFORE the first import of sam2_train
+    # (importing the package executes __init__.py).  On subsequent calls the module is
+    # cached by Python, so __init__.py does NOT re-run and Hydra stays initialized with
+    # "sam2_train" — clearing it would leave Hydra uninitialized and break compose().
+    if "sam2_train" not in sys.modules:
+        from hydra.core.global_hydra import GlobalHydra  # noqa: PLC0415
+        GlobalHydra.instance().clear()
 
     # Medical-SAM2 ships its own sam2_train package (no conflict with sam2)
     from sam2_train.build_sam import build_sam2_video_predictor  # noqa: PLC0415
