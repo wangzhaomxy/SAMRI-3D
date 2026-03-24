@@ -105,6 +105,25 @@ import numpy as np
 import SimpleITK as sitk
 import torch
 from PIL import Image as PILImage
+try:
+    from tqdm import tqdm as _tqdm
+    def _progress(it, **kw):
+        # Write to the real stderr so the bar is visible in the terminal
+        # but does NOT appear in the Tee-captured log file.
+        return _tqdm(it, file=sys.__stderr__, dynamic_ncols=True, **kw)
+except ImportError:
+    import contextlib
+
+    class _NoBar:
+        """No-op stand-in when tqdm is not installed."""
+        def __init__(self, it, **_): self._it = it
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+        def __iter__(self): return iter(self._it)
+        def set_postfix(self, **_): pass
+
+    def _progress(it, **kw):
+        return _NoBar(it, **kw)
 
 # PIL Pillow 10+ compatibility: Image.BILINEAR / NEAREST removed → Resampling enum
 try:
@@ -139,14 +158,22 @@ from test_vis3d_multi import (
 # sam2 is restored; the built model objects hold direct class references that
 # remain valid regardless of what sys.modules['sam2'] points to.
 
+def _is_sam2_or_tv(k: str) -> bool:
+    return k == 'sam2' or k.startswith('sam2.') or k == 'torchvision' or k.startswith('torchvision.')
+
+
 @contextlib.contextmanager
 def _swap_sam2(new_sam2_parent: Path):
     """
     Context manager: replace sys.modules['sam2*'] with the sam2 found under
     new_sam2_parent, then restore on exit.
+
+    Also saves/restores torchvision* so that a failed import inside the context
+    (e.g. missing CUDA extension on the first call) does not leave a partially
+    initialised torchvision in sys.modules, which would cause a circular-import
+    error on every subsequent call.
     """
-    saved = {k: v for k, v in sys.modules.items()
-             if k == 'sam2' or k.startswith('sam2.')}
+    saved = {k: v for k, v in sys.modules.items() if _is_sam2_or_tv(k)}
     for k in list(saved):
         del sys.modules[k]
     new_p = str(new_sam2_parent)
@@ -156,9 +183,8 @@ def _swap_sam2(new_sam2_parent: Path):
     try:
         yield
     finally:
-        for k in list(sys.modules.keys()):
-            if k == 'sam2' or k.startswith('sam2.'):
-                del sys.modules[k]
+        for k in [k for k in sys.modules if _is_sam2_or_tv(k)]:
+            del sys.modules[k]
         if not was_in and new_p in sys.path:
             sys.path.remove(new_p)
         sys.modules.update(saved)
@@ -341,12 +367,20 @@ def run_medsam2(
         if str(medsam2_root) not in sys.path:
             sys.path.insert(0, str(medsam2_root))
         with _swap_sam2(medsam2_root):
+            from hydra.core.global_hydra import GlobalHydra  # noqa: PLC0415
+            GlobalHydra.instance().clear()
             from sam2.build_sam import build_sam2_video_predictor_npz  # noqa: PLC0415
-            # Hydra expects a config name (e.g. "sam2.1_hiera_t512"), not a
-            # full path.  It resolves the name against pkg://sam2 (the configs/
-            # subdirectory of MedSAM2's own sam2 package).
+            # Hydra search path is pkg://sam2 (the sam2 package dir).
+            # The config name must be relative to that dir, e.g. "configs/sam2.1_hiera_t512".
+            # Using cfg_path.stem ("sam2.1_hiera_t512") fails because the YAML
+            # lives in sam2/configs/, not at the package root.
+            sam2_pkg_dir = medsam2_root / "sam2"
+            try:
+                cfg_name = str(cfg_path.relative_to(sam2_pkg_dir).with_suffix(""))
+            except ValueError:
+                cfg_name = cfg_path.stem  # fallback for unusual layouts
             predictor = build_sam2_video_predictor_npz(
-                cfg_path.stem, str(ckpt_path), device=device)
+                cfg_name, str(ckpt_path), device=device)
         run_medsam2._cache = (cache_key, predictor)
     predictor = run_medsam2._cache[1]
 
@@ -436,6 +470,8 @@ def run_medical_sam2(
 
     cache_key = str(ckpt_path)
     if not hasattr(run_medical_sam2, "_cache") or run_medical_sam2._cache[0] != cache_key:
+        from hydra.core.global_hydra import GlobalHydra  # noqa: PLC0415
+        GlobalHydra.instance().clear()
         net = build_sam2_video_predictor(str(cfg_path), str(ckpt_path), device=device)
         net.eval()
         run_medical_sam2._cache = (cache_key, net)
@@ -628,16 +664,13 @@ def evaluate_model(
     final_record: Dict[str, List[Dict]] = {}
 
     test_folders = collect_test_folders(dataset_paths)
-    print(f"  Found {len(test_folders)} test folder(s):")
-    for tf_ in test_folders:
-        print(f"    {tf_}")
+    print(f"  Found {len(test_folders)} test folder(s).")
 
     for test_folder in test_folders:
         tf = Path(test_folder).resolve()
         ds_name = tf.parent.name if tf.name == "testing" else tf.name
 
         pairs = scan_pairs_same_folder(test_folder)
-        print(f"  [{ds_name}] {len(pairs)} pair(s) found in {test_folder}")
         if not pairs:
             final_record[ds_name] = []
             continue
@@ -648,99 +681,93 @@ def evaluate_model(
         ds_rows: List[Dict] = []
         skipped = 0
         kept = 0
+        errors = 0
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            for img_path, gt_path in pairs:
-                case_name = Path(img_path).name
-                try:
-                    img_zyx, img_sitk = read_3d_image(img_path)
-                    gt_zyx,  _        = read_3d_image(gt_path)
-                    if img_zyx.shape != gt_zyx.shape:
-                        raise ValueError(
-                            f"Shape mismatch: img {img_zyx.shape} vs gt {gt_zyx.shape}")
-                except Exception as e:
-                    print(f"  [ERROR] loading {case_name}: {e}")
-                    skipped += 1
-                    continue
-
-                spacing_xyz = img_sitk.GetSpacing()
-                spacing_zyx = (float(spacing_xyz[2]),
-                               float(spacing_xyz[1]),
-                               float(spacing_xyz[0]))
-
-                labels = get_labels_from_mask(gt_zyx)
-                if not labels:
-                    skipped += 1
-                    continue
-
-                total_voxels = int(gt_zyx.size)
-                primary_axis = choose_primary_axis(img_zyx.shape)
-                gt0 = np.moveaxis(gt_zyx, primary_axis, 0)
-
-                model_skipped = False
-                for lb in labels:
-                    gt_binary = (gt_zyx == lb).astype(np.uint8)
-                    t0 = time.time()
+            model_skipped = False
+            with _progress(pairs, desc=f"  {ds_name}", unit="case") as pbar:
+                for img_path, gt_path in pbar:
+                    case_name = Path(img_path).name
                     try:
-                        pred_binary = runner(
-                            img_path=img_path,
-                            gt_path=gt_path,
-                            label_id=lb,
-                            img_zyx=img_zyx,
-                            gt_zyx=gt_zyx,
-                            spacing_zyx=spacing_zyx,
-                            weights_dir=weights_dir,
-                            device=device,
-                            comparison_dir=comparison_dir,
-                            tmp_dir=tmp_dir,
-                            medical_sam2_ckpt=medical_sam2_ckpt,
-                            samed2_ckpt=samed2_ckpt,
-                        )
-
-                        dsc = dice_3d(pred_binary, gt_binary)
-                        hd, msd = hd_msd_3d_sitk(pred_binary, gt_binary,
-                                                   spacing_zyx=spacing_zyx)
-                        elapsed = time.time() - t0
-
-                        vc = int(gt_binary.sum())
-                        vp = vc / float(total_voxels)
-                        fg_lb = (gt0 == lb).sum(axis=(1, 2))
-                        cut_idx = int(np.argmax(fg_lb)) if fg_lb.max() > 0 else -1
-
-                        ds_rows.append({
-                            "img_name":         img_path,
-                            "mask_name":        gt_path,
-                            "label":            int(lb),
-                            "voxel_count":      vc,
-                            "voxel_percentage": vp,
-                            "dice":             float(dsc),
-                            "hd":               float(hd),
-                            "msd":              float(msd),
-                            "cut_axis":         int(primary_axis),
-                            "cut_idx":          cut_idx,
-                        })
-                        kept += 1
-
-                        hd_str  = f"{hd:7.2f}" if hd  != float('inf') else "    inf"
-                        msd_str = f"{msd:7.2f}" if msd != float('inf') else "    inf"
-                        print(
-                            f"  [{case_name}] label {lb:>3d}: "
-                            f"Dice={dsc:.4f}  HD={hd_str} mm  MSD={msd_str} mm"
-                            f"  ({elapsed:.1f}s)"
-                        )
-
-                    except NotImplementedError as e:
-                        print(f"  [SKIP] {model_name}: {e}")
-                        model_skipped = True
-                        break
+                        img_zyx, img_sitk = read_3d_image(img_path)
+                        gt_zyx,  _        = read_3d_image(gt_path)
+                        if img_zyx.shape != gt_zyx.shape:
+                            raise ValueError(
+                                f"Shape mismatch: img {img_zyx.shape} vs gt {gt_zyx.shape}")
                     except Exception as e:
-                        print(f"  [{case_name}] label {lb}: [ERROR] {e}")
+                        print(f"  [ERROR] loading {case_name}: {e}")
+                        skipped += 1
+                        continue
 
-                if model_skipped:
-                    break
+                    spacing_xyz = img_sitk.GetSpacing()
+                    spacing_zyx = (float(spacing_xyz[2]),
+                                   float(spacing_xyz[1]),
+                                   float(spacing_xyz[0]))
+
+                    labels = get_labels_from_mask(gt_zyx)
+                    if not labels:
+                        skipped += 1
+                        continue
+
+                    total_voxels = int(gt_zyx.size)
+                    primary_axis = choose_primary_axis(img_zyx.shape)
+                    gt0 = np.moveaxis(gt_zyx, primary_axis, 0)
+
+                    for lb in labels:
+                        gt_binary = (gt_zyx == lb).astype(np.uint8)
+                        try:
+                            pred_binary = runner(
+                                img_path=img_path,
+                                gt_path=gt_path,
+                                label_id=lb,
+                                img_zyx=img_zyx,
+                                gt_zyx=gt_zyx,
+                                spacing_zyx=spacing_zyx,
+                                weights_dir=weights_dir,
+                                device=device,
+                                comparison_dir=comparison_dir,
+                                tmp_dir=tmp_dir,
+                                medical_sam2_ckpt=medical_sam2_ckpt,
+                                samed2_ckpt=samed2_ckpt,
+                            )
+
+                            dsc = dice_3d(pred_binary, gt_binary)
+                            hd, msd = hd_msd_3d_sitk(pred_binary, gt_binary,
+                                                       spacing_zyx=spacing_zyx)
+                            vc = int(gt_binary.sum())
+                            vp = vc / float(total_voxels)
+                            fg_lb = (gt0 == lb).sum(axis=(1, 2))
+                            cut_idx = int(np.argmax(fg_lb)) if fg_lb.max() > 0 else -1
+
+                            ds_rows.append({
+                                "img_name":         img_path,
+                                "mask_name":        gt_path,
+                                "label":            int(lb),
+                                "voxel_count":      vc,
+                                "voxel_percentage": vp,
+                                "dice":             float(dsc),
+                                "hd":               float(hd),
+                                "msd":              float(msd),
+                                "cut_axis":         int(primary_axis),
+                                "cut_idx":          cut_idx,
+                            })
+                            kept += 1
+
+                        except NotImplementedError as e:
+                            print(f"  [SKIP] {model_name}: {e}")
+                            model_skipped = True
+                            break
+                        except Exception as e:
+                            print(f"  [ERROR] {case_name} label {lb}: {e}")
+                            errors += 1
+
+                    pbar.set_postfix(kept=kept, skip=skipped, err=errors)
+
+                    if model_skipped:
+                        break
 
         final_record[ds_name] = ds_rows
-        print(f"[Done] {ds_name}: kept_labels={kept}, skipped={skipped}")
+        print(f"[Done] {ds_name}: kept={kept}  skipped={skipped}  errors={errors}")
 
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
     with open(save_path, "wb") as f:
