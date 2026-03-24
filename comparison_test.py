@@ -499,9 +499,6 @@ def run_medical_sam2(
         # the compiled sam2_train._C extension (not built in this environment).
         net = build_sam2_video_predictor(cfg_name, str(ckpt_path), device=device,
                                          apply_postprocessing=False)
-        # Hiera backbone (Flash Attention) returns bf16 activations; cast weights to
-        # match so memory_attention cross-attn doesn't see bf16 vs float32 mismatch.
-        net = net.to(torch.bfloat16)
         net.eval()
         run_medical_sam2._cache = (cache_key, net)
     net = run_medical_sam2._cache[1]
@@ -515,7 +512,7 @@ def run_medical_sam2(
     gt_shw  = np.moveaxis(gt_zyx,  primary_axis, 0)
     S, H, W = vol_shw.shape
 
-    img_tensor = _vol_to_rgb_tensor(vol_shw, FRAME_SIZE, device)  # (S,3,FRAME_SIZE,FRAME_SIZE)
+    img_tensor = _vol_to_rgb_tensor(vol_shw, FRAME_SIZE, device)
 
     fg = (gt_shw == label_id).sum(axis=(1, 2))
     if fg.max() == 0:
@@ -531,7 +528,8 @@ def run_medical_sam2(
     ).unsqueeze(0)  # (1, 4)
 
     pred_shw = np.zeros((S, H, W), dtype=bool)
-    with torch.no_grad():
+    _autocast_device = "cuda" if "cuda" in str(device) else "cpu"
+    with torch.no_grad(), torch.autocast(_autocast_device, dtype=torch.bfloat16):
         state = net.val_init_state(imgs_tensor=img_tensor)
         net.train_add_new_bbox(
             inference_state=state,
