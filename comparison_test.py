@@ -732,10 +732,19 @@ def run_ma_sam(
         if _ma_path not in sys.path:
             sys.path.insert(0, _ma_path)
 
-        # Import directly from build_sam to avoid __init__.py pulling in
-        # SamAutomaticMaskGenerator → torchvision, which has a torch version conflict.
+        # Both segment_anything/__init__.py and sam_fact_tt_image_encoder.py import
+        # SamAutomaticMaskGenerator, which triggers automatic_mask_generator.py →
+        # torchvision → torch.onnx.DiagnosticOptions (removed in newer torch).
+        # Pre-inject a dummy module so Python never executes the real file.
+        import types as _types
+        _amg_key = "segment_anything.automatic_mask_generator"
+        if _amg_key not in sys.modules:
+            _amg_stub = _types.ModuleType(_amg_key)
+            _amg_stub.SamAutomaticMaskGenerator = None  # type: ignore[attr-defined]
+            sys.modules[_amg_key] = _amg_stub
+
         from segment_anything.build_sam import sam_model_registry  # noqa: PLC0415
-        from sam_fact_tt_image_encoder import Fact_tt_Sam  # noqa: PLC0415
+        from sam_fact_tt_image_encoder import Fact_tt_Sam          # noqa: PLC0415
 
         # Detect num_classes from the adapted checkpoint's mask_decoder keys
         _sd = torch.load(str(adapt_ckpt), map_location="cpu")
