@@ -840,7 +840,10 @@ def evaluate_model(
                             model_skipped = True
                             break
                         except Exception as e:
-                            print(f"  [ERROR] {case_name} label {lb}: {e}")
+                            import traceback as _tb
+                            _msg = str(e) or "(no message)"
+                            print(f"  [ERROR] {case_name} label {lb}: {type(e).__name__}: {_msg}")
+                            print("".join(_tb.format_exception(type(e), e, e.__traceback__)).strip())
                             errors += 1
 
                     pbar.set_postfix(kept=kept, skip=skipped, err=errors)
