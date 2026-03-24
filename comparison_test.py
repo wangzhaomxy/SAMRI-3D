@@ -757,15 +757,16 @@ def run_ma_sam(
         from segment_anything.build_sam import sam_model_registry  # noqa: PLC0415
         from sam_fact_tt_image_encoder import Fact_tt_Sam          # noqa: PLC0415
 
-        # Detect num_classes from the adapted checkpoint's mask_decoder keys
+        # Detect num_classes from the adapted checkpoint's mask_decoder keys.
+        # MaskDecoder stores num_multimask_outputs+1 MLPs (the +1 is the single-mask
+        # head), so subtract 1 to recover the actual num_classes used at training.
         _sd = torch.load(str(adapt_ckpt), map_location="cpu")
-        num_classes = sum(
+        _n_mlps = sum(
             1 for k in _sd
             if "mask_decoder.output_hypernetworks_mlps" in k
             and "layers.0.weight" in k
         )
-        if num_classes == 0:
-            num_classes = 12  # default: BTCV/Synapse
+        num_classes = max(_n_mlps - 1, 1) if _n_mlps > 0 else 12  # default: BTCV/Synapse
 
         sam, _ = sam_model_registry["vit_h"](
             image_size=512,
