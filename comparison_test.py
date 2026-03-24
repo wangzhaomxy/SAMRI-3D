@@ -74,11 +74,11 @@ python comparison_test.py \\
 
 # Debug: limit to 2 cases per dataset
 python comparison_test.py \
---model all \
+--model samed2 \
 --dataset-path /scratch/user/s4670484/Datasets/SAMRI_datasets_3D/ /scratch/user/s4670484/Datasets/Zeroshot3D/ \
 --weights-dir /scratch/user/s4670484/comparison_ckpt/ \
 --save-path /scratch/user/s4670484/Eval_results/comparison/samed2_debug.pkl \
---max-cases 2
+--max-cases 1
 
 example:
 python comparison_test.py \
