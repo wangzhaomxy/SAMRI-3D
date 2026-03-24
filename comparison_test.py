@@ -500,14 +500,16 @@ def run_medical_sam2(
         run_medical_sam2._cache = (cache_key, net)
     net = run_medical_sam2._cache[1]
 
-    FRAME_SIZE = 512
+    # Medical-SAM2 config sets image_size=1024, backbone_stride=16 →
+    # sam_image_embedding_size=64; input must be 1024×1024.
+    FRAME_SIZE = getattr(net, "image_size", 1024)
 
     primary_axis = choose_primary_axis(img_zyx.shape)
     vol_shw = np.moveaxis(img_zyx, primary_axis, 0)  # [S, H, W]
     gt_shw  = np.moveaxis(gt_zyx,  primary_axis, 0)
     S, H, W = vol_shw.shape
 
-    img_tensor = _vol_to_rgb_tensor(vol_shw, FRAME_SIZE, device)  # (S,3,512,512)
+    img_tensor = _vol_to_rgb_tensor(vol_shw, FRAME_SIZE, device)  # (S,3,FRAME_SIZE,FRAME_SIZE)
 
     fg = (gt_shw == label_id).sum(axis=(1, 2))
     if fg.max() == 0:
