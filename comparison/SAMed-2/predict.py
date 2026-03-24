@@ -131,9 +131,8 @@ class MedicalSegmenter:
                     )
                 else:
                     # Use empty memory for single image without memory bank
-                    # Batch dimension must match curr (B=2, duplicated above)
-                    memory = torch.zeros(1, B, C, device=self.device)
-                    memory_pos = torch.zeros(1, B, C, device=self.device)
+                    memory = torch.zeros(1, 1, C, device=self.device)
+                    memory_pos = torch.zeros(1, 1, C, device=self.device)
                 
                 # Apply memory attention (critical for SAMed2)
                 pix_feat_with_mem = self.model.memory_attention(

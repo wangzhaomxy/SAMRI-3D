@@ -575,6 +575,12 @@ def run_samed2(
     if fg.max() == 0:
         return np.zeros(img_zyx.shape, dtype=bool)
 
+    import torch.nn.functional as _F
+
+    model  = segmenter.model
+    dev    = segmenter.device
+    tform  = segmenter.transform
+
     pred_shw = np.zeros((S, H, W), dtype=bool)
     for s in range(S):
         s2d = normalize_to_uint8(vol_shw[s])
@@ -591,8 +597,52 @@ def run_samed2(
             margin = IMG_SIZE * 0.1
             box_1024 = [margin, margin, IMG_SIZE - margin, IMG_SIZE - margin]
 
-        result    = segmenter.predict(pil, box=box_1024)
-        mask_1024 = result['mask']  # (1024, 1024) bool
+        # B=1 inference — avoids the B=2 duplication in MedicalSegmenter.predict()
+        # so that empty memory (1, 1, C) matches curr batch dim without patching predict.py
+        img_t   = tform(pil).unsqueeze(0).to(dev)          # (1, 3, 1024, 1024)
+        box_t   = torch.tensor([box_1024], device=dev)      # (1, 4)
+
+        with torch.no_grad():
+            bb_out = model.forward_image(img_t)
+            _, v_feats, v_pos, feat_sizes = model._prepare_backbone_features(bb_out)
+
+            B = 1
+            C = model.hidden_dim
+            fH, fW = feat_sizes[-1]
+
+            memory     = torch.zeros(1, B, C, device=dev)
+            memory_pos = torch.zeros(1, B, C, device=dev)
+
+            pix_feat = model.memory_attention(
+                curr=v_feats[-1:],
+                curr_pos=v_pos[-1:],
+                memory=memory,
+                memory_pos=memory_pos,
+                num_obj_ptr_tokens=0,
+            )
+            backbone_feat = pix_feat.permute(1, 2, 0).view(B, C, fH, fW)
+
+            hr_feats = (
+                [x.permute(1, 2, 0).view(x.size(1), x.size(2), *s)
+                 for x, s in zip(v_feats[:-1], feat_sizes[:-1])]
+                if len(v_feats) > 1 else None
+            )
+
+            sparse_e, dense_e = model.sam_prompt_encoder(
+                points=None, boxes=box_t, masks=None, batch_size=B
+            )
+            low_res, _, _, _ = model.sam_mask_decoder(
+                image_embeddings=backbone_feat,
+                image_pe=model.sam_prompt_encoder.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_e,
+                dense_prompt_embeddings=dense_e,
+                multimask_output=False,
+                repeat_image=False,
+                high_res_features=hr_feats,
+            )
+            masks_up = _F.interpolate(low_res.float(), size=(IMG_SIZE, IMG_SIZE),
+                                      mode="bilinear", align_corners=False)
+            mask_1024 = (masks_up[0, 0] > 0.0).cpu().numpy()  # (1024, 1024) bool
 
         # Resize prediction back to original (H, W)
         pred_shw[s] = _resize_mask_to_hw(mask_1024, H, W)
