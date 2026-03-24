@@ -714,15 +714,17 @@ def run_ma_sam(
     ma_sam_root = Path(comparison_dir) / "MA-SAM-main" / "MA-SAM"
     ckpt_dir    = Path(weights_dir) / "ma_sam"
     ckpts = sorted(ckpt_dir.glob("*.pth")) + sorted(ckpt_dir.glob("*.pt"))
-    if len(ckpts) < 2:
-        raise FileNotFoundError(
-            f"Expected 2 checkpoints in {ckpt_dir} "
-            "(base sam_vit_h_4b8939.pth + MA-SAM adapted weights)"
-        )
-    # Largest file = base SAM ViT-H; smaller = adapted weights
-    ckpts_by_size = sorted(ckpts, key=lambda p: p.stat().st_size, reverse=True)
-    base_ckpt  = ckpts_by_size[0]
-    adapt_ckpt = ckpts_by_size[1]
+    if not ckpts:
+        raise FileNotFoundError(f"No checkpoint files found in {ckpt_dir}")
+
+    # Base SAM ViT-H is ~2.4 GB; MA-SAM adapted weights are much smaller.
+    # Use size ≥ 1 GB as the threshold to distinguish them — avoids loading
+    # 2.4 GB just to peek at keys.
+    _GB = 1024 ** 3
+    large = [c for c in ckpts if c.stat().st_size >= _GB]
+    small = [c for c in ckpts if c.stat().st_size <  _GB]
+    base_ckpt  = large[0] if large else None   # base SAM ViT-H (may be absent)
+    adapt_ckpt = (small or large)[0]           # MA-SAM adapted weights
 
     cache_key = str(adapt_ckpt)
     if not hasattr(run_ma_sam, "_cache") or run_ma_sam._cache[0] != cache_key:
@@ -746,7 +748,7 @@ def run_ma_sam(
         sam, _ = sam_model_registry["vit_h"](
             image_size=512,
             num_classes=num_classes,
-            checkpoint=str(base_ckpt),
+            checkpoint=str(base_ckpt) if base_ckpt else None,
             pixel_mean=[0., 0., 0.],
             pixel_std=[1., 1., 1.],
         )
