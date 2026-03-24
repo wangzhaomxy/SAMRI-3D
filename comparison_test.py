@@ -47,7 +47,7 @@ The filename does not matter — the script picks up whichever file is present.
 <weights_dir>/
 ├── sam_med3d/      <one .pth>   (https://huggingface.co/blueyo0/SAM-Med3D)
 ├── MedSAM2/        <one .pt>    (https://huggingface.co/wanglab/MedSAM2)
-├── medica_sam2/    <one .pt>    (https://huggingface.co/jiayuanz3/MedSAM2_pretrain)
+├── medical_sam2/    <one .pt>    (https://huggingface.co/jiayuanz3/MedSAM2_pretrain)
 │                                (override with --medical-sam2-ckpt /explicit/path)
 ├── samed2/         <one .pth>   (SAMed-2 GitHub page)
 │                                (override with --samed2-ckpt /explicit/path)
@@ -74,18 +74,18 @@ python comparison_test.py \\
 
 # Debug: limit to 2 cases per dataset
 python comparison_test.py \
---model samed2 \
+--model medical_sam2 \
 --dataset-path /scratch/user/s4670484/Datasets/SAMRI_datasets_3D/ /scratch/user/s4670484/Datasets/Zeroshot3D/ \
 --weights-dir /scratch/user/s4670484/comparison_ckpt/ \
---save-path /scratch/user/s4670484/Eval_results/comparison/samed2_debug.pkl \
+--save-path /scratch/user/s4670484/Eval_results/comparison/medical_sam2_debug.pkl \
 --max-cases 1
 
 example:
 python comparison_test.py \
---model medsam2 \
+--model sam_med3d \
 --dataset-path /scratch/user/s4670484/Datasets/SAMRI_datasets_3D/ /scratch/user/s4670484/Datasets/Zeroshot3D/ \
 --weights-dir /scratch/user/s4670484/comparison_ckpt/ \
---save-path /scratch/user/s4670484/Eval_results/comparison/medsam2.pkl
+--save-path /scratch/user/s4670484/Eval_results/comparison/sam_med3d.pkl
 """
 
 from __future__ import annotations
@@ -457,6 +457,12 @@ def run_medical_sam2(
     ckpt_path = (Path(medical_sam2_ckpt) if medical_sam2_ckpt else
                  _find_checkpoint(Path(weights_dir) / "medica_sam2", "Medical-SAM2"))
 
+    # sam2_train/__init__.py calls initialize_config_module("sam2_train") unconditionally.
+    # SAMRI2's sam2/__init__.py already initialized GlobalHydra with "sam2", so we must
+    # clear it BEFORE importing sam2_train (the import itself triggers __init__.py).
+    from hydra.core.global_hydra import GlobalHydra  # noqa: PLC0415
+    GlobalHydra.instance().clear()
+
     # Medical-SAM2 ships its own sam2_train package (no conflict with sam2)
     from sam2_train.build_sam import build_sam2_video_predictor  # noqa: PLC0415
 
@@ -470,8 +476,6 @@ def run_medical_sam2(
 
     cache_key = str(ckpt_path)
     if not hasattr(run_medical_sam2, "_cache") or run_medical_sam2._cache[0] != cache_key:
-        from hydra.core.global_hydra import GlobalHydra  # noqa: PLC0415
-        GlobalHydra.instance().clear()
         net = build_sam2_video_predictor(str(cfg_path), str(ckpt_path), device=device)
         net.eval()
         run_medical_sam2._cache = (cache_key, net)
