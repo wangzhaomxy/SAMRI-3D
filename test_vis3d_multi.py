@@ -54,9 +54,9 @@ Features:
 Examples:
 python test_vis3d_multi.py \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-path /scratch/user/s4670484/Model_save/gvt_3dloss/samri2_gvt_5x_3d_emb_K16_norm/sam2_gvt3dloss_epoch_48.pth \
+--ckpt-path /scratch/user/s4670484/Model_save/samri2_gvt2_recon_K16_rec32_new/sam2_gvt_tsdf_epoch_48.pth \
 --dataset-path /scratch/user/s4670484/Datasets/SAMRI_datasets_3D/ /scratch/user/s4670484/Datasets/Zeroshot3D/ \
---save-path /scratch/user/s4670484/Eval_results/SAMRI2_perlabel/samri2_gvt_3dloss_k16_epoch_48.pkl \
+--save-path /scratch/user/s4670484/Eval_results/SAMRI2_perlabel/samri2_gvt2_recon_K16_rec32_new_epoch_48.pkl \
 --num-workers 12 \
 --use-gvt
 """
@@ -289,7 +289,7 @@ def normalize_to_uint8(slice2d: np.ndarray) -> np.ndarray:
     This matches SAM2's expected preprocessing: images should be normalized
     to [0, 255] uint8 before being passed through SAM2Transforms.
     """
-    sl = slice2d.astype(np.float32)
+    sl = np.nan_to_num(slice2d.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
     sl_min, sl_max = sl.min(), sl.max()
     if sl_max - sl_min < 1e-8:
         sl_max = sl_min + 1e-8
