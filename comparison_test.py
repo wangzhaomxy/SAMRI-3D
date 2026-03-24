@@ -615,16 +615,14 @@ def run_samed2(
         s2d = normalize_to_uint8(vol_shw[s])
         pil = PILImage.fromarray(s2d).convert("RGB")
 
-        # Box from GT label on this slice, scaled to SAMed-2's 1024×1024 input
+        # Box from GT label on this slice, scaled to SAMed-2's 1024×1024 input.
+        # Skip slices with no foreground — predicting on empty slices inflates FP.
         box_hw = mask2d_to_bbox_xyxy((gt_shw[s] == label_id).astype(np.uint8))
-        if box_hw is not None:
-            box_1024 = (box_hw * np.array(
-                [IMG_SIZE / W, IMG_SIZE / H, IMG_SIZE / W, IMG_SIZE / H]
-            )).tolist()
-        else:
-            # Empty slice — use SAMed-2's default center-80% box
-            margin = IMG_SIZE * 0.1
-            box_1024 = [margin, margin, IMG_SIZE - margin, IMG_SIZE - margin]
+        if box_hw is None:
+            continue  # leave pred_shw[s] = False
+        box_1024 = (box_hw * np.array(
+            [IMG_SIZE / W, IMG_SIZE / H, IMG_SIZE / W, IMG_SIZE / H]
+        )).tolist()
 
         # SAMed-2's TemporalAdapter requires B divisible by d_size=2, so B must be 2.
         # predict.py duplicates the image but creates empty memory with B=1 (bug).
