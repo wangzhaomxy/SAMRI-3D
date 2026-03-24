@@ -612,17 +612,23 @@ def run_samed2(
             C = model.hidden_dim
             fH, fW = feat_sizes[-1]
 
-            # memory batch dim must match curr (B=2)
-            memory     = torch.zeros(1, B, C, device=dev)
-            memory_pos = torch.zeros(1, B, C, device=dev)
-
-            pix_feat = model.memory_attention(
-                curr=v_feats[-1:],
-                curr_pos=v_pos[-1:],
-                memory=memory,
-                memory_pos=memory_pos,
-                num_obj_ptr_tokens=0,
-            )
+            # SAMed-2 config has directly_add_no_mem_embed=True: for the no-memory
+            # (single-frame) case SAM2 skips memory_attention entirely and just adds
+            # no_mem_embed to the vision features.  The memory_attention cross-attention
+            # expects kv_in_dim=64, so passing zeros of dim C=256 would fail.
+            if getattr(model, "directly_add_no_mem_embed", False):
+                pix_feat = v_feats[-1] + model.no_mem_embed
+            else:
+                mem_dim = getattr(model, "mem_dim", 64)
+                memory     = torch.zeros(1, B, mem_dim, device=dev)
+                memory_pos = torch.zeros(1, B, mem_dim, device=dev)
+                pix_feat = model.memory_attention(
+                    curr=v_feats[-1:],
+                    curr_pos=v_pos[-1:],
+                    memory=memory,
+                    memory_pos=memory_pos,
+                    num_obj_ptr_tokens=0,
+                )
             backbone_feat = pix_feat.permute(1, 2, 0).view(B, C, fH, fW)
 
             hr_feats = (
