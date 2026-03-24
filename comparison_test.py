@@ -774,7 +774,7 @@ def run_ma_sam(
             pixel_mean=[0., 0., 0.],
             pixel_std=[1., 1., 1.],
         )
-        net = Fact_tt_Sam(sam, rank=32, s=1.0).to(device)
+        net = Fact_tt_Sam(sam, r=32, s=1.0).to(device)
         net.load_parameters(str(adapt_ckpt))
         net.eval()
         run_ma_sam._cache = (cache_key, net, num_classes)
