@@ -66,7 +66,7 @@ SAVE_PATH_2D_EMB="/scratch/user/s4670484/Model_save/samri2_2dloss_all3d_emb/"
 # ============================================================================
 SAVE_PATH_3D_EMB="/scratch/user/s4670484/Model_save/samri2_5x_3d_emb_256/"
 LAMBDA_2D=1.0               # Weight for 2D slice loss
-LAMBDA_3D=0               # Weight for 3D volume loss
+LAMBDA_3D=5.0               # Weight for 3D volume loss
 
 # ============================================================================
 # 2D Loss Image Mode Configuration (train_unified.py)
@@ -79,7 +79,7 @@ SAVE_PATH_2D_IMG="/scratch/user/s4670484/Model_save/samri2_2d_img/"
 # ============================================================================
 SAVE_PATH_GVT_V1="/scratch/user/s4670484/Model_save/samri2_gvt1_K16/"
 SAVE_PATH_GVT_V2="/scratch/user/s4670484/Model_save/samri2_gvt2_recon_K16_rec32_new/"
-SAVE_PATH_GVT_TSDF="/scratch/user/s4670484/Model_save/samri2_gvt3_tsdf_K16_AUX1_gated/"
+SAVE_PATH_GVT_TSDF="/scratch/user/s4670484/Model_save/samri2_gvt3_tsdf_K16_AUX1_gated_3d/"
 
 # GVT encoder
 GVT_NUM_TOKENS=16
