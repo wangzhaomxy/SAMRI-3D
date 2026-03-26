@@ -107,6 +107,7 @@ import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from datetime import timedelta
 from tqdm import tqdm
 
 # Prefer local ./sam2
@@ -448,7 +449,8 @@ def count_parameters(model):
 
 def ddp_setup(rank: int, world_size: int):
     """Setup distributed data parallel training."""
-    init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    init_process_group(backend="nccl", rank=rank, world_size=world_size,
+                       timeout=timedelta(hours=4))
     torch.cuda.set_device(rank)
 
 
