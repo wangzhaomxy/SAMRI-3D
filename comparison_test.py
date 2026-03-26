@@ -27,7 +27,10 @@ Implemented runners
                                _swap_sam2); 2D per-slice 1024×1024 input; box prompt
                                from GT per slice; aggregated to 3D volume.
 
-Stub (format incompatible)
+Stub (format incompatible) (running but too slow to run on the full test set, the 
+                            initial run is around 20 minutes, then 30 min for big slice case,
+                            using 22GB VRAM, so not suitable for large-scale evaluation 
+                            without further optimization):
 --------------------------
   ma_sam        MA-SAM       — requires Synapse-format pickle data (2Dimage_* / 2Dmask_*);
                                NIfTI input not supported by its test.py. Add a
@@ -58,26 +61,26 @@ The filename does not matter — the script picks up whichever file is present.
 Usage
 -----
 # Single model
-python comparison_test.py \\
-    --model medsam2 \\
-    --dataset-path /path/to/Test_3d/ /path/to/ZeroShot/ \\
-    --weights-dir /path/to/weights/ \\
+python comparison_test.py \
+    --model medsam2 \
+    --dataset-path /path/to/Test_3d/ /path/to/ZeroShot/ \
+    --weights-dir /path/to/weights/ \
     --save-path results/medsam2.pkl
 
 # All models sequentially (saves per-model .pkl and a combined .pkl)
-python comparison_test.py \\
-    --model all \\
-    --dataset-path /path/to/Test_3d/ /path/to/ZeroShot/ \\
-    --weights-dir /path/to/weights/ \\
-    --save-path results/comparison.pkl \\
+python comparison_test.py \
+    --model all \
+    --dataset-path /path/to/Test_3d/ /path/to/ZeroShot/ \
+    --weights-dir /path/to/weights/ \
+    --save-path results/comparison.pkl \
     --device cuda:0
 
 # Debug: limit to 2 cases per dataset
 python comparison_test.py \
---model ma_sam \
+--model samed2 \
 --dataset-path /scratch/user/s4670484/Datasets/SAMRI_datasets_3D/ /scratch/user/s4670484/Datasets/Zeroshot3D/ \
 --weights-dir /scratch/user/s4670484/comparison_ckpt/ \
---save-path /scratch/user/s4670484/Eval_results/comparison/ma_sam_debug.pkl \
+--save-path /scratch/user/s4670484/Eval_results/comparison/samed2_debug.pkl \
 --max-cases 1
 
 example:
