@@ -54,9 +54,9 @@ Features:
 Examples:
 python test_vis3d_multi.py \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
---ckpt-path /scratch/user/s4670484/Model_save/samri2_gvt2_recon_K16_rec32_new/sam2_gvt_tsdf_epoch_48.pth \
+--ckpt-path /scratch/user/s4670484/Model_save/samri2_gvt3_tsdf_K16_AUX1_gated/sam2_gvt_tsdf_epoch_48.pth \
 --dataset-path /scratch/user/s4670484/Datasets/SAMRI_datasets_3D/ /scratch/user/s4670484/Datasets/Zeroshot3D/ \
---save-path /scratch/user/s4670484/Eval_results/SAMRI2_perlabel/samri2_gvt2_recon_K16_rec32_new_epoch_48.pkl \
+--save-path /scratch/user/s4670484/Eval_results/SAMRI2_perlabel/samri2_gvt3_tsdf_K16_AUX1_gated.pkl \
 --num-workers 12 \
 --use-gvt
 """
@@ -1068,12 +1068,12 @@ def main():
         # Read GVT config from checkpoint
         ckpt_data = torch.load(args.ckpt_path, map_location="cpu", weights_only=True)
         gvt_cfg = ckpt_data.get("gvt_config", None)
+        sd = ckpt_data.get("model", ckpt_data)
         if gvt_cfg is not None:
             num_tokens = gvt_cfg["num_tokens"]
             num_layers = gvt_cfg["num_layers"]
             num_heads = gvt_cfg["num_heads"]
         else:
-            sd = ckpt_data.get("model", ckpt_data)
             q_key = "memory_attention.gvt_module.global_queries"
             num_tokens = sd[q_key].shape[0] if q_key in sd else 16
             layer_indices = set()
@@ -1082,13 +1082,16 @@ def main():
                     layer_indices.add(int(k.split("gvt_module.cross_attn.layers.")[1].split(".")[0]))
             num_layers = max(layer_indices) + 1 if layer_indices else 2
             num_heads = 4
+        use_gated = any("memory_gate" in k for k in sd)
         del ckpt_data
 
-        print(f"  GVT config: {num_tokens} tokens, {num_layers} layers, {num_heads} heads")
+        print(f"  GVT config: {num_tokens} tokens, {num_layers} layers, {num_heads} heads"
+              f"{', gated attention' if use_gated else ''}")
         predictor = build_sam2_video_predictor(args.sam2_config, ckpt_path=None, device=args.device)
         predictor = wrap_model_with_gvt(
             predictor, num_tokens=num_tokens, num_layers=num_layers,
             num_heads=num_heads, device=args.device,
+            use_gated_attention=use_gated,
         )
         load_gvt_checkpoint(predictor, args.ckpt_path, device=args.device)
         gvt_params = sum(p.numel() for p in predictor.memory_attention.gvt_module.parameters())
