@@ -105,7 +105,7 @@ TSDF_ALPHA=4.0              # Boundary upweighting factor
 
 # Gated Attention (Priority 1 experiment)
 # Set to "true" to enable Y' = Y ⊙ σ(X·W_G) gating on memory attention output
-USE_GATED_ATTENTION=true
+USE_GATED_ATTENTION=false
 
 # Additional GVT v3 training args
 WEIGHT_DECAY=0.01
