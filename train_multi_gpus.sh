@@ -36,7 +36,7 @@ export MASTER_PORT=$((26000 + RANDOM % 1000))  # Pick a port between 26000 ~ 269
 #   "gvt_v1"   - GVT v1: GVT encoder only (seg loss, no aux decoder)
 #   "gvt_v2"   - GVT v2: GVT encoder + GVTReconDecoder (label-conditioned recon loss)
 #   "gvt_v3"   - GVT v3: GVT encoder + GVTReconDecoder + TSDFDecoder (recon + TSDF)
-TRAINING_MODE="gvt_v1"  # Change this to switch between training modes
+TRAINING_MODE="gvt_v3"  # Change this to switch between training modes
 
 # Common paths
 SAM2_CONFIG="configs/sam2.1/sam2.1_hiera_s.yaml"
@@ -66,7 +66,7 @@ SAVE_PATH_2D_EMB="/scratch/user/s4670484/Model_save/samri2_2dloss_all3d_emb/"
 # ============================================================================
 SAVE_PATH_3D_EMB="/scratch/user/s4670484/Model_save/samri2_5x_3d_emb_256/"
 LAMBDA_2D=1.0               # Weight for 2D slice loss
-LAMBDA_3D=0.0               # Weight for 3D volume loss
+LAMBDA_3D=5.0               # Weight for 3D volume loss
 
 # ============================================================================
 # 2D Loss Image Mode Configuration (train_unified.py)
@@ -79,7 +79,7 @@ SAVE_PATH_2D_IMG="/scratch/user/s4670484/Model_save/samri2_2d_img/"
 # ============================================================================
 SAVE_PATH_GVT_V1="/scratch/user/s4670484/Model_save/samri2_gvt1_K16_perlabel/"
 SAVE_PATH_GVT_V2="/scratch/user/s4670484/Model_save/samri2_gvt2_recon_K16_rec32_new/"
-SAVE_PATH_GVT_TSDF="/scratch/user/s4670484/Model_save/samri2_gvt3_tsdf_K16_AUX1_gated_3d/"
+SAVE_PATH_GVT_TSDF="/scratch/user/s4670484/Model_save/samri2_gvt3_tsdf_K16_AUX1_5x3d/"
 
 # GVT encoder
 GVT_NUM_TOKENS=16
@@ -107,7 +107,7 @@ TSDF_ALPHA=4.0              # Boundary upweighting factor
 # Set to "true" to enable Y' = Y ⊙ σ(X·W_G) gating on memory attention output
 USE_GATED_ATTENTION=false
 
-# Additional GVT v3 training args
+# Additional GVT training args
 WEIGHT_DECAY=0.01
 MAX_GRAD_NORM=1.0
 MAX_LABELS_PER_SAMPLE=1     # Labels sampled per volume per epoch
