@@ -58,6 +58,26 @@ Every case's input image, resolved-label GT mask, and each model's full-resoluti
 spacing/origin/direction. This lets you redo overlay rendering (different contour
 colors, crop margins, etc.) straight from disk via --from-volumes, with no GPU /
 re-inference needed. Disable with --no-save-pred-volumes.
+
+=== Multi-environment workflow ===
+
+The comparison models each need their own conda env (sam_med3d / medical_sam2 /
+samed2), while the SAM2-native models (sam2_small, baseline, gvt_v1-3) share one.
+Run model subsets separately into the SAME --output-dir: each run appends its
+predictions to pred_volumes/ and MERGES case_meta.json, then a final --from-volumes
+pass assembles the combined figure. Use --skip-figures for the inference-only runs.
+
+  # env: samri (SAM2-native models)
+  python qualitative_study.py --samples-json ... --output-dir OUT --skip-figures \
+      --models sam2_small baseline gvt_v1 gvt_v2 gvt_v3
+  # env: sam_med3d
+  python qualitative_study.py --samples-json ... --output-dir OUT --skip-figures --models sam_med3d
+  # env: medical_sam2
+  python qualitative_study.py --samples-json ... --output-dir OUT --skip-figures --models medical_sam2
+  # env: samed2
+  python qualitative_study.py --samples-json ... --output-dir OUT --skip-figures --models samed2
+  # any env: assemble combined figures from accumulated volumes
+  python qualitative_study.py --output-dir OUT --from-volumes OUT/pred_volumes
 """
 
 from __future__ import annotations
@@ -142,6 +162,16 @@ MODEL_SPECS = {
 DEFAULT_MODEL_ORDER = [
     "sam2_small", "sam_med3d", "medical_sam2", "samed2", "baseline", "gvt_v1", "gvt_v2", "gvt_v3",
 ]
+
+
+def order_model_keys(keys) -> List[str]:
+    """Order an arbitrary set of model keys by the canonical figure-column order
+    (DEFAULT_MODEL_ORDER), appending any unknown keys at the end. Used when merging
+    models accumulated across separate per-environment runs."""
+    keyset = set(keys)
+    ordered = [k for k in DEFAULT_MODEL_ORDER if k in keyset]
+    ordered += [k for k in keys if k not in DEFAULT_MODEL_ORDER and k not in ordered]
+    return ordered
 
 
 # ----------------------------
@@ -236,21 +266,60 @@ def preflight_check_models(model_keys: List[str], args, log) -> Tuple[List[str],
 # ----------------------------
 # Label resolution
 # ----------------------------
-def resolve_label_id(gt_zyx: np.ndarray, label_field, dataset: str) -> int:
+def resolve_label_id(
+    gt_zyx: np.ndarray, label_field, dataset: str,
+    cut_axis: Optional[int] = None, cut_idx: Optional[int] = None,
+    voxel_pct: Optional[float] = None, log=None,
+) -> int:
+    """Resolve a case's target integer label ID.
+
+    Fast paths: an integer-like label_field is used directly; a single-label mask
+    resolves to its one non-zero ID. For a multi-label mask the named label is
+    resolved by inverting how qualitative_samples.json was produced from
+    test_vis3d_multi.py: the target label is the one whose per-label voxel fraction
+    (count / volume.size) matches `voxel_pct` and whose argmax-foreground slice along
+    `cut_axis` equals `cut_idx`. The final Dice-vs-expected table is the safety net —
+    a wrong resolution shows up there as a MISMATCH.
+    """
     try:
         return int(label_field)
     except (TypeError, ValueError):
         pass
+
     labels = get_labels_from_mask(gt_zyx)
+    if not labels:
+        raise RuntimeError(f"Mask for dataset '{dataset}' has no non-zero labels.")
     if len(labels) == 1:
         return labels[0]
-    voxel_counts = {lb: int((gt_zyx == lb).sum()) for lb in labels}
-    raise RuntimeError(
-        f"Cannot resolve label '{label_field}' for dataset '{dataset}': mask has "
-        f"{len(labels)} non-zero labels (voxel counts {voxel_counts}) and there is no "
-        f"name->ID mapping in this repo. Please confirm which integer ID corresponds "
-        f"to '{label_field}'."
-    )
+
+    if cut_idx is None or voxel_pct is None:
+        voxel_counts = {lb: int((gt_zyx == lb).sum()) for lb in labels}
+        raise RuntimeError(
+            f"Cannot resolve label '{label_field}' for dataset '{dataset}': mask has "
+            f"{len(labels)} non-zero labels (voxel counts {voxel_counts}) and no "
+            f"cut_idx/voxel_pct available to disambiguate."
+        )
+
+    gt0 = np.moveaxis(gt_zyx, cut_axis, 0)
+    total = float(gt_zyx.size)
+    frac = {lb: (gt_zyx == lb).sum() / total for lb in labels}
+    argmax_slice = {lb: int(np.argmax((gt0 == lb).sum(axis=(1, 2)))) for lb in labels}
+
+    # Prefer labels whose peak-foreground slice matches the recorded cut_idx; among
+    # them (or all labels if none match) pick the closest voxel fraction.
+    cut_matches = [lb for lb in labels if argmax_slice[lb] == cut_idx]
+    pool = cut_matches if cut_matches else labels
+    chosen = min(pool, key=lambda lb: abs(frac[lb] - voxel_pct))
+
+    if log is not None:
+        log(f"  [label] {dataset}/{label_field!r} -> id {chosen}  "
+            f"(voxel_frac={frac[chosen]:.4f} vs json {voxel_pct:.4f}; "
+            f"argmax_slice={argmax_slice[chosen]} vs cut_idx {cut_idx}; "
+            f"{'cut-matched' if chosen in cut_matches else 'NO cut match'})")
+    if not cut_matches and log is not None:
+        log(f"  [WARN] {dataset}/{label_field!r}: no label's argmax slice == cut_idx "
+            f"{cut_idx}; fell back to closest voxel_pct (id {chosen}). Check the Dice table.")
+    return chosen
 
 
 # ----------------------------
@@ -400,10 +469,14 @@ def load_case_from_volumes(case_dir: Path) -> Tuple[Dict, str, List[str]]:
 # ----------------------------
 # Per-case processing
 # ----------------------------
-def process_case(case: Dict, model_keys: List[str]) -> Dict:
+def process_case(case: Dict, model_keys: List[str], log=None) -> Dict:
     img_zyx, img_sitk = read_3d_image(case["img_path"])
     gt_zyx, _ = read_3d_image(case["mask_path"])
-    label_id = resolve_label_id(gt_zyx, case["label"], case["dataset"])
+    label_id = resolve_label_id(
+        gt_zyx, case["label"], case["dataset"],
+        cut_axis=case["cut_axis"], cut_idx=case["cut_idx"],
+        voxel_pct=case.get("voxel_pct"), log=log,
+    )
 
     spacing_xyz = img_sitk.GetSpacing()
     spacing_zyx = (float(spacing_xyz[2]), float(spacing_xyz[1]), float(spacing_xyz[0]))
@@ -541,6 +614,10 @@ def parse_args():
     p.add_argument("--allow-partial", action="store_true",
                     help="If some --models fail the pre-flight checkpoint check, proceed with "
                          "whichever models are available instead of aborting (default: abort).")
+    p.add_argument("--skip-figures", action="store_true",
+                    help="Run inference and save .nii.gz volumes + merge case_meta.json, but "
+                         "don't render figures. Use for per-environment subset runs, then do a "
+                         "final --from-volumes pass to assemble the combined figure.")
     return p.parse_args()
 
 
@@ -600,7 +677,7 @@ def run_inference_pipeline(args, log) -> Tuple[Dict[str, List[Dict]], List[str]]
         recs = []
         for case in cases:
             try:
-                rec = process_case(case, model_keys)
+                rec = process_case(case, model_keys, log=log)
                 if save_volumes:
                     cdir = case_dir_for(pred_volumes_dir, case)
                     save_volume_like(rec["img_zyx"], rec["img_sitk"], cdir / "input.nii.gz", dtype=np.float32)
@@ -667,18 +744,34 @@ def run_inference_pipeline(args, log) -> Tuple[Dict[str, List[Dict]], List[str]]
 
     # case_meta.json (written before dropping img_sitk/3D arrays) so a later
     # --from-volumes run can rebuild figures without touching the dataset.
+    # MERGE with any existing meta from a previous run so that running model
+    # subsets in separate conda envs accumulates into one pred_volumes/ dir
+    # (e.g. SAM2-native models in `samri`, then sam_med3d/medical_sam2/samed2
+    # each in their own env) instead of overwriting each other.
     if save_volumes:
         for rec in all_records:
             case = rec["case"]
             cdir = case_dir_for(pred_volumes_dir, case)
+            meta_path = cdir / "case_meta.json"
+            merged_keys: List[str] = []
+            merged_dice: Dict = {}
+            if meta_path.exists():
+                try:
+                    prev = json.loads(meta_path.read_text())
+                    merged_keys += list(prev.get("model_keys", []))
+                    merged_dice.update(prev.get("computed_dice", {}))
+                except Exception as e:
+                    log(f"[WARN] could not merge existing {meta_path}: {e}")
+            merged_keys += [k for k in model_keys if k not in merged_keys]
+            merged_dice.update(rec["computed_dice"])  # this run's results win on overlap
             meta = {
                 "case": case,
                 "label_id": rec["label_id"],
                 "group": rec_groups[case["dataset"] + "__" + case["label"]],
-                "model_keys": model_keys,
-                "computed_dice": rec["computed_dice"],
+                "model_keys": order_model_keys(merged_keys),
+                "computed_dice": merged_dice,
             }
-            (cdir / "case_meta.json").write_text(json.dumps(meta, indent=2))
+            meta_path.write_text(json.dumps(meta, indent=2))
 
     for rec in all_records:
         finalize_case_memory(rec)
@@ -691,7 +784,8 @@ def run_from_volumes_pipeline(args, log) -> Tuple[Dict[str, List[Dict]], List[st
     log(f"Rebuilding figures from saved volumes in: {pred_volumes_dir}")
 
     records_by_group: Dict[str, List[Dict]] = {"showcase": [], "failure": []}
-    model_keys: Optional[List[str]] = None
+    all_keys: List[str] = []
+    found_any = False
     for case_dir in sorted(p for p in pred_volumes_dir.iterdir() if p.is_dir()):
         meta_path = case_dir / "case_meta.json"
         if not meta_path.exists():
@@ -702,11 +796,15 @@ def run_from_volumes_pipeline(args, log) -> Tuple[Dict[str, List[Dict]], List[st
             log(f"[ERROR] failed to load {case_dir.name} from volumes: {e}")
             traceback.print_exc()
             continue
-        model_keys = mk
+        found_any = True
+        all_keys += [k for k in mk if k not in all_keys]
         records_by_group.setdefault(group, []).append(rec)
 
-    if model_keys is None:
+    if not found_any:
         raise SystemExit(f"No valid case_meta.json found under {pred_volumes_dir}")
+    # Only keep models that actually have a saved volume for at least one case.
+    model_keys = order_model_keys(all_keys)
+    log(f"  Combined models found across runs: {model_keys}")
     return records_by_group, model_keys
 
 
@@ -729,16 +827,20 @@ def main():
     else:
         records_by_group, model_keys = run_inference_pipeline(args, log)
 
-    # Per-case PNGs
-    for recs in records_by_group.values():
-        for rec in recs:
-            case = rec["case"]
-            fname = f"{sanitize_filename(case['dataset'])}__{sanitize_filename(case['label'])}.png"
-            render_single_case(rec, model_keys, out_dir / fname, dpi=args.dpi)
+    if args.skip_figures and not args.from_volumes:
+        log("\n--skip-figures set: skipping figure rendering (volumes + case_meta.json saved). "
+            "Run a final --from-volumes pass to assemble the combined figure.")
+    else:
+        # Per-case PNGs
+        for recs in records_by_group.values():
+            for rec in recs:
+                case = rec["case"]
+                fname = f"{sanitize_filename(case['dataset'])}__{sanitize_filename(case['label'])}.png"
+                render_single_case(rec, model_keys, out_dir / fname, dpi=args.dpi)
 
-    # Figure grids
-    render_grid(records_by_group["showcase"], model_keys, out_dir / "figure_showcase", dpi=args.dpi)
-    render_grid(records_by_group["failure"], model_keys, out_dir / "figure_failure", dpi=args.dpi)
+        # Figure grids
+        render_grid(records_by_group["showcase"], model_keys, out_dir / "figure_showcase", dpi=args.dpi)
+        render_grid(records_by_group["failure"], model_keys, out_dir / "figure_failure", dpi=args.dpi)
 
     # Verification table
     log("\n" + "=" * 70)
@@ -769,7 +871,11 @@ def main():
     with open(out_dir / "run_log.txt", "w") as f:
         f.write("\n".join(log_lines) + "\n")
 
-    print(f"\nSaved figures + run_log.txt to: {out_dir}")
+    if args.skip_figures and not args.from_volumes:
+        print(f"\nSaved prediction volumes + run_log.txt under: {out_dir} "
+              f"(figures skipped; assemble with --from-volumes)")
+    else:
+        print(f"\nSaved figures + run_log.txt to: {out_dir}")
 
 
 if __name__ == "__main__":
