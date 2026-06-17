@@ -44,7 +44,7 @@ Example:
 python qualitative_study.py \
 --samples-json /scratch/user/s4670484/qualitative_samples.json \
 --output-dir /scratch/user/s4670484/SAMRI2_qualitative/qualitative \
---models sam2_small sam_med3d medical_sam2 samed2 baseline gvt_v1 gvt_v2 gvt_v3
+--models sam2_small baseline gvt_v1 gvt_v2 gvt_v3 sam_med3d medical_sam2 samed2
 
 The SAMRI2 checkpoint defaults point at /scratch/.../Model_save/samri2/ (samri2_2dloss.pth,
 samri2_GVT_v1.pth, samri2_GVT_v2.pth, samri2_GVT_v3.pth) and the SAM2-Small init ckpt at
