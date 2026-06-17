@@ -381,8 +381,8 @@ def run_comparison_model(model_key: str, case: Dict, label_id: int, spacing_zyx:
 # ----------------------------
 # Colorblind-friendly overlay colors (avoid pure green/red).
 # Yellow + blue is the most colorblind-safe high-contrast pairing.
-GT_COLOR = "#FFD400"      # yellow — ground truth
-GT_RGB = (255 / 255, 212 / 255, 0 / 255)
+GT_COLOR = "#FFFF00"      # yellow — ground truth
+GT_RGB = (255 / 255, 255 / 255, 0 / 255)
 PRED_COLOR = "#1E88E5"    # blue — prediction
 PRED_RGB = (30 / 255, 136 / 255, 229 / 255)
 
