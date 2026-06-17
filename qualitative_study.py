@@ -46,11 +46,11 @@ python qualitative_study.py \
 --output-dir /scratch/user/s4670484/SAMRI2_qualitative/qualitative \
 --models sam2_small sam_med3d medical_sam2 samed2 baseline gvt_v1 gvt_v2 gvt_v3
 
-The checkpoint defaults below come from train_multi_gpus.sh save-path conventions
-(SAM2-Small init ckpt is exact; GVT v1/v2/v3/baseline final-checkpoint filenames are
-the scripts' own "*_final.pth" naming) — verify they exist before trusting figures,
-and override with --sam2-small-ckpt / --baseline-ckpt / --gvt-v1-ckpt / etc. and
---weights-dir (for sam_med3d / medical_sam2 / samed2) if they don't match your run.
+The SAMRI2 checkpoint defaults point at /scratch/.../Model_save/samri2/ (samri2_2dloss.pth,
+samri2_GVT_v1.pth, samri2_GVT_v2.pth, samri2_GVT_v3.pth) and the SAM2-Small init ckpt at
+pretrained_ckpt/ — verify they exist before trusting figures, and override with
+--sam2-small-ckpt / --baseline-ckpt / --gvt-v1-ckpt / etc. and --weights-dir
+(for sam_med3d / medical_sam2 / samed2) if they don't match your run.
 
 Every case's input image, resolved-label GT mask, and each model's full-resolution
 3D prediction are also saved as .nii.gz (plus a case_meta.json) under
@@ -105,10 +105,10 @@ except ImportError:
 # ----------------------------
 DEFAULT_BASE_SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_s.yaml"  # "s" config == small backbone
 DEFAULT_SAM2_SMALL_CKPT = "/scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt"
-DEFAULT_BASELINE_CKPT = "/scratch/user/s4670484/Model_save/samri2_2dloss_all3d_emb/sam2_emb3d_final.pth"
-DEFAULT_GVT_V1_CKPT = "/scratch/user/s4670484/Model_save/samri2_gvt1_K16_perlabel/sam2_gvt_tsdf_final.pth"
-DEFAULT_GVT_V2_CKPT = "/scratch/user/s4670484/Model_save/samri2_gvt2_recon_K16_rec32_new/sam2_gvt_tsdf_final.pth"
-DEFAULT_GVT_V3_CKPT = "/scratch/user/s4670484/Model_save/samri2_gvt3_tsdf_K16_AUX1_5x3d/sam2_gvt_tsdf_final.pth"
+DEFAULT_BASELINE_CKPT = "/scratch/user/s4670484/Model_save/samri2/samri2_2dloss.pth"
+DEFAULT_GVT_V1_CKPT = "/scratch/user/s4670484/Model_save/samri2/samri2_GVT_v1.pth"
+DEFAULT_GVT_V2_CKPT = "/scratch/user/s4670484/Model_save/samri2/samri2_GVT_v2.pth"
+DEFAULT_GVT_V3_CKPT = "/scratch/user/s4670484/Model_save/samri2/samri2_GVT_v3.pth"
 DEFAULT_COMPARISON_WEIGHTS_DIR = "/scratch/user/s4670484/comparison_ckpt/"
 DEFAULT_COMPARISON_DIR = str(_THIS_DIR / "comparison")
 
