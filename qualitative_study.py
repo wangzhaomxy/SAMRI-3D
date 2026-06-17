@@ -379,6 +379,13 @@ def run_comparison_model(model_key: str, case: Dict, label_id: int, spacing_zyx:
 # ----------------------------
 # Overlay rendering
 # ----------------------------
+# Colorblind-friendly overlay colors (avoid pure green/red).
+GT_COLOR = "#1E88E5"      # cyan-blue — ground truth
+GT_RGB = (30 / 255, 136 / 255, 229 / 255)
+PRED_COLOR = "#FB8C00"    # orange — prediction
+PRED_RGB = (251 / 255, 140 / 255, 0 / 255)
+
+
 def crop_bbox_from_mask(mask2d: np.ndarray, margin_frac: float = 0.2) -> Tuple[int, int, int, int]:
     H, W = mask2d.shape
     ys, xs = np.where(mask2d > 0)
@@ -394,24 +401,32 @@ def crop_bbox_from_mask(mask2d: np.ndarray, margin_frac: float = 0.2) -> Tuple[i
 def draw_panel(
     ax, img2d_uint8: np.ndarray, crop: Tuple[int, int, int, int],
     gt2d: Optional[np.ndarray] = None, pred2d: Optional[np.ndarray] = None,
+    gt_fill_alpha: float = 0.0, gt_contour: bool = True,
     pred_fill_alpha: float = 0.25, title: Optional[str] = None,
 ) -> None:
     y0, y1, x0, x1 = crop
     ax.imshow(img2d_uint8[y0:y1, x0:x1], cmap="gray", interpolation="nearest")
 
+    # GT area shade — used for the combined "Input + GT" panel
+    if gt2d is not None and gt_fill_alpha > 0:
+        gt_crop = gt2d[y0:y1, x0:x1]
+        fill = np.zeros((*gt_crop.shape, 4))
+        fill[gt_crop > 0] = (*GT_RGB, gt_fill_alpha)
+        ax.imshow(fill, interpolation="nearest")
+
     if pred2d is not None and pred_fill_alpha > 0:
         pred_crop = pred2d[y0:y1, x0:x1]
         fill = np.zeros((*pred_crop.shape, 4))
-        fill[pred_crop > 0] = (1.0, 0.0, 0.0, pred_fill_alpha)
+        fill[pred_crop > 0] = (*PRED_RGB, pred_fill_alpha)
         ax.imshow(fill, interpolation="nearest")
 
-    if gt2d is not None:
+    if gt2d is not None and gt_contour:
         for c in find_contours(gt2d[y0:y1, x0:x1].astype(float), 0.5):
-            ax.plot(c[:, 1], c[:, 0], color="lime", linewidth=2)
+            ax.plot(c[:, 1], c[:, 0], color=GT_COLOR, linewidth=2)
 
     if pred2d is not None:
         for c in find_contours(pred2d[y0:y1, x0:x1].astype(float), 0.5):
-            ax.plot(c[:, 1], c[:, 0], color="red", linewidth=2)
+            ax.plot(c[:, 1], c[:, 0], color=PRED_COLOR, linewidth=2)
 
     ax.set_xlim(0, x1 - x0)
     ax.set_ylim(y1 - y0, 0)
@@ -514,9 +529,34 @@ def finalize_case_memory(record: Dict) -> None:
 # ----------------------------
 # Figure assembly
 # ----------------------------
+def _draw_case_columns(axes_row, rec: Dict, model_keys: List[str], show_titles: bool) -> None:
+    """Draw one case's panels across a row of axes.
+
+    Column 0 = "Input + GT": full original-resolution slice with the GT area shaded
+    (no crop, no prediction). Remaining columns = per-model panels cropped to the GT
+    bounding box, with green GT contour + red prediction contour.
+    """
+    columns = ["input_gt"] + model_keys
+    full = rec["img_slice"].shape  # (H, W)
+    full_crop = (0, full[0], 0, full[1])
+    bbox_crop = crop_bbox_from_mask(rec["gt_slice"], margin_frac=0.2)
+
+    for j, col in enumerate(columns):
+        ax = axes_row[j]
+        if col == "input_gt":
+            draw_panel(ax, rec["img_slice"], full_crop, gt2d=rec["gt_slice"],
+                       gt_fill_alpha=0.35, gt_contour=False,
+                       title="Input + GT" if show_titles else None)
+        else:
+            dsc = rec["computed_dice"].get(col, float("nan"))
+            title = (f"{MODEL_SPECS[col]['title']}\nDice={dsc:.2f}"
+                     if show_titles else f"Dice={dsc:.2f}")
+            draw_panel(ax, rec["img_slice"], bbox_crop, gt2d=rec["gt_slice"],
+                       pred2d=rec["pred_slices"].get(col), title=title)
+
+
 def render_grid(records: List[Dict], model_keys: List[str], out_path_stem: Path, dpi: int) -> None:
-    columns = ["input", "gt"] + model_keys
-    ncols = len(columns)
+    ncols = 1 + len(model_keys)  # "Input + GT" + one column per model
     nrows = len(records)
     fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 2.2, nrows * 2.4))
     if nrows == 1:
@@ -524,26 +564,12 @@ def render_grid(records: List[Dict], model_keys: List[str], out_path_stem: Path,
 
     for i, rec in enumerate(records):
         case = rec["case"]
-        crop = crop_bbox_from_mask(rec["gt_slice"], margin_frac=0.2)
-        for j, col in enumerate(columns):
-            ax = axes[i, j]
-            if col == "input":
-                draw_panel(ax, rec["img_slice"], crop, title="Input" if i == 0 else None)
-            elif col == "gt":
-                draw_panel(ax, rec["img_slice"], crop, gt2d=rec["gt_slice"], title="GT" if i == 0 else None)
-            else:
-                dsc = rec["computed_dice"].get(col, float("nan"))
-                title = f"{MODEL_SPECS[col]['title']}\nDice={dsc:.2f}" if i == 0 else f"Dice={dsc:.2f}"
-                draw_panel(
-                    ax, rec["img_slice"], crop, gt2d=rec["gt_slice"],
-                    pred2d=rec["pred_slices"].get(col), title=title,
-                )
-            if j == 0:
-                ax.text(
-                    -0.25, 0.5, f"{case['dataset']} — {case['label']}",
-                    transform=ax.transAxes, ha="right", va="center",
-                    rotation=90, fontsize=8,
-                )
+        _draw_case_columns(axes[i], rec, model_keys, show_titles=(i == 0))
+        axes[i, 0].text(
+            -0.25, 0.5, f"{case['dataset']} — {case['label']}",
+            transform=axes[i, 0].transAxes, ha="right", va="center",
+            rotation=90, fontsize=8,
+        )
 
     fig.tight_layout()
     fig.savefig(str(out_path_stem) + ".pdf", dpi=dpi, bbox_inches="tight")
@@ -552,21 +578,9 @@ def render_grid(records: List[Dict], model_keys: List[str], out_path_stem: Path,
 
 
 def render_single_case(rec: Dict, model_keys: List[str], out_path: Path, dpi: int) -> None:
-    columns = ["input", "gt"] + model_keys
-    fig, axes = plt.subplots(1, len(columns), figsize=(len(columns) * 2.2, 2.6))
-    crop = crop_bbox_from_mask(rec["gt_slice"], margin_frac=0.2)
-    for j, col in enumerate(columns):
-        ax = axes[j]
-        if col == "input":
-            draw_panel(ax, rec["img_slice"], crop, title="Input")
-        elif col == "gt":
-            draw_panel(ax, rec["img_slice"], crop, gt2d=rec["gt_slice"], title="GT")
-        else:
-            dsc = rec["computed_dice"].get(col, float("nan"))
-            draw_panel(
-                ax, rec["img_slice"], crop, gt2d=rec["gt_slice"],
-                pred2d=rec["pred_slices"].get(col), title=f"{MODEL_SPECS[col]['title']}\nDice={dsc:.2f}",
-            )
+    ncols = 1 + len(model_keys)
+    fig, axes = plt.subplots(1, ncols, figsize=(ncols * 2.2, 2.6))
+    _draw_case_columns(axes, rec, model_keys, show_titles=True)
     fig.tight_layout()
     fig.savefig(str(out_path), dpi=dpi, bbox_inches="tight")
     plt.close(fig)
