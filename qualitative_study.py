@@ -64,8 +64,11 @@ re-inference needed. Disable with --no-save-pred-volumes.
 The comparison models each need their own conda env (sam_med3d / medical_sam2 /
 samed2), while the SAM2-native models (sam2_small, baseline, gvt_v1-3) share one.
 Run model subsets separately into the SAME --output-dir: each run appends its
-predictions to pred_volumes/ and MERGES case_meta.json, then a final --from-volumes
-pass assembles the combined figure. Use --skip-figures for the inference-only runs.
+predictions to pred_volumes/ and MERGES case_meta.json. Figures are always cumulative
+— after each inference run the figure is rebuilt from ALL models accumulated in
+pred_volumes/ so far (not just that run's subset), so the final env run already
+produces the complete figure. --skip-figures just suppresses that per-run rendering
+for the intermediate runs; a standalone --from-volumes pass can re-assemble anytime.
 
   # env: samri (SAM2-native models)
   python qualitative_study.py --samples-json ... --output-dir OUT --skip-figures \
@@ -621,13 +624,17 @@ def parse_args():
     return p.parse_args()
 
 
+def pred_volumes_dir_for(args) -> Path:
+    """Resolve where .nii.gz volumes live: --pred-volumes-dir, else <output-dir>/pred_volumes."""
+    return Path(args.pred_volumes_dir) if args.pred_volumes_dir else Path(args.output_dir) / "pred_volumes"
+
+
 def run_inference_pipeline(args, log) -> Tuple[Dict[str, List[Dict]], List[str]]:
     if not args.samples_json:
         raise SystemExit("--samples-json is required unless --from-volumes is set.")
 
-    out_dir = Path(args.output_dir)
     save_volumes = not args.no_save_pred_volumes
-    pred_volumes_dir = Path(args.pred_volumes_dir) if args.pred_volumes_dir else out_dir / "pred_volumes"
+    pred_volumes_dir = pred_volumes_dir_for(args)
 
     model_keys = list(args.models)
     if any(MODEL_SPECS[k]["kind"] == "comparison" for k in model_keys):
@@ -779,8 +786,8 @@ def run_inference_pipeline(args, log) -> Tuple[Dict[str, List[Dict]], List[str]]
     return records_by_group, model_keys
 
 
-def run_from_volumes_pipeline(args, log) -> Tuple[Dict[str, List[Dict]], List[str]]:
-    pred_volumes_dir = Path(args.from_volumes)
+def run_from_volumes_pipeline(pred_volumes_dir: Path, log) -> Tuple[Dict[str, List[Dict]], List[str]]:
+    pred_volumes_dir = Path(pred_volumes_dir)
     log(f"Rebuilding figures from saved volumes in: {pred_volumes_dir}")
 
     records_by_group: Dict[str, List[Dict]] = {"showcase": [], "failure": []}
@@ -823,9 +830,15 @@ def main():
         log_lines.append(msg)
 
     if args.from_volumes:
-        records_by_group, model_keys = run_from_volumes_pipeline(args, log)
+        records_by_group, model_keys = run_from_volumes_pipeline(Path(args.from_volumes), log)
     else:
         records_by_group, model_keys = run_inference_pipeline(args, log)
+        # Figures must reflect ALL models accumulated in pred_volumes/ (across separate
+        # per-environment runs), not just this run's in-memory subset. So when volumes
+        # were saved and we're about to render, reload the full merged set from disk.
+        if not args.skip_figures and not args.no_save_pred_volumes:
+            log("\nReloading all accumulated models from pred_volumes/ for cumulative figures...")
+            records_by_group, model_keys = run_from_volumes_pipeline(pred_volumes_dir_for(args), log)
 
     if args.skip_figures and not args.from_volumes:
         log("\n--skip-figures set: skipping figure rendering (volumes + case_meta.json saved). "
