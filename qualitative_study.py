@@ -380,10 +380,11 @@ def run_comparison_model(model_key: str, case: Dict, label_id: int, spacing_zyx:
 # Overlay rendering
 # ----------------------------
 # Colorblind-friendly overlay colors (avoid pure green/red).
-GT_COLOR = "#1E88E5"      # cyan-blue — ground truth
-GT_RGB = (30 / 255, 136 / 255, 229 / 255)
-PRED_COLOR = "#FB8C00"    # orange — prediction
-PRED_RGB = (251 / 255, 140 / 255, 0 / 255)
+# Yellow + blue is the most colorblind-safe high-contrast pairing.
+GT_COLOR = "#FFD400"      # yellow — ground truth
+GT_RGB = (255 / 255, 212 / 255, 0 / 255)
+PRED_COLOR = "#1E88E5"    # blue — prediction
+PRED_RGB = (30 / 255, 136 / 255, 229 / 255)
 
 
 def crop_bbox_from_mask(mask2d: np.ndarray, margin_frac: float = 0.2) -> Tuple[int, int, int, int]:
