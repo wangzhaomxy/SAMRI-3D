@@ -383,8 +383,8 @@ def run_comparison_model(model_key: str, case: Dict, label_id: int, spacing_zyx:
 # Yellow + blue is the most colorblind-safe high-contrast pairing.
 GT_COLOR = "#FFFF00"      # yellow — ground truth
 GT_RGB = (255 / 255, 255 / 255, 0 / 255)
-PRED_COLOR = "#1E88E5"    # blue — prediction
-PRED_RGB = (30 / 255, 136 / 255, 229 / 255)
+PRED_COLOR = "#4FC3F7"    # light sky blue — prediction
+PRED_RGB = (79 / 255, 195 / 255, 247 / 255)
 
 
 def crop_bbox_from_mask(mask2d: np.ndarray, margin_frac: float = 0.2) -> Tuple[int, int, int, int]:
