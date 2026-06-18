@@ -96,6 +96,42 @@ for the intermediate runs; a standalone --from-volumes pass can re-assemble anyt
   python qualitative_study.py --samples-json ... --output-dir OUT --skip-figures --models samed2
   # any env: assemble combined figures from accumulated volumes
   python qualitative_study.py --output-dir OUT --from-volumes OUT/pred_volumes
+
+=== Re-render from existing volumes (no inference) ===
+
+Once pred_volumes/ exists you can iterate on the *visualisation rule* (colors, crop,
+fonts, methods, model subset) and re-render without touching inference, by pointing
+--from-volumes at the saved volumes and writing to a NEW --output-dir. The source
+pred_volumes/ and the original figures are left untouched, so each variant lands in
+its own folder for comparison:
+
+  # edit the rendering code first (colors / crop / etc.), then:
+  python qualitative_study.py \
+      --from-volumes OUT/pred_volumes \
+      --output-dir   OUT_v2
+
+In --from-volumes mode --samples-json is not needed (each case is read from its
+case_meta.json). Two render filters compose:
+  --models <subset>      render only these model COLUMNS (intersected with what is
+                         saved; default = every model present). e.g. --models
+                         sam2_small baseline gvt_v3. Falls back to all-available if
+                         none of the requested models exist on disk.
+  --vis-methods <subset> render only these METHODS into their visN_* folders
+                         (default: all). e.g. --vis-methods vis2 vis5
+
+  # example: only triplanar + surface, only three model columns, into a new folder
+  python qualitative_study.py --from-volumes OUT/pred_volumes --output-dir OUT_v3 \
+      --models sam2_small baseline gvt_v3 --vis-methods vis2 vis5
+
+Note: --models is a render filter ONLY in --from-volumes mode. In the inference path
+it selects which models to RUN, and those runs stay cumulative (figures always reflect
+every model accumulated in pred_volumes/, not just that run's subset).
+
+Example:
+python qualitative_study.py \
+--from-volumes /scratch/user/s4670484/SAMRI2_qualitative/qualitative/pred_volumes \
+--output-dir   /scratch/user/s4670484/SAMRI2_qualitative/five_model_vis \
+--models sam2_small sam_med3d medical_sam2 samed2 gvt_v3
 """
 
 from __future__ import annotations
@@ -1320,6 +1356,17 @@ def main():
 
     if args.from_volumes:
         records_by_group, model_keys = run_from_volumes_pipeline(Path(args.from_volumes), log)
+        # In --from-volumes mode, --models doubles as a render filter: keep only the
+        # requested models (intersected with what's actually saved), in canonical order.
+        # Default --models is the full set, so by default everything available renders.
+        requested = set(args.models)
+        selected = [m for m in model_keys if m in requested]
+        if selected and selected != model_keys:
+            log(f"  Restricting render to --models subset: {selected}")
+            model_keys = selected
+        elif not selected:
+            log(f"[WARN] none of --models {args.models} are present in {args.from_volumes}; "
+                f"rendering all available: {model_keys}")
     else:
         records_by_group, model_keys = run_inference_pipeline(args, log)
         # Figures must reflect ALL models accumulated in pred_volumes/ (across separate
