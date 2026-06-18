@@ -797,28 +797,54 @@ def vis_mip(out_path: Path, V: Dict, model_keys: List[str], dpi: int) -> None:
     plt.close(fig)
 
 
-def _mesh_verts_faces(mask3d: np.ndarray, spacing_zyx: Tuple[float, float, float]):
+def _mesh_verts_faces(mask3d: np.ndarray, spacing_zyx: Tuple[float, float, float],
+                      step_size: int = 1):
     """Marching-cubes surface of a binary mask (padded so the surface closes).
-    Returns (verts, faces) in physical coords, or None if the mask is too small."""
+    Returns (verts, faces) in physical coords, or None if the mask is too small.
+    `step_size` > 1 coarsens the mesh (fewer triangles → cleaner wireframe)."""
     if int(mask3d.sum()) < 27:
         return None
     try:
         verts, faces, _, _ = marching_cubes(
-            np.pad(mask3d.astype(np.float32), 1), level=0.5, spacing=spacing_zyx)
+            np.pad(mask3d.astype(np.float32), 1), level=0.5,
+            spacing=spacing_zyx, step_size=step_size)
     except (RuntimeError, ValueError):
         return None
     return verts, faces
 
 
-def _add_mesh(ax, mask3d, spacing_zyx, color, alpha) -> Optional[np.ndarray]:
+def _add_mesh(ax, mask3d, spacing_zyx, color, alpha,
+              edgecolor="none", linewidth: float = 0.0, step_size: int = 1) -> Optional[np.ndarray]:
+    """Add a (translucent) solid surface. Alpha is baked into the face color so the
+    optional edge color/width is controlled independently."""
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-    mf = _mesh_verts_faces(mask3d, spacing_zyx)
+    mf = _mesh_verts_faces(mask3d, spacing_zyx, step_size=step_size)
     if mf is None:
         return None
     verts, faces = mf
-    mesh = Poly3DCollection(verts[faces], alpha=alpha)
-    mesh.set_facecolor(color)
-    mesh.set_edgecolor("none")
+    mesh = Poly3DCollection(verts[faces])
+    mesh.set_facecolor((*color, alpha))
+    mesh.set_edgecolor(edgecolor)
+    if linewidth:
+        mesh.set_linewidth(linewidth)
+    ax.add_collection3d(mesh)
+    return verts
+
+
+def _add_wireframe(ax, mask3d, spacing_zyx, color, alpha: float = 0.6,
+                   linewidth: float = 0.6, step_size: int = 3) -> Optional[np.ndarray]:
+    """Add a mask surface as an edge-only 'cage' (transparent faces). Lines don't
+    suffer matplotlib's 3D transparency-sorting artifacts, so an overlaid wireframe
+    prediction never hides the translucent GT volume beneath it."""
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    mf = _mesh_verts_faces(mask3d, spacing_zyx, step_size=step_size)
+    if mf is None:
+        return None
+    verts, faces = mf
+    # Fully transparent RGBA faces (not "none") — an empty facecolor array makes
+    # matplotlib's 3D projection raise in do_3d_projection.
+    mesh = Poly3DCollection(verts[faces], facecolors=(0, 0, 0, 0),
+                            edgecolors=(*color, alpha), linewidths=linewidth)
     ax.add_collection3d(mesh)
     return verts
 
@@ -850,11 +876,13 @@ def vis_surface(out_path: Path, V: Dict, model_keys: List[str], dpi: int) -> Non
                 verts_all.append(v)
             ax.set_title("GT", fontsize=8)
         else:
-            vg = _add_mesh(ax, V["gt"], sp, GT_RGB, alpha=0.18)
+            # Translucent GT volume + prediction as a wireframe cage on top, so the
+            # prediction never occludes the GT and the overlap is easy to read.
+            vg = _add_mesh(ax, V["gt"], sp, GT_RGB, alpha=0.30)
             if vg is not None:
                 verts_all.append(vg)
             if c in V["preds"]:
-                vp = _add_mesh(ax, V["preds"][c], sp, PRED_RGB, alpha=0.85)
+                vp = _add_wireframe(ax, V["preds"][c], sp, PRED_RGB)
                 if vp is not None:
                     verts_all.append(vp)
             ax.set_title(_model_title(V, c, True), fontsize=8)
@@ -920,10 +948,16 @@ def vis_error_volume(out_path: Path, V: Dict, model_keys: List[str], dpi: int) -
         verts_all = []
         if c in V["preds"]:
             pr = V["preds"][c]
-            for mask, color, alpha in ((pr & gt, (0.6, 0.6, 0.6), 0.12),
-                                       (pr & ~gt, FP_RGB, 0.85),
-                                       (~pr & gt, FN_RGB, 0.85)):
-                v = _add_mesh(ax, mask, sp, color, alpha)
+            # Translucent shells (+ thin matching edges) so back surfaces show
+            # through instead of being occluded by the front error region.
+            shells = (
+                (pr & gt, (0.6, 0.6, 0.6), 0.06, "none"),       # TP: faint context
+                (pr & ~gt, FP_RGB, 0.40, (*FP_RGB, 0.7)),       # FP: over-seg
+                (~pr & gt, FN_RGB, 0.40, (*FN_RGB, 0.7)),       # FN: under-seg
+            )
+            for mask, color, alpha, edge in shells:
+                v = _add_mesh(ax, mask, sp, color, alpha,
+                              edgecolor=edge, linewidth=0.2, step_size=2)
                 if v is not None:
                     verts_all.append(v)
         _finalize_3d(ax, verts_all)
