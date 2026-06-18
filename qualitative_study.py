@@ -398,8 +398,15 @@ def run_comparison_model(model_key: str, case: Dict, label_id: int, spacing_zyx:
 # Yellow + blue is the most colorblind-safe high-contrast pairing.
 GT_COLOR = "#FFFF00"      # yellow — ground truth
 GT_RGB = (255 / 255, 255 / 255, 0 / 255)
-PRED_COLOR = "#1565C0"    # deep royal blue — prediction
-PRED_RGB = (21 / 255, 101 / 255, 192 / 255)
+PRED_COLOR = "#e91e63"    # magenta/pink — prediction
+PRED_RGB = (233 / 255, 30 / 255, 99 / 255)
+
+# Larger + bold fonts so panel titles/labels/legends stay legible when several
+# figures are stacked/scaled down in the paper.
+TITLE_FONTSIZE = 13
+LABEL_FONTSIZE = 13
+LEGEND_FONTSIZE = 13
+FONT_WEIGHT = "bold"
 
 
 def _expand_to_min(lo: int, hi: int, min_size: int, limit: int) -> Tuple[int, int]:
@@ -436,6 +443,24 @@ def _safe_contours(arr2d: np.ndarray):
     if arr2d.shape[0] < 2 or arr2d.shape[1] < 2:
         return []
     return find_contours(arr2d.astype(float), 0.5)
+
+
+# Color legend shown at the bottom of GT-vs-prediction figures (vis1-5).
+GT_PRED_LEGEND = [("Ground truth", GT_COLOR), ("Prediction", PRED_COLOR)]
+
+
+def _add_bottom_legend(fig, entries) -> None:
+    """Add a horizontal color-key legend hanging just below the figure.
+
+    Uses loc='upper center' anchored at figure y=0 so the legend sits fully
+    below the axes (no overlap); savefig(bbox_inches='tight') captures it.
+    """
+    from matplotlib.patches import Patch
+    handles = [Patch(facecolor=col, edgecolor="none", label=lbl) for lbl, col in entries]
+    fig.legend(handles=handles, loc="upper center", ncol=len(entries),
+               frameon=False, fontsize=LEGEND_FONTSIZE,
+               prop={"weight": FONT_WEIGHT, "size": LEGEND_FONTSIZE},
+               bbox_to_anchor=(0.5, 0.0))
 
 
 def draw_panel(
@@ -480,7 +505,7 @@ def draw_panel(
         spine.set_color("lightgray")
         spine.set_linewidth(0.5)
     if title is not None:
-        ax.set_title(title, fontsize=8)
+        ax.set_title(title, fontsize=TITLE_FONTSIZE, fontweight=FONT_WEIGHT)
 
 
 def sanitize_filename(s: str) -> str:
@@ -632,10 +657,11 @@ def render_grid(records: List[Dict], model_keys: List[str], out_path_stem: Path,
         axes[i, 0].text(
             -0.25, 0.5, f"{case['dataset']} — {case['label']}",
             transform=axes[i, 0].transAxes, ha="right", va="center",
-            rotation=90, fontsize=8,
+            rotation=90, fontsize=LABEL_FONTSIZE, fontweight=FONT_WEIGHT,
         )
 
     fig.tight_layout()
+    _add_bottom_legend(fig, GT_PRED_LEGEND)
     fig.savefig(str(out_path_stem) + ".pdf", dpi=dpi, bbox_inches="tight")
     fig.savefig(str(out_path_stem) + ".png", dpi=dpi, bbox_inches="tight")
     plt.close(fig)
@@ -699,7 +725,7 @@ def _gt_centroid(gt3d: np.ndarray) -> Tuple[int, int, int]:
 
 def _row_label(ax, text: str) -> None:
     ax.text(-0.25, 0.5, text, transform=ax.transAxes, ha="right", va="center",
-            rotation=90, fontsize=8)
+            rotation=90, fontsize=LABEL_FONTSIZE, fontweight=FONT_WEIGHT)
 
 
 def _model_title(V: Dict, key: str, show: bool, with_dice: bool = True) -> Optional[str]:
@@ -735,6 +761,7 @@ def vis_cut_slice(out_path: Path, V: Dict, model_keys: List[str], dpi: int) -> N
     fig, axes = plt.subplots(1, ncols, figsize=(ncols * 2.2, 2.6))
     _slice_row(axes, V, model_keys, V["cut_axis"], V["cut_idx"], show_titles=True)
     fig.tight_layout()
+    _add_bottom_legend(fig, GT_PRED_LEGEND)
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
@@ -748,6 +775,7 @@ def vis_triplanar(out_path: Path, V: Dict, model_keys: List[str], dpi: int) -> N
         _slice_row(axes[r], V, model_keys, axis, centers[axis], show_titles=(r == 0))
         _row_label(axes[r, 0], PLANE_NAMES[axis])
     fig.tight_layout()
+    _add_bottom_legend(fig, GT_PRED_LEGEND)
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
@@ -768,6 +796,7 @@ def vis_montage(out_path: Path, V: Dict, model_keys: List[str], dpi: int, k: int
         _slice_row(axes[r], V, model_keys, axis, idx, show_titles=(r == 0))
         _row_label(axes[r, 0], f"{PLANE_NAMES[axis][:3]} {idx}")
     fig.tight_layout()
+    _add_bottom_legend(fig, GT_PRED_LEGEND)
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
@@ -793,6 +822,7 @@ def vis_mip(out_path: Path, V: Dict, model_keys: List[str], dpi: int) -> None:
                            title=_model_title(V, c, show), aspect=asp)
         _row_label(axes[r, 0], f"{PLANE_NAMES[axis]} MIP")
     fig.tight_layout()
+    _add_bottom_legend(fig, GT_PRED_LEGEND)
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
@@ -874,7 +904,7 @@ def vis_surface(out_path: Path, V: Dict, model_keys: List[str], dpi: int) -> Non
             v = _add_mesh(ax, V["gt"], sp, GT_RGB, alpha=0.9)
             if v is not None:
                 verts_all.append(v)
-            ax.set_title("GT", fontsize=8)
+            ax.set_title("GT", fontsize=TITLE_FONTSIZE, fontweight=FONT_WEIGHT)
         else:
             # Translucent GT volume + prediction as a wireframe cage on top, so the
             # prediction never occludes the GT and the overlap is easy to read.
@@ -885,9 +915,10 @@ def vis_surface(out_path: Path, V: Dict, model_keys: List[str], dpi: int) -> Non
                 vp = _add_wireframe(ax, V["preds"][c], sp, PRED_RGB)
                 if vp is not None:
                     verts_all.append(vp)
-            ax.set_title(_model_title(V, c, True), fontsize=8)
+            ax.set_title(_model_title(V, c, True), fontsize=TITLE_FONTSIZE, fontweight=FONT_WEIGHT)
         _finalize_3d(ax, verts_all)
     fig.tight_layout()
+    _add_bottom_legend(fig, [("Ground truth (solid)", GT_COLOR), ("Prediction (wireframe)", PRED_COLOR)])
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
@@ -914,7 +945,7 @@ def vis_surface_distance(out_path: Path, V: Dict, model_keys: List[str], dpi: in
         mf = _mesh_verts_faces(V["preds"].get(c, np.zeros_like(gt)), V["spacing_zyx"])
         if mf is None:
             ax.set_axis_off()
-            ax.set_title(_model_title(V, c, True), fontsize=8)
+            ax.set_title(_model_title(V, c, True), fontsize=TITLE_FONTSIZE, fontweight=FONT_WEIGHT)
             continue
         verts, faces = mf
         vox = np.clip(np.round(verts / sp).astype(int) - 1, 0, np.array(gt.shape) - 1)
@@ -925,11 +956,12 @@ def vis_surface_distance(out_path: Path, V: Dict, model_keys: List[str], dpi: in
         mesh.set_edgecolor("none")
         ax.add_collection3d(mesh)
         _finalize_3d(ax, [verts])
-        ax.set_title(_model_title(V, c, True), fontsize=8)
+        ax.set_title(_model_title(V, c, True), fontsize=TITLE_FONTSIZE, fontweight=FONT_WEIGHT)
     sm = cm.ScalarMappable(norm=norm, cmap=cmap)
     sm.set_array([])
-    fig.colorbar(sm, ax=fig.axes, fraction=0.015, pad=0.01,
-                 label="dist to GT surface (mm)")
+    cbar = fig.colorbar(sm, ax=fig.axes, fraction=0.015, pad=0.01)
+    cbar.set_label("dist to GT surface (mm)", fontsize=LABEL_FONTSIZE, fontweight=FONT_WEIGHT)
+    cbar.ax.tick_params(labelsize=LABEL_FONTSIZE - 2)
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
@@ -961,9 +993,9 @@ def vis_error_volume(out_path: Path, V: Dict, model_keys: List[str], dpi: int) -
                 if v is not None:
                     verts_all.append(v)
         _finalize_3d(ax, verts_all)
-        ax.set_title(_model_title(V, c, True), fontsize=8)
-    fig.suptitle("orange = false positive   ·   purple = false negative", fontsize=8, y=0.02)
+        ax.set_title(_model_title(V, c, True), fontsize=TITLE_FONTSIZE, fontweight=FONT_WEIGHT)
     fig.tight_layout()
+    _add_bottom_legend(fig, [("False positive", FP_RGB), ("False negative", FN_RGB)])
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
