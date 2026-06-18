@@ -398,8 +398,8 @@ def run_comparison_model(model_key: str, case: Dict, label_id: int, spacing_zyx:
 # Yellow + blue is the most colorblind-safe high-contrast pairing.
 GT_COLOR = "#FFFF00"      # yellow — ground truth
 GT_RGB = (255 / 255, 255 / 255, 0 / 255)
-PRED_COLOR = "#4FC3F7"    # light sky blue — prediction
-PRED_RGB = (79 / 255, 195 / 255, 247 / 255)
+PRED_COLOR = "#1565C0"    # deep royal blue — prediction
+PRED_RGB = (21 / 255, 101 / 255, 192 / 255)
 
 
 def _expand_to_min(lo: int, hi: int, min_size: int, limit: int) -> Tuple[int, int]:
