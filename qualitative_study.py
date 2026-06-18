@@ -54,10 +54,25 @@ pretrained_ckpt/ — verify they exist before trusting figures, and override wit
 
 Every case's input image, resolved-label GT mask, and each model's full-resolution
 3D prediction are also saved as .nii.gz (plus a case_meta.json) under
-<output-dir>/pred_volumes/<dataset>__<label>/, preserving the original NIfTI
+<output-dir>/pred_volumes/<dataset>__<img-filename>__<label>/, preserving the original NIfTI
 spacing/origin/direction. This lets you redo overlay rendering (different contour
 colors, crop margins, etc.) straight from disk via --from-volumes, with no GPU /
 re-inference needed. Disable with --no-save-pred-volumes.
+
+=== Visualisation methods (one folder each) ===
+
+Inference runs once; every requested visualisation is then rendered from pred_volumes/
+into its own <output-dir>/visN_*/ folder, so you can compare and pick. Select with
+--vis-methods (default: all). All methods use matplotlib+skimage+scipy (no pyvista/VTK):
+  vis1_cut_slice        single cut-slice overlay (+ combined showcase/failure grids)
+  vis2_triplanar        axial/coronal/sagittal through the GT centroid (spacing-correct)
+  vis3_montage          through-plane multi-slice strip along the propagation axis
+  vis4_mip              max-intensity projections from 3 axes
+  vis5_surface          3D surface mesh: GT (translucent) vs prediction
+  vis6_surface_distance prediction surface colored by distance-to-GT (mm)
+  vis7_error_volume     3D FP (orange) vs FN (purple) meshes
+vis5-7 are 3D renders (slower, lower-fidelity than a dedicated renderer); empty/tiny
+masks are skipped gracefully per case.
 
 === Multi-environment workflow ===
 
@@ -91,7 +106,7 @@ import sys
 import tempfile
 import traceback
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -100,7 +115,7 @@ import SimpleITK as sitk
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from skimage.measure import find_contours
+from skimage.measure import find_contours, marching_cubes
 
 _THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_THIS_DIR))
@@ -404,9 +419,12 @@ def draw_panel(
     gt2d: Optional[np.ndarray] = None, pred2d: Optional[np.ndarray] = None,
     gt_fill_alpha: float = 0.0, gt_contour: bool = True,
     pred_fill_alpha: float = 0.25, title: Optional[str] = None,
+    aspect: Optional[float] = None,
 ) -> None:
     y0, y1, x0, x1 = crop
     ax.imshow(img2d_uint8[y0:y1, x0:x1], cmap="gray", interpolation="nearest")
+    if aspect is not None:
+        ax.set_aspect(aspect)
 
     # GT area shade — used for the combined "Input + GT" panel
     if gt2d is not None and gt_fill_alpha > 0:
@@ -448,8 +466,29 @@ def sanitize_filename(s: str) -> str:
 # ----------------------------
 # .nii.gz volume persistence (so figures can be redone without re-inference)
 # ----------------------------
+def _img_stem(img_path: str) -> str:
+    """Filename of img_path with the medical-image extension stripped."""
+    name = Path(img_path).name
+    for ext in (".nii.gz", ".nii", ".mha", ".mhd", ".nrrd"):
+        if name.lower().endswith(ext):
+            return name[: -len(ext)]
+    return Path(name).stem
+
+
+def case_uid(case: Dict) -> str:
+    """Stable unique id per JSON case. The JSON may contain several cases sharing the
+    same (dataset, label) (different patients/instances), so the image filename — which
+    encodes the patient/instance — is included to keep their volumes/metadata distinct.
+    """
+    return "__".join((
+        sanitize_filename(case["dataset"]),
+        sanitize_filename(_img_stem(case["img_path"])),
+        sanitize_filename(str(case["label"])),
+    ))
+
+
 def case_dir_for(pred_volumes_dir: Path, case: Dict) -> Path:
-    return pred_volumes_dir / f"{sanitize_filename(case['dataset'])}__{sanitize_filename(case['label'])}"
+    return pred_volumes_dir / case_uid(case)
 
 
 def save_volume_like(arr: np.ndarray, ref_img: "sitk.Image", out_path: Path, dtype=np.uint8) -> None:
@@ -588,6 +627,346 @@ def render_single_case(rec: Dict, model_keys: List[str], out_path: Path, dpi: in
 
 
 # ----------------------------
+# Multi-method 3D visualisation
+# (one folder per method under <output-dir>; all driven from pred_volumes/, so
+#  inference runs once and every method is rendered from the saved .nii.gz)
+# ----------------------------
+PLANE_NAMES = {0: "Axial", 1: "Coronal", 2: "Sagittal"}
+
+
+def load_case_volumes(case_dir: Path, model_keys: List[str]) -> Optional[Dict]:
+    """Load a case's full 3D volumes + spacing from its pred_volumes/<case>/ dir."""
+    meta_path = case_dir / "case_meta.json"
+    if not meta_path.exists():
+        return None
+    meta = json.loads(meta_path.read_text())
+    case = meta["case"]
+    img_sitk = sitk.ReadImage(str(case_dir / "input.nii.gz"))
+    img = sitk.GetArrayFromImage(img_sitk).astype(np.float32)
+    gt = sitk.GetArrayFromImage(sitk.ReadImage(str(case_dir / "gt.nii.gz"))) > 0
+    sp = img_sitk.GetSpacing()  # (x, y, z)
+    spacing_zyx = (float(sp[2]), float(sp[1]), float(sp[0]))
+    preds = {}
+    for k in model_keys:
+        p = case_dir / f"{k}.nii.gz"
+        if p.exists():
+            preds[k] = sitk.GetArrayFromImage(sitk.ReadImage(str(p))) > 0
+    return {
+        "meta": meta, "case": case, "img": img, "gt": gt, "preds": preds,
+        "spacing_zyx": spacing_zyx,
+        "cut_axis": int(case["cut_axis"]), "cut_idx": int(case["cut_idx"]),
+        "computed_dice": meta.get("computed_dice", {}),
+    }
+
+
+def _plane_aspect(spacing_zyx: Tuple[float, float, float], axis: int) -> float:
+    """Physically correct imshow aspect for the plane perpendicular to `axis`."""
+    other = [a for a in (0, 1, 2) if a != axis]
+    col = spacing_zyx[other[1]]
+    return spacing_zyx[other[0]] / col if col > 0 else 1.0
+
+
+def _gt_centroid(gt3d: np.ndarray) -> Tuple[int, int, int]:
+    pts = np.argwhere(gt3d)
+    if pts.size == 0:
+        return tuple(s // 2 for s in gt3d.shape)  # type: ignore
+    return tuple(int(round(v)) for v in pts.mean(axis=0))  # type: ignore
+
+
+def _row_label(ax, text: str) -> None:
+    ax.text(-0.25, 0.5, text, transform=ax.transAxes, ha="right", va="center",
+            rotation=90, fontsize=8)
+
+
+def _model_title(V: Dict, key: str, show: bool, with_dice: bool = True) -> Optional[str]:
+    if not show:
+        return None
+    if with_dice:
+        return f"{MODEL_SPECS[key]['title']}\nDice={V['computed_dice'].get(key, float('nan')):.2f}"
+    return MODEL_SPECS[key]["title"]
+
+
+def _slice_row(axes_row, V: Dict, model_keys: List[str], axis: int, idx: int,
+               show_titles: bool, crop_models: bool = True, label_suffix: str = "") -> None:
+    """Draw one row: Input+GT (full) then each model (cropped) for slice `idx` along `axis`."""
+    img2d = normalize_to_uint8(np.take(V["img"], idx, axis=axis))
+    gt2d = np.take(V["gt"], idx, axis=axis)
+    asp = _plane_aspect(V["spacing_zyx"], axis)
+    full = (0, img2d.shape[0], 0, img2d.shape[1])
+    bbox = crop_bbox_from_mask(gt2d) if (crop_models and gt2d.any()) else full
+    cols = ["input_gt"] + model_keys
+    for j, c in enumerate(cols):
+        ax = axes_row[j]
+        if c == "input_gt":
+            draw_panel(ax, img2d, full, gt2d=gt2d, gt_fill_alpha=0.35, gt_contour=False,
+                       title=("Input + GT" + label_suffix) if show_titles else None, aspect=asp)
+        else:
+            pr = np.take(V["preds"][c], idx, axis=axis) if c in V["preds"] else None
+            draw_panel(ax, img2d, bbox, gt2d=gt2d, pred2d=pr,
+                       title=_model_title(V, c, show_titles), aspect=asp)
+
+
+def vis_cut_slice(out_path: Path, V: Dict, model_keys: List[str], dpi: int) -> None:
+    ncols = 1 + len(model_keys)
+    fig, axes = plt.subplots(1, ncols, figsize=(ncols * 2.2, 2.6))
+    _slice_row(axes, V, model_keys, V["cut_axis"], V["cut_idx"], show_titles=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
+def vis_triplanar(out_path: Path, V: Dict, model_keys: List[str], dpi: int) -> None:
+    cz, cy, cx = _gt_centroid(V["gt"])
+    centers = {0: cz, 1: cy, 2: cx}
+    ncols = 1 + len(model_keys)
+    fig, axes = plt.subplots(3, ncols, figsize=(ncols * 2.2, 3 * 2.4))
+    for r, axis in enumerate((0, 1, 2)):
+        _slice_row(axes[r], V, model_keys, axis, centers[axis], show_titles=(r == 0))
+        _row_label(axes[r, 0], PLANE_NAMES[axis])
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
+def vis_montage(out_path: Path, V: Dict, model_keys: List[str], dpi: int, k: int = 6) -> None:
+    axis = V["cut_axis"]
+    other = tuple(a for a in (0, 1, 2) if a != axis)
+    present = np.where(V["gt"].any(axis=other))[0]
+    if present.size == 0:
+        present = np.array([V["cut_idx"]])
+    sel = sorted(set(np.linspace(present.min(), present.max(),
+                                 num=min(k, present.size)).round().astype(int).tolist()))
+    ncols = 1 + len(model_keys)
+    fig, axes = plt.subplots(len(sel), ncols, figsize=(ncols * 2.0, len(sel) * 2.0))
+    if len(sel) == 1:
+        axes = axes[None, :]
+    for r, idx in enumerate(sel):
+        _slice_row(axes[r], V, model_keys, axis, idx, show_titles=(r == 0))
+        _row_label(axes[r, 0], f"{PLANE_NAMES[axis][:3]} {idx}")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
+def vis_mip(out_path: Path, V: Dict, model_keys: List[str], dpi: int) -> None:
+    ncols = 1 + len(model_keys)
+    fig, axes = plt.subplots(3, ncols, figsize=(ncols * 2.2, 3 * 2.4))
+    cols = ["input_gt"] + model_keys
+    for r, axis in enumerate((0, 1, 2)):
+        img2d = normalize_to_uint8(V["img"].max(axis=axis))
+        gt2d = V["gt"].any(axis=axis)
+        asp = _plane_aspect(V["spacing_zyx"], axis)
+        full = (0, img2d.shape[0], 0, img2d.shape[1])
+        for j, c in enumerate(cols):
+            ax = axes[r, j]
+            show = (r == 0)
+            if c == "input_gt":
+                draw_panel(ax, img2d, full, gt2d=gt2d, gt_fill_alpha=0.35, gt_contour=False,
+                           title="Input + GT (MIP)" if show else None, aspect=asp)
+            else:
+                pr = V["preds"][c].any(axis=axis) if c in V["preds"] else None
+                draw_panel(ax, img2d, full, gt2d=gt2d, pred2d=pr,
+                           title=_model_title(V, c, show), aspect=asp)
+        _row_label(axes[r, 0], f"{PLANE_NAMES[axis]} MIP")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _mesh_verts_faces(mask3d: np.ndarray, spacing_zyx: Tuple[float, float, float]):
+    """Marching-cubes surface of a binary mask (padded so the surface closes).
+    Returns (verts, faces) in physical coords, or None if the mask is too small."""
+    if int(mask3d.sum()) < 27:
+        return None
+    try:
+        verts, faces, _, _ = marching_cubes(
+            np.pad(mask3d.astype(np.float32), 1), level=0.5, spacing=spacing_zyx)
+    except (RuntimeError, ValueError):
+        return None
+    return verts, faces
+
+
+def _add_mesh(ax, mask3d, spacing_zyx, color, alpha) -> Optional[np.ndarray]:
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    mf = _mesh_verts_faces(mask3d, spacing_zyx)
+    if mf is None:
+        return None
+    verts, faces = mf
+    mesh = Poly3DCollection(verts[faces], alpha=alpha)
+    mesh.set_facecolor(color)
+    mesh.set_edgecolor("none")
+    ax.add_collection3d(mesh)
+    return verts
+
+
+def _finalize_3d(ax, all_verts: List[np.ndarray]) -> None:
+    ax.set_axis_off()
+    if not all_verts:
+        return
+    v = np.concatenate(all_verts, axis=0)
+    mins, maxs = v.min(0), v.max(0)
+    ax.set_box_aspect(tuple((maxs - mins) + 1e-6))
+    for setlim, lo, hi in ((ax.set_xlim, mins[0], maxs[0]),
+                           (ax.set_ylim, mins[1], maxs[1]),
+                           (ax.set_zlim, mins[2], maxs[2])):
+        setlim(lo, hi)
+    ax.view_init(elev=20, azim=-60)
+
+
+def vis_surface(out_path: Path, V: Dict, model_keys: List[str], dpi: int) -> None:
+    cols = ["GT"] + model_keys
+    fig = plt.figure(figsize=(len(cols) * 2.6, 3.0))
+    sp = V["spacing_zyx"]
+    for j, c in enumerate(cols):
+        ax = fig.add_subplot(1, len(cols), j + 1, projection="3d")
+        verts_all = []
+        if c == "GT":
+            v = _add_mesh(ax, V["gt"], sp, GT_RGB, alpha=0.9)
+            if v is not None:
+                verts_all.append(v)
+            ax.set_title("GT", fontsize=8)
+        else:
+            vg = _add_mesh(ax, V["gt"], sp, GT_RGB, alpha=0.18)
+            if vg is not None:
+                verts_all.append(vg)
+            if c in V["preds"]:
+                vp = _add_mesh(ax, V["preds"][c], sp, PRED_RGB, alpha=0.85)
+                if vp is not None:
+                    verts_all.append(vp)
+            ax.set_title(_model_title(V, c, True), fontsize=8)
+        _finalize_3d(ax, verts_all)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
+def vis_surface_distance(out_path: Path, V: Dict, model_keys: List[str], dpi: int,
+                         vmax_mm: float = 10.0) -> None:
+    from scipy.ndimage import distance_transform_edt
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    import matplotlib.cm as cm
+    from matplotlib import colormaps
+    from matplotlib.colors import Normalize
+
+    sp = np.asarray(V["spacing_zyx"], dtype=np.float32)
+    gt = V["gt"]
+    # Unsigned physical distance to the GT surface (mm).
+    dist = np.minimum(distance_transform_edt(~gt, sampling=sp),
+                      distance_transform_edt(gt, sampling=sp))
+    norm = Normalize(vmin=0.0, vmax=vmax_mm)
+    cmap = colormaps["inferno"]
+
+    fig = plt.figure(figsize=(len(model_keys) * 2.6 + 0.6, 3.0))
+    for j, c in enumerate(model_keys):
+        ax = fig.add_subplot(1, len(model_keys), j + 1, projection="3d")
+        mf = _mesh_verts_faces(V["preds"].get(c, np.zeros_like(gt)), V["spacing_zyx"])
+        if mf is None:
+            ax.set_axis_off()
+            ax.set_title(_model_title(V, c, True), fontsize=8)
+            continue
+        verts, faces = mf
+        vox = np.clip(np.round(verts / sp).astype(int) - 1, 0, np.array(gt.shape) - 1)
+        dvals = dist[vox[:, 0], vox[:, 1], vox[:, 2]]
+        face_d = dvals[faces].mean(axis=1)
+        mesh = Poly3DCollection(verts[faces])
+        mesh.set_facecolor(cmap(norm(face_d)))
+        mesh.set_edgecolor("none")
+        ax.add_collection3d(mesh)
+        _finalize_3d(ax, [verts])
+        ax.set_title(_model_title(V, c, True), fontsize=8)
+    sm = cm.ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    fig.colorbar(sm, ax=fig.axes, fraction=0.015, pad=0.01,
+                 label="dist to GT surface (mm)")
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
+# Error-volume colors: orange = false positive (over-seg), purple = false negative (under-seg).
+FP_RGB = (251 / 255, 140 / 255, 0 / 255)
+FN_RGB = (142 / 255, 36 / 255, 170 / 255)
+
+
+def vis_error_volume(out_path: Path, V: Dict, model_keys: List[str], dpi: int) -> None:
+    sp = V["spacing_zyx"]
+    gt = V["gt"]
+    fig = plt.figure(figsize=(len(model_keys) * 2.6, 3.0))
+    for j, c in enumerate(model_keys):
+        ax = fig.add_subplot(1, len(model_keys), j + 1, projection="3d")
+        verts_all = []
+        if c in V["preds"]:
+            pr = V["preds"][c]
+            for mask, color, alpha in ((pr & gt, (0.6, 0.6, 0.6), 0.12),
+                                       (pr & ~gt, FP_RGB, 0.85),
+                                       (~pr & gt, FN_RGB, 0.85)):
+                v = _add_mesh(ax, mask, sp, color, alpha)
+                if v is not None:
+                    verts_all.append(v)
+        _finalize_3d(ax, verts_all)
+        ax.set_title(_model_title(V, c, True), fontsize=8)
+    fig.suptitle("orange = false positive   ·   purple = false negative", fontsize=8, y=0.02)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
+# Ordered registry: folder name -> renderer. "visN_" prefix preserves a stable order.
+VIS_METHODS: "Dict[str, Callable]" = {
+    "vis1_cut_slice": vis_cut_slice,
+    "vis2_triplanar": vis_triplanar,
+    "vis3_montage": vis_montage,
+    "vis4_mip": vis_mip,
+    "vis5_surface": vis_surface,
+    "vis6_surface_distance": vis_surface_distance,
+    "vis7_error_volume": vis_error_volume,
+}
+VIS_NUM_TO_FOLDER = {f"vis{i + 1}": name for i, name in enumerate(VIS_METHODS)}
+
+
+def resolve_vis_methods(tokens: List[str]) -> List[str]:
+    """Map CLI tokens ('all' | 'vis1'.. | full folder name) to ordered folder names."""
+    if not tokens or "all" in tokens:
+        return list(VIS_METHODS)
+    chosen = []
+    for t in tokens:
+        folder = VIS_NUM_TO_FOLDER.get(t, t)
+        if folder in VIS_METHODS and folder not in chosen:
+            chosen.append(folder)
+    return [m for m in VIS_METHODS if m in chosen]  # keep canonical order
+
+
+def generate_visualisations(pred_volumes_dir: Path, out_dir: Path,
+                            records_by_group: Dict[str, List[Dict]], model_keys: List[str],
+                            method_folders: List[str], dpi: int, log) -> None:
+    """Render every requested method into out_dir/<folder>/, loading each case's
+    volumes from pred_volumes/ once and feeding all enabled per-case renderers."""
+    for folder in method_folders:
+        (out_dir / folder).mkdir(parents=True, exist_ok=True)
+
+    # vis1 also gets the combined showcase/failure grids (the multi-case overview).
+    if "vis1_cut_slice" in method_folders:
+        sub = out_dir / "vis1_cut_slice"
+        try:
+            render_grid(records_by_group["showcase"], model_keys, sub / "figure_showcase", dpi)
+            render_grid(records_by_group["failure"], model_keys, sub / "figure_failure", dpi)
+        except Exception as e:
+            log(f"[WARN] vis1 grid rendering failed: {e}")
+
+    case_dirs = sorted(p for p in Path(pred_volumes_dir).iterdir() if p.is_dir())
+    log(f"\nRendering {len(method_folders)} visualisation method(s) for {len(case_dirs)} "
+        f"case(s): {method_folders}")
+    for cd in case_dirs:
+        V = load_case_volumes(cd, model_keys)
+        if V is None:
+            continue
+        for folder in method_folders:
+            try:
+                VIS_METHODS[folder](out_dir / folder / f"{cd.name}.png", V, model_keys, dpi)
+            except Exception as e:
+                log(f"[WARN] {folder} failed for {cd.name}: {e}")
+
+
+# ----------------------------
 # CLI
 # ----------------------------
 def parse_args():
@@ -599,6 +978,11 @@ def parse_args():
     p.add_argument("--prompt-mode", choices=["box", "mask"], default="box")
     p.add_argument("--dpi", type=int, default=300)
     p.add_argument("--dice-tolerance", type=float, default=0.03)
+    p.add_argument("--vis-methods", nargs="+", default=["all"],
+                    choices=["all"] + list(VIS_NUM_TO_FOLDER) + list(VIS_METHODS),
+                    help="Which visualisation method(s) to render, each into its own "
+                         "<output-dir>/visN_* folder. 'all' (default) renders every method; "
+                         "or pass e.g. vis1 vis2 vis5. vis5-7 are 3D renders (slower).")
 
     p.add_argument("--models", nargs="+", default=DEFAULT_MODEL_ORDER, choices=list(MODEL_SPECS),
                     help="Which model columns to run, in order (default: all candidates, "
@@ -711,7 +1095,7 @@ def run_inference_pipeline(args, log) -> Tuple[Dict[str, List[Dict]], List[str]]
                 traceback.print_exc()
         records_by_group[group_name] = recs
 
-    rec_groups = {rec["case"]["dataset"] + "__" + rec["case"]["label"]: g
+    rec_groups = {case_uid(rec["case"]): g
                   for g, recs in records_by_group.items() for rec in recs}
     all_records = records_by_group["showcase"] + records_by_group["failure"]
 
@@ -789,7 +1173,7 @@ def run_inference_pipeline(args, log) -> Tuple[Dict[str, List[Dict]], List[str]]
             meta = {
                 "case": case,
                 "label_id": rec["label_id"],
-                "group": rec_groups[case["dataset"] + "__" + case["label"]],
+                "group": rec_groups[case_uid(case)],
                 "model_keys": order_model_keys(merged_keys),
                 "computed_dice": merged_dice,
             }
@@ -855,20 +1239,19 @@ def main():
             log("\nReloading all accumulated models from pred_volumes/ for cumulative figures...")
             records_by_group, model_keys = run_from_volumes_pipeline(pred_volumes_dir_for(args), log)
 
+    pvd = Path(args.from_volumes) if args.from_volumes else pred_volumes_dir_for(args)
+    volumes_available = bool(args.from_volumes) or not args.no_save_pred_volumes
+
     if args.skip_figures and not args.from_volumes:
         log("\n--skip-figures set: skipping figure rendering (volumes + case_meta.json saved). "
-            "Run a final --from-volumes pass to assemble the combined figure.")
+            "Run a final --from-volumes pass to assemble the combined figures.")
+    elif not volumes_available:
+        log("\n[WARN] --no-save-pred-volumes leaves no 3D volumes on disk; the multi-method "
+            "visualisations need them. Skipping figures (use without --no-save-pred-volumes).")
     else:
-        # Per-case PNGs
-        for recs in records_by_group.values():
-            for rec in recs:
-                case = rec["case"]
-                fname = f"{sanitize_filename(case['dataset'])}__{sanitize_filename(case['label'])}.png"
-                render_single_case(rec, model_keys, out_dir / fname, dpi=args.dpi)
-
-        # Figure grids
-        render_grid(records_by_group["showcase"], model_keys, out_dir / "figure_showcase", dpi=args.dpi)
-        render_grid(records_by_group["failure"], model_keys, out_dir / "figure_failure", dpi=args.dpi)
+        methods = resolve_vis_methods(args.vis_methods)
+        generate_visualisations(pvd, out_dir, records_by_group, model_keys, methods,
+                                dpi=args.dpi, log=log)
 
     # Verification table
     log("\n" + "=" * 70)
