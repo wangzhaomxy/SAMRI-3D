@@ -402,7 +402,18 @@ PRED_COLOR = "#4FC3F7"    # light sky blue — prediction
 PRED_RGB = (79 / 255, 195 / 255, 247 / 255)
 
 
-def crop_bbox_from_mask(mask2d: np.ndarray, margin_frac: float = 0.2) -> Tuple[int, int, int, int]:
+def _expand_to_min(lo: int, hi: int, min_size: int, limit: int) -> Tuple[int, int]:
+    """Grow [lo, hi) to at least min_size (centered), clamped to [0, limit]."""
+    need = min_size - (hi - lo)
+    if need > 0:
+        lo = max(0, lo - (need + 1) // 2)
+        hi = min(limit, lo + min_size)
+        lo = max(0, hi - min_size)
+    return lo, hi
+
+
+def crop_bbox_from_mask(mask2d: np.ndarray, margin_frac: float = 0.2,
+                        min_size: int = 8) -> Tuple[int, int, int, int]:
     H, W = mask2d.shape
     ys, xs = np.where(mask2d > 0)
     if ys.size == 0:
@@ -411,7 +422,20 @@ def crop_bbox_from_mask(mask2d: np.ndarray, margin_frac: float = 0.2) -> Tuple[i
     x0, x1 = int(xs.min()), int(xs.max())
     my = int((y1 - y0 + 1) * margin_frac)
     mx = int((x1 - x0 + 1) * margin_frac)
-    return max(0, y0 - my), min(H, y1 + my + 1), max(0, x0 - mx), min(W, x1 + mx + 1)
+    y0, y1 = max(0, y0 - my), min(H, y1 + my + 1)
+    x0, x1 = max(0, x0 - mx), min(W, x1 + mx + 1)
+    # Tiny/thin structures can yield a 1-px-wide box; enforce a minimum so the
+    # panel keeps context and contour extraction (needs >=2x2) stays valid.
+    y0, y1 = _expand_to_min(y0, y1, min_size, H)
+    x0, x1 = _expand_to_min(x0, x1, min_size, W)
+    return y0, y1, x0, x1
+
+
+def _safe_contours(arr2d: np.ndarray):
+    """find_contours that returns [] for sub-2x2 inputs instead of raising."""
+    if arr2d.shape[0] < 2 or arr2d.shape[1] < 2:
+        return []
+    return find_contours(arr2d.astype(float), 0.5)
 
 
 def draw_panel(
@@ -440,11 +464,11 @@ def draw_panel(
         ax.imshow(fill, interpolation="nearest")
 
     if gt2d is not None and gt_contour:
-        for c in find_contours(gt2d[y0:y1, x0:x1].astype(float), 0.5):
+        for c in _safe_contours(gt2d[y0:y1, x0:x1]):
             ax.plot(c[:, 1], c[:, 0], color=GT_COLOR, linewidth=2)
 
     if pred2d is not None:
-        for c in find_contours(pred2d[y0:y1, x0:x1].astype(float), 0.5):
+        for c in _safe_contours(pred2d[y0:y1, x0:x1]):
             ax.plot(c[:, 1], c[:, 0], color=PRED_COLOR, linewidth=2)
 
     ax.set_xlim(0, x1 - x0)
