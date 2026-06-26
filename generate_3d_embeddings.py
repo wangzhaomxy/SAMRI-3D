@@ -617,7 +617,7 @@ def parse_args():
 
     # Data source (either training list or data paths)
     parser.add_argument("--training-list", type=str, default=None,
-                        help="Path to 3D training list pickle (from gen_training_list.py)")
+                        help="Path to 3D training list pickle (from utils/gen_training_list.py)")
     parser.add_argument("--data-paths", type=str, nargs="+", default=None,
                         help="List of data paths (alternative to --training-list)")
 

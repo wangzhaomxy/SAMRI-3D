@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-train_stage_two_3dwise.py
+train_unified.py
 
 unified training training: 3D-wise training with memory bank on SAM2.
 
@@ -28,7 +28,7 @@ Sample Mix:
 
 Step 1: Generate training lists with dice scores (if not already done)
   # 2D training list
-  python gen_training_list.py \\
+  python utils/gen_training_list.py \\
       --mode 2d \\
       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
       --ckpt-path /path/to/sam2.1_hiera_small.pt \\
@@ -36,7 +36,7 @@ Step 1: Generate training lists with dice scores (if not already done)
       --save-path /path/to/training_list_2d.pkl
 
   # 3D training list
-  python gen_training_list.py \\
+  python utils/gen_training_list.py \\
       --mode 3d \\
       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
       --ckpt-path /path/to/sam2.1_hiera_small.pt \\
@@ -44,7 +44,7 @@ Step 1: Generate training lists with dice scores (if not already done)
       --save-path /path/to/training_list_3d.pkl
 
 Step 2: Run unified training training
-  python train_stage_two_3dwise.py \\
+  python train_unified.py \\
       --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
       --pretrained-ckpt /path/to/pretrained_checkpoint.pth \\
       --training-list-2d /path/to/training_list_2d.pkl \\
@@ -55,7 +55,7 @@ Step 2: Run unified training training
 === CLI Examples ===
 
 1. Basic unified training training (2x H100 80G GPUs):
-   python train_stage_two_3dwise.py \\
+   python train_unified.py \\
        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
        --pretrained-ckpt /path/to/pretrained_best.pth \\
        --training-list-2d /path/to/training_list_2d.pkl \\
@@ -68,7 +68,7 @@ Step 2: Run unified training training
        --num-workers 32
 
 2. With gradient accumulation for larger effective batch:
-   python train_stage_two_3dwise.py \\
+   python train_unified.py \\
        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \\
        --pretrained-ckpt /path/to/pretrained_best.pth \\
        --training-list-2d /path/to/training_list_2d.pkl \\
@@ -96,7 +96,7 @@ Logging:
   
 Hparameters may need adjustment based on GPU memory and dataset size.
 Example:
-python train_stage_two_3dwise.py \
+python train_unified.py \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
 --pretrained-ckpt /path/to/pretrained_checkpoint.pth \
 --training-list-2d /path/to/training_list_2d.pkl \

@@ -10,9 +10,10 @@ SAMRI2 (Segment Anything Model for MRI - Version 2) adapts Meta's SAM2 for medic
 
 ### Installation
 ```bash
-pip install -e .                    # Install SAMRI package
-python setup_sam2.py install        # Install SAM2 with CUDA extensions
+pip install -e .                    # Install SAMRI package + dependencies (see setup.py)
 ```
+SAM2 is vendored under `sam2/` (no separate install). Comparison-model code is
+vendored under `comparison/`; those baselines need their own conda environments.
 
 ### Running Evaluation
 ```bash
@@ -25,31 +26,21 @@ python test_vis3d_multi.py \
   --prompt-mode box \
   --num-workers 8
 
-# 3D evaluation with Dense CRF post-processing
-python test_vis3d_crf.py \
+# 3D evaluation with GVT (auto-detects GVT config from checkpoint)
+python test_vis3d_multi.py \
   --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-  --ckpt-path /path/to/checkpoint.pt \
+  --ckpt-path /path/to/gvt_checkpoint.pth \
   --dataset-path /path/to/test_data/ /path/to/zeroshot_results/ \
-  --save-path /path/to/results_crf.pkl \
-  --num-workers 8 \
-  --use-crf
+  --save-path /path/to/results_gvt.pkl \
+  --num-workers 12 --use-gvt
 
-# 3D evaluation with two-pass auto-context refinement (topk/allconf/revstyle)
-python test_vis3d_twopass.py \
-  --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-  --ckpt-path /path/to/checkpoint.pt \
+# Comparison-model evaluation (sam_med3d / medsam2 / medical_sam2 / samed2 / ma_sam)
+# Each needs its own conda env; checkpoints live under <weights-dir>/<model>/
+python comparison_test.py \
+  --model medsam2 \
   --dataset-path /path/to/test_data/ /path/to/zeroshot_results/ \
-  --save-path /path/to/results_topk5.pkl \
-  --num-workers 8 \
-  --two-pass topk --two-pass-k 5
-
-# 2D slice evaluation
-python test_vis2d.py \
-  --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-  --ckpt-path /path/to/checkpoint.pt \
-  --test-file-paths /path/to/datasets/ \
-  --save-path /path/to/results.pkl \
-  --device cuda
+  --weights-dir /path/to/comparison_ckpt/ \
+  --save-path /path/to/results_medsam2.pkl
 
 # 3D inference without metrics
 python 3d_inference.py \
@@ -60,10 +51,25 @@ python 3d_inference.py \
   --prompt-mode box
 ```
 
+### Qualitative Figures
+```bash
+# Run inference once + render 7 visualisation methods (one folder each)
+python qualitative_study.py \
+  --samples-json /path/to/qualitative_samples.json \
+  --output-dir /path/to/qualitative/ \
+  --models sam2_small sam_med3d medical_sam2 samed2 baseline gvt_v1 gvt_v2 gvt_v3
+
+# Re-render from saved volumes only (no inference); subset models/methods
+python qualitative_study.py \
+  --from-volumes /path/to/qualitative/pred_volumes \
+  --output-dir /path/to/qualitative_v2/ \
+  --models sam2_small baseline gvt_v3 --vis-methods vis2 vis5
+```
+
 ### Generating Training Lists (for filtered training)
 ```bash
 # Generate 2D training list with dice scores
-python gen_training_list.py \
+python utils/gen_training_list.py \
   --mode 2d \
   --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
   --ckpt-path /path/to/checkpoint.pt \
@@ -72,7 +78,7 @@ python gen_training_list.py \
   --num-workers 12
 
 # Generate 3D training list with dice scores
-python gen_training_list.py \
+python utils/gen_training_list.py \
   --mode 3d \
   --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
   --ckpt-path /path/to/checkpoint.pt \
@@ -163,18 +169,16 @@ sbatch train_multi_gpus.sh
 ### Key Components
 
 **Root scripts:**
+- `test_vis3d_multi.py` - 3D evaluation (per-label cut, semantic volume output); `--use-gvt` auto-detects GVT config from the checkpoint
+- `comparison_test.py` - Comparison-model evaluation (sam_med3d / medsam2 / medical_sam2 / samed2 / ma_sam) on the same NIfTI test data; each runner vendored under `comparison/`
+- `qualitative_study.py` - Qualitative overlay/3D figures: runs inference once, saves per-case `.nii.gz` to `pred_volumes/`, then renders 7 visualisation methods (one folder each); supports `--from-volumes` re-render and `--models`/`--vis-methods` filters
 - `3d_inference.py` - Batch 3D inference without evaluation
-- `test_vis3d_multi.py` - 3D evaluation (per-label cut, semantic volume output)
-- `test_vis3d_crf.py` - 3D evaluation with Dense CRF post-processing (experimental)
-- `test_vis3d_twopass.py` - 3D evaluation with two-pass auto-context refinement (experimental)
-- `test_vis2d.py` - 2D slice evaluation
-- `gen_training_list.py` - Generate training lists with dice scores for filtered training
-- `generate_sam2_embeddings.py` - Pre-compute SAM2 image embeddings for 2D training
+- `utils/gen_training_list.py` - Generate training lists with dice scores for filtered training
 - `generate_3d_embeddings.py` - Pre-compute SAM2 embeddings for 3D volumes
-- `train_unified.py` - Unified training from raw images (2D loss)
-- `train_unified_emb.py` - Unified training from pre-computed embeddings (2D loss)
+- `train_unified.py` - Unified training from raw images / training list (2D loss)
+- `train_unified_emb.py` - Unified training from pre-computed embeddings (2D loss) — baseline model
 - `train_unified_emb_3dloss.py` - Unified training from embeddings (2D + 3D volumetric loss)
-- `gvt/train_gvt_emb_tsdf.py` - GVT unified training script: supports v1 (GVT encoder only), v2 (+recon loss), and v3 (+TSDF shape prior). This is the canonical GVT training script — `gvt/train_gvt_emb_3dloss.py` has been merged into this file and deleted.
+- `gvt/train_gvt_emb_tsdf.py` - Canonical GVT training script: supports v1 (GVT encoder only), v2 (+recon loss), and v3 (+TSDF shape prior)
 - `utils/tsdf_utils.py` - TSDF computation, target preparation, and boundary-weighted loss
 
 **sam2/** - Meta's SAM2 package with:
@@ -264,116 +268,6 @@ for each label:
 Image encoding cost: **N** forward_image calls total (not N*K).
 `init_state` cost: **2*K** calls (one pair per label), but no disk I/O when
 streaming is available — sources are in-memory PIL loaders.
-
-### Dense CRF Post-Processing (test_vis3d_crf.py)
-
-`test_vis3d_crf.py` extends `test_vis3d_multi.py` by applying optional Dense CRF
-refinement to SAM2's soft probability outputs **after** propagation, **before**
-thresholding into the final binary mask.
-
-**CRF backend priority (auto-detected at runtime):**
-1. **SimpleCRF** (`pip install SimpleCRF`) — true 3D CRF, processes the full volume
-2. **pydensecrf** (`pip install pydensecrf`) — 2D slice-by-slice fallback
-3. **Sigmoid threshold** — if neither library is available
-
-**New CLI flags:**
-- `--use-crf` — enable CRF post-processing (default: off)
-- `--crf-sigma-spatial` — spatial Gaussian kernel width (default: 5.0)
-- `--crf-sigma-intensity` — bilateral intensity kernel width (default: 0.1)
-- `--crf-sigma-smooth` — smoothness kernel width (default: 1.0)
-- `--crf-w-bilateral` — bilateral energy weight (default: 5.0)
-- `--crf-w-smooth` — smoothness energy weight (default: 3.0)
-- `--crf-iterations` — CRF mean-field iterations (default: 5)
-
-**Sigmoid overflow (IMPORTANT):**
-SAM2's raw logits can have very large magnitude. Using `1.0 / (1.0 + np.exp(-logit))`
-on `float32` arrays overflows at ±88 and produces `RuntimeWarning`. The fix used
-throughout this script is `scipy.special.expit`, which is numerically stable:
-
-```python
-from scipy.special import expit
-prob_vol = expit(logit_vol.astype(np.float64)).astype(np.float32)
-```
-
-The overflow itself is benign (results in 0.0 or 1.0, which are mathematically correct)
-but the warning pollutes logs and indicates float32 precision loss.
-
-### Two-Pass Auto-Context Refinement (test_vis3d_twopass.py)
-
-`test_vis3d_twopass.py` extends `test_vis3d_multi.py` with a second propagation pass
-that uses Pass 1's high-confidence predictions as additional prompted frames.
-
-**Two-pass variants (`--two-pass`):**
-- `none` — baseline, identical to `test_vis3d_multi.py`
-- `topk` — re-prompt Pass 2 with the K frames of highest `object_score_logits`
-- `allconf` — re-prompt Pass 2 with all frames where sigmoid(score) ≥ threshold
-- `revstyle` — add high-quality anchor frames that bookend low-quality regions
-
-**New CLI flags:**
-- `--two-pass {none|topk|allconf|revstyle}` (default: none)
-- `--two-pass-k` — K for topk mode (default: 5)
-- `--two-pass-conf-threshold` — confidence threshold for allconf/revstyle (default: 0.7)
-
-**Feature-reuse pattern (critical for inference speed):**
-
-Naively, two-pass doubles the image encoder cost (2N forward_image calls vs N for
-single-pass). The implementation avoids this by:
-
-1. **Prefill `cached_features` before Pass 1** — `_prefill_features(predictor, state)`
-   runs `forward_image` on every frame and writes all results into
-   `state["cached_features"]` as a full dict. During propagation, `_get_image_feature`
-   finds every frame in the dict (cache hit) and never replaces it.
-
-2. **`reset_state` preserves `cached_features`** — After Pass 1, `predictor.reset_state(state)`
-   clears all object/tracking state but does **not** touch `cached_features`. Pass 2
-   can re-prompt and re-propagate with zero additional encoder calls.
-
-3. **Sequential per-video processing** — v1 is fully processed (P1 → P2) before v2,
-   so only one video's feature cache is in GPU memory at a time:
-
-```
-init_state(v1) → prefill(v1) → prompt → Pass1-propagate
-   → reset_state(v1) → re-prompt → Pass2-propagate → del(v1)
-init_state(v2) → prefill(v2) → prompt → Pass1-propagate
-   → reset_state(v2) → re-prompt → Pass2-propagate → del(v2)
-```
-
-**Encoding cost: N calls total** (same as single-pass baseline).
-**Memory: one video's feature cache at a time** (same peak as baseline).
-
-**`object_score_logits` as quality proxy:**
-The per-frame confidence used for frame selection is `object_score_logits`, a `(1,1)`
-scalar stored in `state["output_dict_per_obj"][obj_idx]["cond_frame_outputs"|"non_cond_frame_outputs"][frame_idx]`.
-Higher values indicate the model is more confident the object is present and
-well-segmented in that frame. `select_allconf_frames` and `select_revstyle_frames`
-apply sigmoid to convert to a [0,1] confidence using `scipy.special.expit` to avoid
-overflow warnings.
-
-## Reference Materials (backup/)
-
-The `backup/` folder contains Meta's original SAM2 files as reference examples. This folder will be removed after project finalization.
-
-### Notebooks (`backup/notebooks/`)
-- **video_predictor_example.ipynb** - Most relevant for SAMRI2; shows `SAM2VideoPredictor` workflow: initialize state, add prompts on any frame, propagate through video, multi-object tracking
-- **image_predictor_example.ipynb** - Single-image segmentation with point/box prompts, multi-mask output, batched inference
-- **automatic_mask_generator_example.ipynb** - Fully automatic segmentation using grid-based point sampling
-
-### Demo Application (`backup/demo/`)
-- **Frontend** (`demo/frontend/`): React + TypeScript + Vite app with video player, interaction layers, mask visualization
-- **Backend** (`demo/backend/server/`): Flask + GraphQL with `InferenceAPI` class in `inference/predictor.py` showing production inference patterns, session state management, device auto-detection
-
-### SAMRI v1 Training Script (`backup/train_in_batch_multi_gpu.py`)
-Reference implementation for decoder-only training on pre-computed embeddings:
-- Trains only mask decoder (freezes image encoder and prompt encoder)
-- Uses `EmbDataset` / `BalancedEmbDataset` for pre-computed embeddings
-- Multi-GPU DDP training via `torch.multiprocessing.spawn`
-- Mixed prompts (point + bbox) with `DiceFocalLoss`
-- AdamW optimizer: lr=1e-5, weight_decay=0.1
-
-### Other References
-- `checkpoints/download_ckpts.sh` - Download script for SAM2.1 model checkpoints (tiny/small/base_plus/large)
-- `INSTALL.md` - Installation guide with troubleshooting for CUDA, Flash Attention, Windows issues
-- `RELEASE_NOTES.md` - Version history documenting SAM2 -> SAM2.1 improvements
 
 ## SAM2 Training Strategy Reference
 
@@ -574,7 +468,10 @@ Both `recon_decoder` and `tsdf_decoder` are wrapped in DDP for gradient all-redu
 ckpt["gvt_recon_decoder"] = recon_decoder.module.state_dict()
 ckpt["tsdf_decoder"] = tsdf_decoder.module.state_dict()
 ```
-When loading in `eval_gvt_recon.py`, old checkpoints missing `label_cross_attn` keys load with `strict=False` and a warning; the new cross-attention weights are randomly initialized (eval Dice is a lower-bound sanity check only for such checkpoints).
+At inference both auxiliary decoders are discarded — only the `"model"` key (SAM2 +
+GVTModule, including the `memory_attention` wrapper) is loaded by `test_vis3d_multi.py
+--use-gvt`. Old checkpoints missing newer keys (e.g. `label_cross_attn`) load with
+`strict=False`.
 
 **GPU load balance (IMPORTANT — do not regress):**
 `compute_gvt_tokens` intentionally processes all N slices for global context. Both `TSDFDecoder` and `GVTReconDecoder` must be capped at `max_slices_per_video` to balance per-sample GPU cost. Without caps, large-N volumes (N=200) cause one GPU to run 2× longer, leaving others idle during NCCL allreduce.

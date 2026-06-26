@@ -21,7 +21,7 @@ for training on samples filtered by dice score threshold.
 === Usage ===
 
 1. Generate 2D training list (for slice-wise training):
-python gen_training_list.py \
+python utils/gen_training_list.py \
 --mode 2d \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
 --ckpt-path /scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt \
@@ -30,7 +30,7 @@ python gen_training_list.py \
 --num-workers 12
 
 2. Generate 3D training list (for volume training):
-python gen_training_list.py \
+python utils/gen_training_list.py \
 --mode 3d \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
 --ckpt-path /scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt \
@@ -40,7 +40,7 @@ python gen_training_list.py \
 --num-workers 16
 
 3. Generate both lists:
-python gen_training_list.py \
+python utils/gen_training_list.py \
 --mode both \
 --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
 --ckpt-path /scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt \
@@ -50,12 +50,13 @@ python gen_training_list.py \
 
 === Training with Filtered Samples ===
 
-After generating the training list, use with train_stage_one_slicewise.py:
-   python train_stage_one_slicewise.py \
+After generating the lists, use them with train_unified.py (the 2d_img mode):
+   python train_unified.py \
        --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
-       --ckpt-path /scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt \
-       --training-list /scratch/user/s4670484/training_lists/training_list_2d.pkl \
-       --dice-threshold 0.4 \
+       --pretrained-ckpt /scratch/user/s4670484/pretrained_ckpt/sam2.1_hiera_small.pt \
+       --training-list-2d /scratch/user/s4670484/training_lists/training_list_2d.pkl \
+       --training-list-3d /scratch/user/s4670484/training_lists/training_list_3d.pkl \
+       --dice-threshold-2d 0.4 --dice-threshold-3d 0.2 \
        --save-path /scratch/user/s4670484/Model_save/samri2_filtered/
 
 === Options ===
@@ -88,9 +89,10 @@ import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
-# Prefer local ./sam2
-_THIS_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(_THIS_DIR))
+# This script lives in utils/; add the repo root (its parent) to sys.path so the
+# top-level `sam2` and `utils` packages resolve regardless of CWD.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO_ROOT))
 
 from sam2.build_sam import build_sam2, build_sam2_video_predictor
 from sam2.sam2_image_predictor import SAM2ImagePredictor
