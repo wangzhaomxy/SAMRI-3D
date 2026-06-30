@@ -4,7 +4,7 @@
 """
 qualitative_study.py
 
-Generates the SAMRI2 DICTA2026 qualitative overlay figures: for a fixed list of
+Generates the SAMRI-3D DICTA2026 qualitative overlay figures: for a fixed list of
 20 evaluation cases (15 showcase + 5 failure, defined in qualitative_samples.json),
 runs inference with a hardcoded candidate model set, renders GT/prediction contour
 overlays on the per-case cut slice, and assembles two figure grids.
@@ -14,11 +14,11 @@ Candidate models (see MODEL_SPECS):
   - sam_med3d     SAM-Med3D                 \
   - medical_sam2  Medical-SAM2               } via comparison_test.py RUNNERS,
   - samed2        SAMed-2                   /  checkpoints under --weights-dir
-  - baseline      SAMRI2-2dloss (fine-tuned, no GVT/3D loss)
-  - gvt_v1        SAMRI2-GVT-v1 (GVT encoder only)
-  - gvt_v2        SAMRI2-GVT-v2 (+ GVTReconDecoder)
-  - gvt_v3        SAMRI2-GVT-v3 (+ TSDFDecoder, ours/best)
-All SAMRI2 variants (baseline, gvt_v1-3) are fine-tuned from the SAM2-Small backbone.
+  - baseline      SAMRI-3D (2D loss) (fine-tuned, no GVT/3D loss)
+  - gvt_v1        SAMRI-3D (GVT-v1) (GVT encoder only)
+  - gvt_v2        SAMRI-3D (GVT-v2) (+ GVTReconDecoder)
+  - gvt_v3        SAMRI-3D (GVT-v3) (+ TSDFDecoder, ours/best)
+All SAMRI-3D variants (baseline, gvt_v1-3) are fine-tuned from the SAM2-Small backbone.
 Select/reorder columns with --models (default: all of the above, comparisons first,
 ending with gvt_v3).
 
@@ -46,7 +46,7 @@ python qualitative_study.py \
 --output-dir /scratch/user/s4670484/SAMRI2_qualitative/qualitative \
 --models sam2_small baseline gvt_v1 gvt_v2 gvt_v3 sam_med3d medical_sam2 samed2
 
-The SAMRI2 checkpoint defaults point at /scratch/.../Model_save/samri2/ (samri2_2dloss.pth,
+The SAMRI-3D checkpoint defaults point at /scratch/.../Model_save/samri2/ (samri2_2dloss.pth,
 samri2_GVT_v1.pth, samri2_GVT_v2.pth, samri2_GVT_v3.pth) and the SAM2-Small init ckpt at
 pretrained_ckpt/ — verify they exist before trusting figures, and override with
 --sam2-small-ckpt / --baseline-ckpt / --gvt-v1-ckpt / etc. and --weights-dir
@@ -204,13 +204,13 @@ MODEL_SPECS = {
     "sam_med3d":    {"kind": "comparison", "title": "SAM-Med3D"},
     "medical_sam2": {"kind": "comparison", "title": "Medical-SAM2"},
     "samed2":       {"kind": "comparison", "title": "SAMed-2"},
-    "baseline":     {"kind": "sam2", "title": "SAMRI2-2dloss", "use_gvt": False,
+    "baseline":     {"kind": "sam2", "title": "SAMRI-3D (2D loss)", "use_gvt": False,
                       "ckpt_arg": "baseline_ckpt"},
-    "gvt_v1":       {"kind": "sam2", "title": "SAMRI2-GVT-v1", "use_gvt": True,
+    "gvt_v1":       {"kind": "sam2", "title": "SAMRI-3D (GVT-v1)", "use_gvt": True,
                       "ckpt_arg": "gvt_v1_ckpt"},
-    "gvt_v2":       {"kind": "sam2", "title": "SAMRI2-GVT-v2", "use_gvt": True,
+    "gvt_v2":       {"kind": "sam2", "title": "SAMRI-3D (GVT-v2)", "use_gvt": True,
                       "ckpt_arg": "gvt_v2_ckpt"},
-    "gvt_v3":       {"kind": "sam2", "title": "SAMRI2-GVT-v3 (ours)", "use_gvt": True,
+    "gvt_v3":       {"kind": "sam2", "title": "SAMRI-3D (GVT-v3, ours)", "use_gvt": True,
                       "ckpt_arg": "gvt_v3_ckpt"},
 }
 DEFAULT_MODEL_ORDER = [
@@ -1096,7 +1096,7 @@ def generate_visualisations(pred_volumes_dir: Path, out_dir: Path,
 # CLI
 # ----------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="SAMRI2 qualitative overlay figure generator")
+    p = argparse.ArgumentParser(description="SAMRI-3D qualitative overlay figure generator")
     p.add_argument("--samples-json", default=None,
                     help="Path to qualitative_samples.json. Required unless --from-volumes is set.")
     p.add_argument("--output-dir", default="outputs/qualitative")
@@ -1188,7 +1188,7 @@ def run_inference_pipeline(args, log) -> Tuple[Dict[str, List[Dict]], List[str]]
         samples = json.load(f)
 
     log("=" * 70)
-    log("SAMRI2 qualitative figure generation")
+    log("SAMRI-3D qualitative figure generation")
     log(f"  Models (in order)             : {model_keys}")
     log(f"  SAM2 config (all SAM2-native) : {args.sam2_config}")
     for key in model_keys:

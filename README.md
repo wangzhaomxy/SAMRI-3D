@@ -1,11 +1,11 @@
-# SAMRI2 — Segment Anything Model for 3D MRI
+# SAMRI-3D — Segment Anything Model for 3D MRI
 
-Official code for **"SAMRI2: Adapting SAM2 for 3D MRI Segmentation with Global Volume
+Official code for **"SAMRI-3D: Adapting SAM2 for 3D MRI Segmentation with Global Volume
 Tokens"** (Wang et al.) — the 3D successor to [SAMRI](https://github.com/wangzhaomxy/SAMRI),
 our published 2D MRI model ([arXiv:2510.26635](https://arxiv.org/abs/2510.26635)).
 
-SAMRI2 adapts Meta's **SAM2** for **3D MRI segmentation**. MRI's low soft-tissue contrast
-leaves many boundaries effectively invisible on individual slices, so SAMRI2 treats a 3D
+SAMRI-3D adapts Meta's **SAM2** for **3D MRI segmentation**. MRI's low soft-tissue contrast
+leaves many boundaries effectively invisible on individual slices, so SAMRI-3D treats a 3D
 volume as a bidirectional "video": it is split at the slice with the largest foreground
 (the *cut slice*) into two sub-sequences, and SAM2's video predictor propagates the
 segmentation outward from a box/point prompt placed on the cut slice. Predictions are
@@ -13,16 +13,16 @@ merged back into a 3D semantic mask with the original NIfTI geometry preserved.
 
 Freezing the image encoder and fine-tuning only the lightweight **decoder and memory
 modules** raises mean Dice from **0.58** (zero-shot SAM2) to **0.76**. To recover the
-boundaries that are invisible slice-by-slice, SAMRI2 introduces **Global Volume Tokens
+boundaries that are invisible slice-by-slice, SAMRI-3D introduces **Global Volume Tokens
 (GVT)** — compact, persistent whole-volume memory tokens trained with a **Truncated Signed
 Distance Field (TSDF)** shape-prior objective that is *discarded at inference* (zero added
 cost). GVT-v3 reaches the best accuracy (**0.78** mean Dice) and generalizes to held-out
 datasets with no performance drop.
 
-![SAMRI2 pipeline overview](assets/samri2_pipeline.png)
+![SAMRI-3D pipeline overview](assets/samri3d_pipeline.png)
 
-*Overall SAMRI2 pipeline. A 3D MRI volume is split at the cut slice (largest foreground)
-into forward and backward sub-sequences, each processed by the SAMRI2 video predictor with
+*Overall SAMRI-3D pipeline. A 3D MRI volume is split at the cut slice (largest foreground)
+into forward and backward sub-sequences, each processed by the SAMRI-3D video predictor with
 GVT injection, then merged into the full 3D segmentation. Global Volume Tokens summarize the
 entire volume and are injected into SAM2's memory bank; a training-only TSDF shape-prior
 head supervises them and is discarded at inference.*
@@ -43,9 +43,9 @@ head supervises them and is discarded at inference.*
 
 ---
 
-## SAMRI2-Bench
+## SAMRI-3D-Bench
 
-SAMRI2 is evaluated on **SAMRI2-Bench**, the largest MRI-only SAM2 benchmark to date:
+SAMRI-3D is evaluated on **SAMRI-3D-Bench**, the largest MRI-only SAM2 benchmark to date:
 **10,392 volumes** from **34 datasets** (27 public, 7 in-house) spanning **12 anatomical
 domains** and **10+ sequences**, with explicit **seen/unseen splits** for zero-shot
 generalization testing.
@@ -61,16 +61,16 @@ per-sequence, statistical tests) are reported in the paper.
 | Medical-SAM2 | SAM2, medical | 0.49 |
 | SAM2 | foundation (zero-shot) | 0.58 |
 | SAMed-2 | SAM2, medical | 0.69 |
-| **SAMRI2** | ours (decoder + memory fine-tune) | **0.76** |
-| **SAMRI2-GVT-v3** | ours, best (+ TSDF prior) | **0.78** |
+| **SAMRI-3D** | ours (decoder + memory fine-tune) | **0.76** |
+| **SAMRI-3D (GVT-v3)** | ours, best (+ TSDF prior) | **0.78** |
 
-SAMRI2-GVT-v3 attains **0.78 ± 0.14 Dice, 13.85 ± 9.01 HD, 2.11 ± 0.96 MSD** and shows
+SAMRI-3D (GVT-v3) attains **0.78 ± 0.14 Dice, 13.85 ± 9.01 HD, 2.11 ± 0.96 MSD** and shows
 **no drop on held-out datasets** (0.79 unseen vs. 0.78 seen) — per-sequence analysis
 confirms the TSDF shape prior helps most where per-slice contrast is weakest.
 
-![Qualitative comparison](assets/samri2_qualitative.png)
+![Qualitative comparison](assets/samri3d_qualitative.png)
 
-*Qualitative comparison (triplanar axial/coronal/sagittal views) of SAMRI2-GVT-v3 against
+*Qualitative comparison (triplanar axial/coronal/sagittal views) of SAMRI-3D (GVT-v3) against
 zero-shot SAM2-Small, SAM-Med3D, Medical-SAM2, and SAMed-2. Yellow = ground truth,
 magenta = prediction. Figures are produced by [`qualitative_study.py`](qualitative_study.py).*
 
@@ -88,6 +88,10 @@ SAMRI2/
 │   ├── gvt_integration.py      Wraps SAM2 memory_attention with GVT tokens
 │   ├── gvt_inference.py        GVT token computation at inference
 │   └── train_gvt_emb_tsdf.py   Canonical GVT training (v1/v2/v3)
+├── gui/                        Interactive Jupyter GUI (ipywidgets + ipycanvas)
+│   ├── samri3d_gui.py           GUI app
+│   ├── inference_backend.py    Box/point-prompted bidirectional propagation
+│   └── SAMRI3D_GUI.ipynb        Notebook launcher
 ├── utils/
 │   ├── dataloader.py           NiiDataset / Filtered{,3D}NiiDataset
 │   ├── losses.py               Dice / Hausdorff / MSD
@@ -126,7 +130,7 @@ pip install -e .          # installs the `samri` package + dependencies (see set
 
 The model config is referenced as `configs/sam2.1/sam2.1_hiera_s.yaml` (resolved through
 the vendored `sam2` package); available variants: `_t` (tiny), `_s` (small), `_b+`
-(base+), `_l` (large). SAMRI2 fine-tunes the **small** backbone by default.
+(base+), `_l` (large). SAMRI-3D fine-tunes the **small** backbone by default.
 
 ---
 
@@ -197,7 +201,7 @@ auxiliary losses).
 ### 3. Evaluate (Dice / HD / MSD)
 
 ```bash
-# SAMRI2 (add --use-gvt for GVT checkpoints; GVT config auto-detected from ckpt)
+# SAMRI-3D (add --use-gvt for GVT checkpoints; GVT config auto-detected from ckpt)
 python test_vis3d_multi.py \
   --sam2-config configs/sam2.1/sam2.1_hiera_s.yaml \
   --ckpt-path /path/to/checkpoint.pth \
@@ -241,6 +245,32 @@ python qualitative_study.py \
 
 ---
 
+## Interactive GUI
+
+For point-and-click segmentation (the 3D analogue of [SAMRI v1's](https://github.com/wangzhaomxy/SAMRI)
+ipywidgets demo), a Jupyter GUI is provided under `gui/`:
+
+```bash
+conda activate samri          # on a machine with a CUDA GPU
+jupyter notebook gui/SAMRI3D_GUI.ipynb     # then "Run all cells"
+```
+
+or from any notebook cell:
+
+```python
+from gui import launch
+app = launch(device="cuda")
+```
+
+Workflow: **load a volume → scrub slices → draw a bounding box and/or click +/- points on
+one slice → load a SAMRI-3D checkpoint (tick "GVT" for GVT models) → Segment** (SAM2
+propagates the prompt through the whole volume) **→ toggle the overlay and save as NIfTI.**
+Built with `ipywidgets` + `ipycanvas` (already in `setup.py`); use **Jupyter Notebook**
+rather than JupyterLab unless the matching labextensions are installed. The GUI reuses the
+exact propagation pipeline from `test_vis3d_multi.py` via `gui/inference_backend.py`.
+
+---
+
 ## Model variants
 
 | Name      | Training script               | Notes |
@@ -258,11 +288,11 @@ All variants fine-tune from the SAM2-Small backbone. GVT auxiliary decoders
 
 ## Citation
 
-If you use SAMRI2 or SAMRI2-Bench, please cite our paper (citation to be finalized):
+If you use SAMRI-3D or SAMRI-3D-Bench, please cite our paper (citation to be finalized):
 
 ```bibtex
-@article{wang2026samri2,
-  title   = {SAMRI2: Adapting SAM2 for 3D MRI Segmentation with Global Volume Tokens},
+@article{wang2026samri3d,
+  title   = {SAMRI-3D: Adapting SAM2 for 3D MRI Segmentation with Global Volume Tokens},
   author  = {Wang, Zhao and Dai, Wei and Sun, Hongfu and Engstrom, Craig and Chandra, Shekhar S.},
   year    = {2026}
 }
@@ -298,12 +328,12 @@ School of Electrical Engineering and Computer Science, The University of Queensl
 
 ## Acknowledgements & license
 
-SAMRI2 builds on Meta AI's [SAM2](https://github.com/facebookresearch/sam2) and the
+SAMRI-3D builds on Meta AI's [SAM2](https://github.com/facebookresearch/sam2) and the
 [MedSAM](https://github.com/bowang-lab/MedSAM) line of open-source medical SAM adaptations,
 and was developed with the support of the University of Queensland Research Computing
 Centre's **Bunya** supercomputer. We thank the MRI research community for the public
-datasets that make up SAMRI2-Bench.
+datasets that make up SAMRI-3D-Bench.
 
 The `sam2/` and `training/` directories are vendored from the SAM2 release; `comparison/`
-contains third-party model code under their respective licenses. SAMRI2 code is released
+contains third-party model code under their respective licenses. SAMRI-3D code is released
 under the **Apache-2.0 License**.

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-SAMRI2 (Segment Anything Model for MRI - Version 2) adapts Meta's SAM2 for medical imaging, specifically 3D MRI segmentation using decoder-only fine-tuning on pre-computed embeddings.
+SAMRI-3D (Segment Anything Model for 3D MRI) adapts Meta's SAM2 for medical imaging, specifically 3D MRI segmentation using decoder-only fine-tuning on pre-computed embeddings.
 
 ## Common Commands
 
@@ -225,7 +225,7 @@ def normalize_to_uint8(img: np.ndarray) -> np.ndarray:
 **Why plain min-max?**
 - SAM2's `SAM2Transforms` expects uint8 [0, 255] input, then applies `ToTensor()` (scales to [0,1]) followed by ImageNet normalization
 - Using percentile-based normalization (e.g., clipping at 0.5th and 99.5th percentiles) creates inconsistency between training and inference
-- All SAMRI2 scripts use plain min-max to ensure consistency across training, validation, and inference
+- All SAMRI-3D scripts use plain min-max to ensure consistency across training, validation, and inference
 
 **Do NOT use percentile-based normalization** like:
 ```python
@@ -285,7 +285,7 @@ streaming is available — sources are in-memory PIL loaders.
 - **Video training**: 8-frame sequences, 1-2 frames randomly prompted, 50% temporal reversal for bidirectional learning
 - **Joint training**: Alternating batches (~30-40% images, ~60-70% videos) proportional to dataset size
 
-### SAMRI2 Unified Training Pipeline (3D MRI as Bidirectional Videos)
+### SAMRI-3D Unified Training Pipeline (3D MRI as Bidirectional Videos)
 
 **Core approach:**
 1. Split 3D volume at "central slice" (largest foreground) into two sequences

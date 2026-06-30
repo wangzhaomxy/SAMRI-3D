@@ -151,7 +151,7 @@ fi
 # Print common job and hardware info
 echo ""
 echo "############################################################"
-echo "#                  SAMRI2 Training Job                     #"
+echo "#                 SAMRI-3D Training Job                    #"
 echo "############################################################"
 echo "  Job ID       : ${SLURM_JOB_ID:-local}"
 echo "  Node         : $(hostname)"

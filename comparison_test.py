@@ -2,7 +2,7 @@
 """
 comparison_test.py
 
-Evaluate comparison 3D segmentation models on SAMRI2-format NIfTI test data.
+Evaluate comparison 3D segmentation models on SAMRI-3D-format NIfTI test data.
 
 Design
 ------
@@ -38,9 +38,9 @@ Stub (format incompatible) (running but too slow to run on the full test set, th
 
 sam2 namespace management
 --------------------------
-MedSAM2 and SAMed-2 each ship their own sam2 fork with symbols absent from SAMRI2's sam2.
+MedSAM2 and SAMed-2 each ship their own sam2 fork with symbols absent from SAMRI-3D's sam2.
 Both use _swap_sam2() during model construction to temporarily replace sys.modules['sam2*']
-with the correct fork, then restore SAMRI2's sam2 on exit.
+with the correct fork, then restore SAMRI-3D's sam2 on exit.
 
 Weights directory layout
 ------------------------
@@ -137,9 +137,9 @@ except AttributeError:          # Pillow < 9.1
     _NEAREST  = PILImage.NEAREST   # type: ignore[attr-defined]
 
 # ─── Import shared functions from test_vis3d_multi.py ────────────────────────
-_SAMRI2_ROOT = Path(__file__).resolve().parent
-if str(_SAMRI2_ROOT) not in sys.path:
-    sys.path.insert(0, str(_SAMRI2_ROOT))
+_SAMRI3D_ROOT = Path(__file__).resolve().parent
+if str(_SAMRI3D_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SAMRI3D_ROOT))
 
 from test_vis3d_multi import (
     read_3d_image,
@@ -154,7 +154,7 @@ from test_vis3d_multi import (
 
 
 # ─── sam2 namespace swap helper ───────────────────────────────────────────────
-# Importing test_vis3d_multi above loads SAMRI2's sam2 into sys.modules['sam2'].
+# Importing test_vis3d_multi above loads SAMRI-3D's sam2 into sys.modules['sam2'].
 # MedSAM2 and SAMed-2 each ship their own sam2 fork with different symbols.
 # _swap_sam2() temporarily replaces sys.modules['sam2'] during model construction
 # so their build functions resolve correctly.  After construction the original
@@ -461,7 +461,7 @@ def run_medical_sam2(
                  _find_checkpoint(Path(weights_dir) / "medica_sam2", "Medical-SAM2"))
 
     # sam2_train/__init__.py calls initialize_config_module("sam2_train") unconditionally
-    # (no is_initialized() guard).  SAMRI2's sam2/__init__.py already initialized
+    # (no is_initialized() guard).  SAMRI-3D's sam2/__init__.py already initialized
     # GlobalHydra with "sam2", so we must clear it BEFORE the first import of sam2_train
     # (importing the package executes __init__.py).  On subsequent calls the module is
     # cached by Python, so __init__.py does NOT re-run and Hydra stays initialized with
@@ -1028,7 +1028,7 @@ def print_summary(final_record: Dict, model_name: str) -> None:
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Evaluate comparison 3D segmentation models on SAMRI2 NIfTI test data",
+        description="Evaluate comparison 3D segmentation models on SAMRI-3D NIfTI test data",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(

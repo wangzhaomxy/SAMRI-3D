@@ -1,1 +1,1 @@
-# GVT (Global Volume Token) module for SAMRI2
+# GVT (Global Volume Token) module for SAMRI-3D
