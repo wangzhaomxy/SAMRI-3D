@@ -129,9 +129,10 @@ every model accumulated in pred_volumes/, not just that run's subset).
 
 Example:
 python qualitative_study.py \
---from-volumes /scratch/user/s4670484/SAMRI2_qualitative/qualitative/pred_volumes \
---output-dir   /scratch/user/s4670484/SAMRI2_qualitative/five_model_vis \
---models sam2_small sam_med3d medical_sam2 samed2 gvt_v3
+--from-volumes /scratch/user/s4670484/SAMRI-3D_qualitative/qualitative/pred_volumes \
+--output-dir   /scratch/user/s4670484/SAMRI-3D_qualitative/five_model_vis \
+--models sam2_small sam_med3d medical_sam2 samed2 gvt_v3 \
+--vis-methods vis1_cut_slice vis2_triplanar
 """
 
 from __future__ import annotations
