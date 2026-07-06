@@ -71,6 +71,8 @@ into its own <output-dir>/visN_*/ folder, so you can compare and pick. Select wi
   vis5_surface          3D surface mesh: GT (translucent) vs prediction
   vis6_surface_distance prediction surface colored by distance-to-GT (mm)
   vis7_error_volume     3D FP (orange) vs FN (purple) meshes
+  vis8_tsdf             GT TSDF | Pred TSDF | TSDF error (mask-derived signed distance
+                        field; featured model = --tsdf-model)
 vis5-7 are 3D renders (slower, lower-fidelity than a dedicated renderer); empty/tiny
 masks are skipped gracefully per case.
 
@@ -484,6 +486,25 @@ def _safe_contours(arr2d: np.ndarray):
 
 # Color legend shown at the bottom of GT-vs-prediction figures (vis1-5).
 GT_PRED_LEGEND = [("Ground truth", GT_COLOR), ("Prediction", PRED_COLOR)]
+
+# TSDF panels (vis8): rainbow field (blue far-outside -> green boundary -> red inside),
+# signed error in a diverging map. Configured from CLI in main() via TSDF_OPTS.
+TSDF_CMAP = "jet"
+TSDF_ERR_CMAP = "coolwarm"
+TSDF_OPTS = {"tau": 32.0, "model": "gvt_v3"}   # truncation radius (px), featured model
+
+
+def _compute_tsdf(mask2d: np.ndarray, tau: float = 32.0) -> np.ndarray:
+    """Truncated Signed Distance Field of a 2D binary mask: positive inside, negative
+    outside, ~0 on the boundary, clamped to [-tau, tau]. Empty/full slices -> +/-tau.
+    (Mirrors utils/tsdf_utils.compute_tsdf but self-contained for the figure code.)"""
+    from scipy.ndimage import distance_transform_edt
+    m = np.asarray(mask2d).astype(bool)
+    if m.any() and (~m).any():
+        sdf = distance_transform_edt(m) - distance_transform_edt(~m)
+    else:
+        sdf = np.full(m.shape, tau if m.all() else -tau, dtype=float)
+    return np.clip(sdf, -tau, tau).astype(np.float32)
 
 
 def _add_bottom_legend(fig, entries) -> None:
@@ -1037,6 +1058,68 @@ def vis_error_volume(out_path: Path, V: Dict, model_keys: List[str], dpi: int) -
     plt.close(fig)
 
 
+def _style_tsdf_ax(ax, title: str, aspect: float) -> None:
+    ax.set_aspect(aspect)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title(title, fontsize=TITLE_FONTSIZE, fontweight=FONT_WEIGHT)
+
+
+def vis_tsdf(out_path: Path, V: Dict, model_keys: List[str], dpi: int) -> None:
+    """One row per case: GT TSDF | Pred TSDF | TSDF error.
+
+    The input image, GT, and per-model overlays are already covered by vis1-7, so this
+    method shows only the signed distance fields: the (binary) GT and one featured
+    model's prediction on the cut slice (mask-derived, per utils/tsdf_utils). The
+    featured model is TSDF_OPTS['model'] (default gvt_v3), or the last available one.
+    """
+    from matplotlib.colors import Normalize, TwoSlopeNorm
+
+    tau = float(TSDF_OPTS["tau"])
+    axis, idx = V["cut_axis"], V["cut_idx"]
+    gt2d = np.take(V["gt"], idx, axis=axis)
+    asp = _plane_aspect(V["spacing_zyx"], axis)
+    full = (0, gt2d.shape[0], 0, gt2d.shape[1])
+    y0, y1, x0, x1 = crop_bbox_from_mask(gt2d) if gt2d.any() else full
+
+    # pick the featured model (default gvt_v3), falling back to the last available one
+    featured = TSDF_OPTS["model"]
+    if featured not in V["preds"]:
+        avail = [m for m in model_keys if m in V["preds"]]
+        featured = avail[-1] if avail else None
+    pred2d = (np.take(V["preds"][featured], idx, axis=axis)
+              if featured is not None else np.zeros_like(gt2d))
+    feat_title = MODEL_SPECS[featured]["title"] if featured else "prediction"
+
+    gt_t = _compute_tsdf(gt2d, tau)[y0:y1, x0:x1]
+    pr_t = _compute_tsdf(pred2d, tau)[y0:y1, x0:x1]
+    err = pr_t - gt_t
+    tsdf_norm = Normalize(vmin=-tau, vmax=tau)
+
+    fig, axes = plt.subplots(1, 3, figsize=(3 * 2.6, 3.0))
+
+    for ax, field, title in ((axes[0], gt_t, "GT TSDF"),
+                             (axes[1], pr_t, f"Pred TSDF\n{feat_title}")):
+        im = ax.imshow(field, cmap=TSDF_CMAP, norm=tsdf_norm, interpolation="nearest")
+        for cc in _safe_contours(field > 0):        # zero level-set = boundary
+            ax.plot(cc[:, 1], cc[:, 0], color="w", linewidth=1.0)
+        _style_tsdf_ax(ax, title, asp)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+
+    emax = float(np.abs(err).max()) or 1.0
+    im = axes[2].imshow(err, cmap=TSDF_ERR_CMAP,
+                        norm=TwoSlopeNorm(vmin=-emax, vcenter=0.0, vmax=emax),
+                        interpolation="nearest")
+    band = np.abs(gt_t) < tau
+    mae_band = float(np.abs(err)[band].mean()) if band.any() else float("nan")
+    _style_tsdf_ax(axes[2], f"TSDF error (Pred−GT)\nband MAE={mae_band:.1f}px", asp)
+    fig.colorbar(im, ax=axes[2], fraction=0.046, pad=0.02)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
 # Ordered registry: folder name -> renderer. "visN_" prefix preserves a stable order.
 VIS_METHODS: "Dict[str, Callable]" = {
     "vis1_cut_slice": vis_cut_slice,
@@ -1046,6 +1129,7 @@ VIS_METHODS: "Dict[str, Callable]" = {
     "vis5_surface": vis_surface,
     "vis6_surface_distance": vis_surface_distance,
     "vis7_error_volume": vis_error_volume,
+    "vis8_tsdf": vis_tsdf,
 }
 VIS_NUM_TO_FOLDER = {f"vis{i + 1}": name for i, name in enumerate(VIS_METHODS)}
 
@@ -1109,7 +1193,12 @@ def parse_args():
                     choices=["all"] + list(VIS_NUM_TO_FOLDER) + list(VIS_METHODS),
                     help="Which visualisation method(s) to render, each into its own "
                          "<output-dir>/visN_* folder. 'all' (default) renders every method; "
-                         "or pass e.g. vis1 vis2 vis5. vis5-7 are 3D renders (slower).")
+                         "or pass e.g. vis1 vis2 vis5. vis5-7 are 3D renders (slower); "
+                         "vis8 is the GT/pred TSDF + error panel.")
+    p.add_argument("--tsdf-model", default="gvt_v3", choices=list(MODEL_SPECS),
+                    help="Featured model for the vis8 Predicted-TSDF/error panels (default: gvt_v3).")
+    p.add_argument("--tsdf-tau", type=float, default=32.0,
+                    help="TSDF truncation radius in pixels for vis8 (default: 32).")
 
     p.add_argument("--models", nargs="+", default=DEFAULT_MODEL_ORDER, choices=list(MODEL_SPECS),
                     help="Which model columns to run, in order (default: all candidates, "
@@ -1387,6 +1476,8 @@ def main():
         log("\n[WARN] --no-save-pred-volumes leaves no 3D volumes on disk; the multi-method "
             "visualisations need them. Skipping figures (use without --no-save-pred-volumes).")
     else:
+        TSDF_OPTS["tau"] = float(args.tsdf_tau)
+        TSDF_OPTS["model"] = args.tsdf_model
         methods = resolve_vis_methods(args.vis_methods)
         generate_visualisations(pvd, out_dir, records_by_group, model_keys, methods,
                                 dpi=args.dpi, log=log)
