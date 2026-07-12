@@ -71,8 +71,8 @@ into its own <output-dir>/visN_*/ folder, so you can compare and pick. Select wi
   vis5_surface          3D surface mesh: GT (translucent) vs prediction
   vis6_surface_distance prediction surface colored by distance-to-GT (mm)
   vis7_error_volume     3D FP (orange) vs FN (purple) meshes
-  vis8_tsdf             GT TSDF | Pred TSDF | TSDF error (mask-derived signed distance
-                        field; featured model = --tsdf-model)
+  vis8_tsdf             triplanar TSDF grid: rows = axial/coronal/sagittal, columns =
+                        GT TSDF + one predicted TSDF per selected model (mask-derived)
 vis5-7 are 3D renders (slower, lower-fidelity than a dedicated renderer); empty/tiny
 masks are skipped gracefully per case.
 
@@ -132,9 +132,9 @@ every model accumulated in pred_volumes/, not just that run's subset).
 Example:
 python qualitative_study.py \
 --from-volumes /scratch/user/s4670484/SAMRI-3D_qualitative/qualitative/pred_volumes \
---output-dir   /scratch/user/s4670484/SAMRI-3D_qualitative/five_model_vis \
+--output-dir   /scratch/user/s4670484/SAMRI-3D_qualitative/five_model_vis_tsdf \
 --models sam2_small sam_med3d medical_sam2 samed2 gvt_v3 \
---vis-methods vis1_cut_slice vis2_triplanar
+--vis-methods vis1_cut_slice vis2_triplanar vis8_tsdf
 """
 
 from __future__ import annotations
@@ -487,11 +487,19 @@ def _safe_contours(arr2d: np.ndarray):
 # Color legend shown at the bottom of GT-vs-prediction figures (vis1-5).
 GT_PRED_LEGEND = [("Ground truth", GT_COLOR), ("Prediction", PRED_COLOR)]
 
-# TSDF panels (vis8): rainbow field (blue far-outside -> green boundary -> red inside),
-# signed error in a diverging map. Configured from CLI in main() via TSDF_OPTS.
+# TSDF panels (vis8): rainbow field (blue far-outside -> green boundary -> red inside).
+# tau (truncation radius, px) is configured from CLI in main() via TSDF_OPTS.
 TSDF_CMAP = "jet"
-TSDF_ERR_CMAP = "coolwarm"
-TSDF_OPTS = {"tau": 32.0, "model": "gvt_v3"}   # truncation radius (px), featured model
+TSDF_OPTS = {"tau": 32.0}
+# Concise column headers for the vis8 grid (full MODEL_SPECS titles are too wide).
+_TSDF_SHORT_LABEL = {"sam2_small": "SAM2-Small", "sam_med3d": "SAM-Med3D",
+                     "medical_sam2": "Medical-SAM2", "samed2": "SAMed-2",
+                     "baseline": "2D loss", "gvt_v1": "GVT-v1",
+                     "gvt_v2": "GVT-v2", "gvt_v3": "GVT-v3"}
+
+
+def _short_model_label(key: str) -> str:
+    return _TSDF_SHORT_LABEL.get(key, MODEL_SPECS.get(key, {}).get("title", key))
 
 
 def _compute_tsdf(mask2d: np.ndarray, tau: float = 32.0) -> np.ndarray:
@@ -1065,57 +1073,60 @@ def _style_tsdf_ax(ax, title: str, aspect: float) -> None:
     ax.set_title(title, fontsize=TITLE_FONTSIZE, fontweight=FONT_WEIGHT)
 
 
-def vis_tsdf(out_path: Path, V: Dict, model_keys: List[str], dpi: int) -> None:
-    """One row per case: GT TSDF | Pred TSDF | TSDF error.
+def _tsdf_panel(ax, field2d, tsdf_norm, title, aspect):
+    """Draw one TSDF field panel (jet + white zero-level-set contour)."""
+    ax.imshow(field2d, cmap=TSDF_CMAP, norm=tsdf_norm, interpolation="nearest")
+    for cc in _safe_contours(field2d > 0):          # zero level-set = boundary
+        ax.plot(cc[:, 1], cc[:, 0], color="w", linewidth=1.0)
+    _style_tsdf_ax(ax, title, aspect)
 
-    The input image, GT, and per-model overlays are already covered by vis1-7, so this
-    method shows only the signed distance fields: the (binary) GT and one featured
-    model's prediction on the cut slice (mask-derived, per utils/tsdf_utils). The
-    featured model is TSDF_OPTS['model'] (default gvt_v3), or the last available one.
+
+def vis_tsdf(out_path: Path, V: Dict, model_keys: List[str], dpi: int) -> None:
+    """Triplanar TSDF grid: rows = Axial / Coronal / Sagittal (through the GT centroid),
+    columns = GT TSDF + one predicted TSDF per selected model.
+
+    TSDFs are the mask-derived signed distance field (positive inside, negative outside,
+    ~0 on the boundary, clamped to +/-tau) of the GT and of each model's prediction on
+    that plane's centroid slice. A single shared colorbar spans the grid.
     """
-    from matplotlib.colors import Normalize, TwoSlopeNorm
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
 
     tau = float(TSDF_OPTS["tau"])
-    axis, idx = V["cut_axis"], V["cut_idx"]
-    gt2d = np.take(V["gt"], idx, axis=axis)
-    asp = _plane_aspect(V["spacing_zyx"], axis)
-    full = (0, gt2d.shape[0], 0, gt2d.shape[1])
-    y0, y1, x0, x1 = crop_bbox_from_mask(gt2d) if gt2d.any() else full
-
-    # pick the featured model (default gvt_v3), falling back to the last available one
-    featured = TSDF_OPTS["model"]
-    if featured not in V["preds"]:
-        avail = [m for m in model_keys if m in V["preds"]]
-        featured = avail[-1] if avail else None
-    pred2d = (np.take(V["preds"][featured], idx, axis=axis)
-              if featured is not None else np.zeros_like(gt2d))
-    feat_title = MODEL_SPECS[featured]["title"] if featured else "prediction"
-
-    gt_t = _compute_tsdf(gt2d, tau)[y0:y1, x0:x1]
-    pr_t = _compute_tsdf(pred2d, tau)[y0:y1, x0:x1]
-    err = pr_t - gt_t
+    cz, cy, cx = _gt_centroid(V["gt"])
+    centers = {0: cz, 1: cy, 2: cx}
     tsdf_norm = Normalize(vmin=-tau, vmax=tau)
 
-    fig, axes = plt.subplots(1, 3, figsize=(3 * 2.6, 3.0))
+    columns = ["gt_tsdf"] + model_keys
+    ncols = len(columns)
+    fig, axes = plt.subplots(3, ncols, figsize=(ncols * 2.4, 3 * 2.4))
+    if ncols == 1:
+        axes = axes[:, None]
 
-    for ax, field, title in ((axes[0], gt_t, "GT TSDF"),
-                             (axes[1], pr_t, f"Pred TSDF\n{feat_title}")):
-        im = ax.imshow(field, cmap=TSDF_CMAP, norm=tsdf_norm, interpolation="nearest")
-        for cc in _safe_contours(field > 0):        # zero level-set = boundary
-            ax.plot(cc[:, 1], cc[:, 0], color="w", linewidth=1.0)
-        _style_tsdf_ax(ax, title, asp)
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+    for r, axis in enumerate((0, 1, 2)):
+        idx = centers[axis]
+        gt2d = np.take(V["gt"], idx, axis=axis)
+        asp = _plane_aspect(V["spacing_zyx"], axis)
+        full = (0, gt2d.shape[0], 0, gt2d.shape[1])
+        y0, y1, x0, x1 = crop_bbox_from_mask(gt2d) if gt2d.any() else full
+        gt_t = _compute_tsdf(gt2d, tau)[y0:y1, x0:x1]
 
-    emax = float(np.abs(err).max()) or 1.0
-    im = axes[2].imshow(err, cmap=TSDF_ERR_CMAP,
-                        norm=TwoSlopeNorm(vmin=-emax, vcenter=0.0, vmax=emax),
-                        interpolation="nearest")
-    band = np.abs(gt_t) < tau
-    mae_band = float(np.abs(err)[band].mean()) if band.any() else float("nan")
-    _style_tsdf_ax(axes[2], f"TSDF error (Pred−GT)\nband MAE={mae_band:.1f}px", asp)
-    fig.colorbar(im, ax=axes[2], fraction=0.046, pad=0.02)
+        for j, c in enumerate(columns):
+            ax = axes[r, j]
+            show = (r == 0)
+            if c == "gt_tsdf":
+                _tsdf_panel(ax, gt_t, tsdf_norm, "GT TSDF" if show else "", asp)
+            else:
+                pr2d = np.take(V["preds"][c], idx, axis=axis) if c in V["preds"] else np.zeros_like(gt2d)
+                pr_t = _compute_tsdf(pr2d, tau)[y0:y1, x0:x1]
+                _tsdf_panel(ax, pr_t, tsdf_norm,
+                            _short_model_label(c) if show else "", asp)
+        _row_label(axes[r, 0], PLANE_NAMES[axis])
 
-    fig.tight_layout()
+    sm = ScalarMappable(norm=tsdf_norm, cmap=TSDF_CMAP)
+    sm.set_array([])
+    fig.colorbar(sm, ax=axes.ravel().tolist(), fraction=0.015, pad=0.01,
+                 label="signed distance (px)")
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
@@ -1194,9 +1205,7 @@ def parse_args():
                     help="Which visualisation method(s) to render, each into its own "
                          "<output-dir>/visN_* folder. 'all' (default) renders every method; "
                          "or pass e.g. vis1 vis2 vis5. vis5-7 are 3D renders (slower); "
-                         "vis8 is the GT/pred TSDF + error panel.")
-    p.add_argument("--tsdf-model", default="gvt_v3", choices=list(MODEL_SPECS),
-                    help="Featured model for the vis8 Predicted-TSDF/error panels (default: gvt_v3).")
+                         "vis8 is the triplanar GT/pred TSDF grid.")
     p.add_argument("--tsdf-tau", type=float, default=32.0,
                     help="TSDF truncation radius in pixels for vis8 (default: 32).")
 
@@ -1477,7 +1486,6 @@ def main():
             "visualisations need them. Skipping figures (use without --no-save-pred-volumes).")
     else:
         TSDF_OPTS["tau"] = float(args.tsdf_tau)
-        TSDF_OPTS["model"] = args.tsdf_model
         methods = resolve_vis_methods(args.vis_methods)
         generate_visualisations(pvd, out_dir, records_by_group, model_keys, methods,
                                 dpi=args.dpi, log=log)
