@@ -15,13 +15,17 @@ build/
 # Ignore model checkpoints
 *.pth
 
-# Claude Code local settings (personal preferences)
-.claude/settings.local.json
+# Claude Code local support files (kept locally, not part of the reproducible repo)
+.claude/
+CLAUDE.md
 
 # Temporary Claude Code files (known bug)
 tmpclaude-*-cwd
 
 # Optional: plan files created during builds
 plan.md
-```
+
+# Paper artifacts (kept locally, not part of the reproducible repo)
+/*.pdf
+*.docx
 
