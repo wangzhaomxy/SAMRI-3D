@@ -4,20 +4,22 @@ Official code for **"SAMRI-3D: Adapting SAM2 for 3D MRI Segmentation with Global
 Tokens"** (Wang et al.) — the 3D successor to [SAMRI](https://github.com/wangzhaomxy/SAMRI),
 our published 2D MRI model ([arXiv:2510.26635](https://arxiv.org/abs/2510.26635)).
 
-SAMRI-3D adapts Meta's **SAM2** for **3D MRI segmentation**. MRI's low soft-tissue contrast
-leaves many boundaries effectively invisible on individual slices, so SAMRI-3D treats a 3D
-volume as a bidirectional "video": it is split at the slice with the largest foreground
-(the *cut slice*) into two sub-sequences, and SAM2's video predictor propagates the
-segmentation outward from a box/point prompt placed on the cut slice. Predictions are
-merged back into a 3D semantic mask with the original NIfTI geometry preserved.
+SAMRI-3D adapts Meta's **SAM2** for **3D MRI segmentation**. Following the *slice-as-frame*
+paradigm, it treats a 3D volume as a bidirectional "video": the volume is split at the slice
+with the largest target foreground (the *cut slice*) into a forward and a backward
+sub-sequence, and SAM2's video predictor propagates the segmentation outward from a box/point
+prompt placed on the cut slice, before merging the two halves into a 3D mask with the original
+NIfTI geometry preserved.
 
-Freezing the image encoder and fine-tuning only the lightweight **decoder and memory
-modules** raises mean Dice from **0.58** (zero-shot SAM2) to **0.76**. To recover the
-boundaries that are invisible slice-by-slice, SAMRI-3D introduces **Global Volume Tokens
-(GVT)** — compact, persistent whole-volume memory tokens trained with a **Truncated Signed
-Distance Field (TSDF)** shape-prior objective that is *discarded at inference* (zero added
-cost). GVT-v3 reaches the best accuracy (**0.78** mean Dice) and generalizes to held-out
-datasets with no performance drop.
+For the MRI domain, both encoders (the Hiera image encoder and the prompt encoder) are
+**frozen** and only the lightweight **mask decoder, memory encoder, and memory attention** are
+fine-tuned — which alone lifts mean Dice from **0.58** (zero-shot SAM2-Small) to **0.76**.
+MRI's low soft-tissue contrast, however, leaves many boundaries effectively invisible on
+individual slices, while SAM2's sliding-window memory only carries *local* inter-slice
+context. To give every slice **whole-volume** shape context, SAMRI-3D adds **Global Volume
+Tokens (GVT)** — compact, persistent memory tokens trained with a **Truncated Signed Distance
+Field (TSDF)** shape-prior objective that is *discarded at inference* (zero added cost) —
+reaching **0.78** mean Dice with no drop on held-out datasets.
 
 ![SAMRI-3D pipeline overview](assets/samri3d_pipeline.png)
 
@@ -33,13 +35,19 @@ head supervises them and is discarded at inference.*
 
 ## Highlights
 
-- **Decoder-only fine-tuning** on pre-computed SAM2 embeddings (fast, memory-efficient).
+- **SAMRI-3D-Bench** — the largest MRI-only SAM2 benchmark: 10,392 volumes, 34 datasets,
+  12 anatomical domains, with seen/unseen splits (0.78 mean Dice, no generalization gap).
+- **Parameter-efficient fine-tuning** — both encoders frozen; only the mask decoder + memory
+  modules trained, on pre-computed SAM2 embeddings (fast, memory-efficient).
+- **Global Volume Tokens (GVT)** with a **TSDF shape-prior** objective — whole-volume context
+  injected into SAM2's memory bank; the auxiliary decoder is discarded at inference (zero
+  overhead).
 - **Unified 2D/3D training** controlled by a single `--mix-ratio-3d` parameter.
-- **GVT v1/v2/v3** — global volume tokens, label-conditioned reconstruction, and a TSDF
-  shape prior (auxiliary heads are discarded at inference → zero overhead).
-- **3D evaluation** with per-label cut slices and Dice / Hausdorff / MSD metrics.
-- **Comparison harness** against SAM-Med3D, MedSAM2, Medical-SAM2, SAMed-2, MA-SAM.
-- **Publication-quality qualitative figures** (7 visualisation methods, one folder each).
+- **3D evaluation** (per-label cut slices; Dice / Hausdorff / MSD) plus a comparison harness
+  for prior SAM-based medical models (SAM-Med3D, Medical-SAM2, SAMed-2; MedSAM2 & MA-SAM
+  runners also included).
+- **Publication-quality qualitative figures** (8 visualisation methods incl. TSDF panels,
+  one folder each).
 
 ---
 
@@ -47,30 +55,35 @@ head supervises them and is discarded at inference.*
 
 SAMRI-3D is evaluated on **SAMRI-3D-Bench**, the largest MRI-only SAM2 benchmark to date:
 **10,392 volumes** from **34 datasets** (27 public, 7 in-house) spanning **12 anatomical
-domains** and **10+ sequences**, with explicit **seen/unseen splits** for zero-shot
-generalization testing.
+domains** (brain, prostate, knee/MSK, cardiac, whole-body, hippocampus, vestibular, hip,
+spine, abdominal, shoulder, gynaecology) and **10+ MRI sequences**. Each dataset is split
+**80/10/10** train/val/test; models train only on the **26 seen** datasets, and the **8
+unseen** datasets are held out entirely for zero-shot generalization testing.
 
 ## Key results
 
-Mean Dice over the 34-dataset benchmark (box prompt). Full numbers (HD/MSD, per-domain,
-per-sequence, statistical tests) are reported in the paper.
+Mean over the 34-dataset benchmark (box prompt, mean ± std of per-dataset medians).
+Per-domain, per-sequence, and significance statistics are in the paper.
 
-| Model | Type | Mean Dice ↑ |
-|-------|------|:-----------:|
-| SAM-Med3D | 3D medical SAM | 0.37 |
-| Medical-SAM2 | SAM2, medical | 0.49 |
-| SAM2 | foundation (zero-shot) | 0.58 |
-| SAMed-2 | SAM2, medical | 0.69 |
-| **SAMRI-3D** | ours (decoder + memory fine-tune) | **0.76** |
-| **SAMRI-3D (GVT-v3)** | ours, best (+ TSDF prior) | **0.78** |
+| Method | Type | Dice ↑ | HD ↓ | MSD ↓ |
+|--------|------|:------:|:----:|:-----:|
+| SAM-Med3D | 3D medical SAM | 0.37 ± 0.21 | 29.04 ± 16.70 | 6.39 ± 2.78 |
+| Medical-SAM2 | SAM2, medical | 0.49 ± 0.22 | 33.51 ± 21.81 | 5.92 ± 4.26 |
+| SAM2-Small | foundation (zero-shot) | 0.58 ± 0.24 | 28.24 ± 20.42 | 6.32 ± 4.46 |
+| SAMed-2 | SAM2, medical | 0.69 ± 0.15 | 22.28 ± 18.82 | 2.91 ± 1.62 |
+| **SAMRI-3D** | ours (best) | **0.78 ± 0.14** | **13.85 ± 9.01** | **2.11 ± 0.96** |
 
-SAMRI-3D (GVT-v3) attains **0.78 ± 0.14 Dice, 13.85 ± 9.01 HD, 2.11 ± 0.96 MSD** and shows
-**no drop on held-out datasets** (0.79 unseen vs. 0.78 seen) — per-sequence analysis
-confirms the TSDF shape prior helps most where per-slice contrast is weakest.
+SAMRI-3D attains the best mean **0.78 ± 0.14 Dice, 13.85 ± 9.01 HD, 2.11 ± 0.96 MSD**, with
+the lowest variance on every metric. All gains over the comparison methods and zero-shot
+SAM2-Small are significant at the per-sample and per-label levels (two-sided paired Wilcoxon).
+SAMRI-3D shows **no generalization gap** — 0.79 on the 8 unseen datasets vs. 0.78 on the seen
+ones — and leads **10 of 12** anatomical domains (trailing SAMed-2 only on whole-body /
+abdominal multi-organ cases). The whole-volume shape prior helps most where per-slice contrast
+is weakest, e.g. white-matter hyperintensities improve 0.09 → 0.54 and hippocampus 0.65 → 0.84.
 
 ![Qualitative comparison](assets/samri3d_qualitative.png)
 
-*Qualitative comparison (triplanar axial/coronal/sagittal views) of SAMRI-3D (GVT-v3) against
+*Qualitative comparison (triplanar axial/coronal/sagittal views) of SAMRI-3D against
 zero-shot SAM2-Small, SAM-Med3D, Medical-SAM2, and SAMed-2. Yellow = ground truth,
 magenta = prediction. Figures are produced by [`qualitative_study.py`](qualitative_study.py).*
 
@@ -160,25 +173,10 @@ python generate_3d_embeddings.py \
   --save-dir /path/to/3D_embeddings/
 ```
 
-### 2. Train
+### 2. Train SAMRI-3D
 
-Five training modes are exposed through `train_multi_gpus.sh` (set `TRAINING_MODE`):
-
-| Mode      | Script                        | Description |
-|-----------|-------------------------------|-------------|
-| `2d_emb`  | `train_unified_emb.py`        | 2D loss from embeddings — **baseline** |
-| `3d_emb`  | `train_unified_emb_3dloss.py` | 2D + 3D volumetric loss from embeddings |
-| `2d_img`  | `train_unified.py`            | 2D loss from raw images / training list |
-| `gvt_v1`  | `gvt/train_gvt_emb_tsdf.py`   | GVT encoder only |
-| `gvt_v2`  | `gvt/train_gvt_emb_tsdf.py`   | GVT + reconstruction loss |
-| `gvt_v3`  | `gvt/train_gvt_emb_tsdf.py`   | GVT + reconstruction + **TSDF shape prior** (best) |
-
-```bash
-# Edit TRAINING_MODE and paths inside train_multi_gpus.sh, then:
-sbatch train_multi_gpus.sh
-```
-
-Example direct invocation (GVT v3):
+SAMRI-3D fine-tunes the SAM2.1 Hiera-Small backbone from pre-computed embeddings (both
+encoders frozen) with the GVT + TSDF shape-prior objective:
 
 ```bash
 python gvt/train_gvt_emb_tsdf.py \
@@ -186,7 +184,7 @@ python gvt/train_gvt_emb_tsdf.py \
   --pretrained-ckpt /path/to/sam2.1_hiera_small.pt \
   --embedding-dir /path/to/3D_embeddings/ \
   --save-path /path/to/checkpoints/ \
-  --batch-size 1 --num-epochs 200 --lr 5e-6 \
+  --batch-size 1 --num-epochs 200 --lr 5e-6 --weight-decay 0.01 \
   --lambda-2d 1.0 --lambda-3d 5.0 --mix-ratio-3d 0.8 --max-slices-per-video 32 \
   --use-gvt --gvt-num-tokens 16 --gvt-num-layers 2 --gvt-num-heads 4 \
   --gvt-recon --gvt-recon-res 32 --lambda-aux 1.0 \
@@ -194,9 +192,16 @@ python gvt/train_gvt_emb_tsdf.py \
   --use-amp
 ```
 
-Key knobs: `--mix-ratio-3d` (0=pure 2D slices … 1=pure 3D volumes), `--lambda-2d` /
-`--lambda-3d` (segmentation loss weights), `--lambda-aux` / `--lambda-tsdf` (GVT
-auxiliary losses).
+Or launch on SLURM via `train_multi_gpus.sh` (set `TRAINING_MODE="gvt_v3"`), which wraps the
+command above; the script also exposes the reduced configurations used for the paper's
+ablation study.
+
+```bash
+sbatch train_multi_gpus.sh
+```
+
+Key knobs: `--mix-ratio-3d` (0 = pure 2D slices … 1 = pure 3D volumes) and `--lambda-tsdf`
+(weight of the TSDF shape-prior loss).
 
 ### 3. Evaluate (Dice / HD / MSD)
 
@@ -247,6 +252,9 @@ python qualitative_study.py \
 
 ## Interactive GUI
 
+> **🚧 Under construction.** The GUI is experimental and not yet feature-complete — expect
+> rough edges and API changes.
+
 For point-and-click segmentation (the 3D analogue of [SAMRI v1's](https://github.com/wangzhaomxy/SAMRI)
 ipywidgets demo), a Jupyter GUI is provided under `gui/`:
 
@@ -271,30 +279,20 @@ exact propagation pipeline from `test_vis3d_multi.py` via `gui/inference_backend
 
 ---
 
-## Model variants
-
-| Name      | Training script               | Notes |
-|-----------|-------------------------------|-------|
-| Baseline  | `train_unified_emb.py`        | 2D Dice-Focal loss only |
-| 2D+3D     | `train_unified_emb_3dloss.py` | adds a per-label volumetric Dice loss |
-| GVT v1    | `gvt/train_gvt_emb_tsdf.py`   | global volume tokens in the memory bank |
-| GVT v2    | `gvt/train_gvt_emb_tsdf.py`   | + label-conditioned reconstruction loss |
-| GVT v3    | `gvt/train_gvt_emb_tsdf.py`   | + TSDF shape-prior loss (recommended) |
-
-All variants fine-tune from the SAM2-Small backbone. GVT auxiliary decoders
-(`GVTReconDecoder`, `TSDFDecoder`) are **training-only** and discarded at inference.
-
----
-
 ## Citation
 
-If you use SAMRI-3D or SAMRI-3D-Bench, please cite our paper (citation to be finalized):
+If you use SAMRI-3D or SAMRI-3D-Bench, please cite our paper (arXiv preprint — replace
+`eprint`/`url` with the assigned arXiv ID):
 
 ```bibtex
-@article{wang2026samri3d,
-  title   = {SAMRI-3D: Adapting SAM2 for 3D MRI Segmentation with Global Volume Tokens},
-  author  = {Wang, Zhao and Dai, Wei and Sun, Hongfu and Engstrom, Craig and Chandra, Shekhar S.},
-  year    = {2026}
+@misc{wang2026samri3d,
+  title         = {SAMRI-3D: Adapting SAM2 for 3D MRI Segmentation with Global Volume Tokens},
+  author        = {Wang, Zhao and Dai, Wei and Sun, Hongfu and Engstrom, Craig and Chandra, Shekhar S.},
+  year          = {2026},
+  eprint        = {XXXX.XXXXX},
+  archivePrefix = {arXiv},
+  primaryClass  = {eess.IV},
+  url           = {https://arxiv.org/abs/XXXX.XXXXX}
 }
 ```
 
