@@ -1,8 +1,9 @@
 # SAMRI-3D — Segment Anything Model for 3D MRI
 
 Official code for **"SAMRI-3D: Adapting SAM2 for 3D MRI Segmentation with Global Volume
-Tokens"** (Wang et al.) — the 3D successor to [SAMRI](https://github.com/wangzhaomxy/SAMRI),
-our published 2D MRI model ([arXiv:2510.26635](https://arxiv.org/abs/2510.26635)).
+Tokens"** (Wang et al., [arXiv:2607.18014](https://arxiv.org/abs/2607.18014)) — the 3D
+successor to [SAMRI](https://github.com/wangzhaomxy/SAMRI), our published 2D MRI model
+([arXiv:2510.26635](https://arxiv.org/abs/2510.26635)).
 
 SAMRI-3D adapts Meta's **SAM2** for **3D MRI segmentation**. Following the *slice-as-frame*
 paradigm, it treats a 3D volume as a bidirectional "video": the volume is split at the slice
@@ -135,9 +136,13 @@ pip install -e .          # installs the `samri` package + dependencies (see set
 - **SAM2** is vendored under `sam2/` — no separate install.
 - **PyTorch** with a CUDA build matching your GPU should be installed separately
   (follow the [official instructions](https://pytorch.org/)).
-- **Pretrained SAM2.1 checkpoints** (`sam2.1_hiera_{tiny,small,base_plus,large}.pt`) must
-  be downloaded from the [official SAM2 repository](https://github.com/facebookresearch/sam2)
-  and placed wherever convenient (passed via `--pretrained-ckpt` / `--ckpt-path`).
+- **SAMRI-3D pretrained weights** — download the trained checkpoint from
+  [Google Drive](https://drive.google.com/drive/folders/1LuKt_l-4w8Lbn6ZBFo6uSxkFXAcEU4kg?usp=sharing)
+  and pass it via `--ckpt-path ... --use-gvt` for evaluation/inference.
+- **Pretrained SAM2.1 checkpoints** (`sam2.1_hiera_{tiny,small,base_plus,large}.pt`), needed
+  only to *train* from scratch, come from the
+  [official SAM2 repository](https://github.com/facebookresearch/sam2)
+  (passed via `--pretrained-ckpt`).
 - **Comparison models** (`comparison/`) each require their **own conda environment** and
   checkpoints; see `comparison_test.py` for per-model setup.
 
@@ -281,18 +286,18 @@ exact propagation pipeline from `test_vis3d_multi.py` via `gui/inference_backend
 
 ## Citation
 
-If you use SAMRI-3D or SAMRI-3D-Bench, please cite our paper (arXiv preprint — replace
-`eprint`/`url` with the assigned arXiv ID):
+If you use SAMRI-3D or SAMRI-3D-Bench, please cite our paper
+([arXiv:2607.18014](https://arxiv.org/abs/2607.18014)):
 
 ```bibtex
-@misc{wang2026samri3d,
+@misc{wang2026samri3dadaptingsam23d,
   title         = {SAMRI-3D: Adapting SAM2 for 3D MRI Segmentation with Global Volume Tokens},
-  author        = {Wang, Zhao and Dai, Wei and Sun, Hongfu and Engstrom, Craig and Chandra, Shekhar S.},
+  author        = {Zhao Wang and Wei Dai and Hongfu Sun and Craig Engstrom and Shekhar S. Chandra},
   year          = {2026},
-  eprint        = {XXXX.XXXXX},
+  eprint        = {2607.18014},
   archivePrefix = {arXiv},
-  primaryClass  = {eess.IV},
-  url           = {https://arxiv.org/abs/XXXX.XXXXX}
+  primaryClass  = {cs.CV},
+  url           = {https://arxiv.org/abs/2607.18014}
 }
 ```
 
