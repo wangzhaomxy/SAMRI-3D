@@ -41,6 +41,25 @@ sys.path.insert(0, str(SLM_ROOT))
 os.environ["PYTHONPATH"] = str(SLM_ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")
 
 
+_ORIG_SINGLE_PROC_RUN = None
+
+
+def _per_rank_run(local_rank, main_port, cfg, world_size):
+    """Wrap SLM-SAM2's single_proc_run: give each DDP rank its own MIOpen cache dir
+    (MIOpen's SQLite caches must not be shared between processes)."""
+    base = os.environ.get("MIOPEN_USER_DB_PATH")
+    if base:
+        d = f"{base.rstrip('/')}-r{local_rank}"
+        os.makedirs(d, exist_ok=True)
+        os.environ["MIOPEN_USER_DB_PATH"] = d
+        os.environ["MIOPEN_CUSTOM_CACHE_DIR"] = d
+    fn = _ORIG_SINGLE_PROC_RUN
+    if fn is None:  # spawned worker: training.train is unpatched here
+        import training.train as tt
+        fn = tt.single_proc_run
+    return fn(local_rank, main_port, cfg, world_size)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -85,6 +104,9 @@ def main():
 
     _compose = tt.compose
     tt.compose = lambda config_name: _compose(config_name=config_name, overrides=overrides)
+    global _ORIG_SINGLE_PROC_RUN
+    _ORIG_SINGLE_PROC_RUN = tt.single_proc_run
+    tt.single_proc_run = _per_rank_run
 
     # Importing SLM-SAM2's `sam2` package already initialises Hydra with module "sam2"
     # (sam2/__init__.py), which is exactly what train.py's __main__ would do.

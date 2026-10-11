@@ -4,42 +4,35 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --job-name=CMP_eval
-#SBATCH --time=2-00:00:00
+#SBATCH --time=0-12:00:00
 #SBATCH --partition=gpu_rocm
 #SBATCH --gres=gpu:mi300x:1
-#SBATCH --account=a_ai_collab
 #SBATCH --qos=gpu
+#SBATCH --account=a_ai_collab
 #SBATCH -o /scratch/user/s4670484/SAMRI2_log/slurm-cmp-eval-%j.output
 #SBATCH -e /scratch/user/s4670484/SAMRI2_log/slurm-cmp-eval-%j.error
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=zhao.wang1@uq.edu.au
 #
 # Evaluate on the same 34-dataset test set and protocol as SAMRI-3D (comparison_test.py):
-#   TARGET=slm_box   SLM-SAM2, GT box on the cut slice     (headline protocol)
-#   TARGET=slm_mask  SLM-SAM2, GT mask on the cut slice    (its native prompt, secondary)
 #   TARGET=medsam2   MedSAM2 rerun with the box-coordinate fix
+#   TARGET=slm_box   SLM-SAM2, GT box on the cut slice   (headline protocol)
+#   TARGET=slm_mask  SLM-SAM2, GT mask on the cut slice  (its native prompt, secondary)
 #
-# Submit FROM THE SAMRI-3D REPO ROOT, one job per target. Smoke first (1 case/dataset):
-#   sbatch --time=0-01:00:00 --export=ALL,TARGET=medsam2 comparison/slm_sam2_tools/slurm_comparison_eval.sh
-#   sbatch --export=ALL,TARGET=medsam2,MODE=full         comparison/slm_sam2_tools/slurm_comparison_eval.sh
+# Card: MI300X x1 (samri-mi300, the env used for the earlier SAM2-based evaluations).
+# --time=12h because MI300X jobs have been cut at ~12 h; the run saves after every dataset
+# and --resume skips finished datasets, so a cut job is continued by resubmitting it.
+# If the earlier MedSAM2 run used another env, add ENV=<env> to --export.
 #
-# Each run writes <OUT_DIR>/<run>/<run>.pkl plus its own log.txt (separate folders so
-# parallel runs do not overwrite each other's log).
+#   S=/scratch/user/s4670484/SAMRI2/comparison/slm_sam2_tools/slurm_comparison_eval.sh
+#   sbatch --time=0-01:00:00 --export=ALL,TARGET=medsam2 $S        # smoke: 1 case/dataset
+#   sbatch --export=ALL,TARGET=medsam2,MODE=full $S               # full
 
-set -euo pipefail
+set -uo pipefail
 MODE=${MODE:-smoke}
-TARGET=${TARGET:?set TARGET=slm_box|slm_mask|medsam2}
-# Conda env used for the earlier comparison runs (MedSAM2 needs its deps; SLM-SAM2 only
-# needs the SAM2 stack, so samri-mi300 is enough for it).
-COMP_ENV=${COMP_ENV:-samri-mi300}
-
-mkdir -p /scratch/user/s4670484/SAMRI2_log
-module load anaconda3/2023.09-0
-source $EBROOTANACONDA3/etc/profile.d/conda.sh
-conda activate "$COMP_ENV"
-
-cd "$SLURM_SUBMIT_DIR"
-[ -f comparison_test.py ] || { echo "[ERROR] submit from the SAMRI-3D repo root"; exit 1; }
+TARGET=${TARGET:-}
+[ -n "$TARGET" ] || { echo "[ERROR] set TARGET=medsam2|slm_box|slm_mask"; exit 1; }
+source /scratch/user/s4670484/SAMRI2/comparison/slm_sam2_tools/bunya_common.sh
 
 DATA_SEEN=/scratch/user/s4670484/Datasets/SAMRI_datasets_3D/
 DATA_UNSEEN=/scratch/user/s4670484/Datasets/Zeroshot3D/
@@ -48,21 +41,27 @@ SLM_CKPT=${SLM_CKPT:-/scratch/user/s4670484/Model_save/slm_sam2_samri3d/checkpoi
 OUT_DIR=/scratch/user/s4670484/Eval_results/comparison
 
 case "$TARGET" in
-  slm_box)  ARGS="--model slm_sam2 --slm-sam2-ckpt $SLM_CKPT --slm-prompt box";  RUN=slm_sam2_box ;;
-  slm_mask) ARGS="--model slm_sam2 --slm-sam2-ckpt $SLM_CKPT --slm-prompt mask"; RUN=slm_sam2_mask ;;
-  medsam2)  ARGS="--model medsam2"; RUN=medsam2_boxfix ;;
+  medsam2)  ARGS=(--model medsam2);                                          RUN=medsam2_boxfix; NEED=("$WEIGHTS/MedSAM2") ;;
+  slm_box)  ARGS=(--model slm_sam2 --slm-sam2-ckpt "$SLM_CKPT" --slm-prompt box);  RUN=slm_sam2_box;  NEED=("$SLM_CKPT") ;;
+  slm_mask) ARGS=(--model slm_sam2 --slm-sam2-ckpt "$SLM_CKPT" --slm-prompt mask); RUN=slm_sam2_mask; NEED=("$SLM_CKPT") ;;
   *) echo "[ERROR] unknown TARGET=$TARGET"; exit 1 ;;
 esac
-EXTRA=""
-if [ "$MODE" = "smoke" ]; then RUN=${RUN}_smoke; EXTRA="--max-cases 1"; fi
+EXTRA=()
+if [ "$MODE" = "smoke" ]; then RUN=${RUN}_smoke; EXTRA=(--max-cases 1); fi
 SAVE="$OUT_DIR/$RUN/$RUN.pkl"
 
-echo "TARGET=$TARGET MODE=$MODE ENV=$COMP_ENV SAVE=$SAVE started $(date)"
-python comparison_test.py $ARGS \
+gpu_preflight hydra PIL SimpleITK || exit 1
+require_paths "$DATA_SEEN" "$DATA_UNSEEN" "${NEED[@]}" || exit 1
+echo "TARGET=$TARGET MODE=$MODE SAVE=$SAVE"
+[ -f "$SAVE.partial.pkl" ] && echo "[RESUME] partial results found: $SAVE.partial.pkl"
+
+python comparison_test.py "${ARGS[@]}" \
   --dataset-path "$DATA_SEEN" "$DATA_UNSEEN" \
   --weights-dir "$WEIGHTS" \
   --save-path "$SAVE" \
-  --device cuda $EXTRA
-echo "finished $(date)"
-N_ERR=$(grep -c "\[ERROR\]" "$OUT_DIR/$RUN/log.txt" || true)
-echo "[ERROR] lines in $OUT_DIR/$RUN/log.txt: ${N_ERR:-0}"
+  --device cuda --resume "${EXTRA[@]}"
+RC=$?
+echo "finished $(date) rc=$RC"
+N_ERR=$(grep -c '\[ERROR\]' "$OUT_DIR/$RUN/log.txt" 2>/dev/null) || true
+echo "[ERROR] lines in log: ${N_ERR:-0}"
+exit $RC

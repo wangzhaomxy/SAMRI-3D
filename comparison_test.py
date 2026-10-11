@@ -1009,9 +1009,14 @@ def evaluate_model(
     slm_sam2_ckpt: str = None,
     slm_prompt: str = "box",
     slm_recent_n: int = 1,
+    resume: bool = False,
 ) -> Dict:
     """
     Evaluate one model across all datasets.
+
+    After every dataset the rows collected so far are written to
+    <save_path>.partial.pkl; with resume=True, datasets already in that file are
+    skipped, so a job cut by the scheduler only loses the dataset in progress.
     Save format matches test_vis3d_multi.py:
       {ds_name: [{"img_name", "mask_name", "label",
                   "voxel_count", "voxel_percentage",
@@ -1021,12 +1026,31 @@ def evaluate_model(
     runner = RUNNERS[model_name]
     final_record: Dict[str, List[Dict]] = {}
 
+    partial_path = str(save_path) + ".partial.pkl"
+    done: Dict[str, List[Dict]] = {}
+    if resume and os.path.exists(partial_path):
+        with open(partial_path, "rb") as f:
+            done = pickle.load(f)
+        print(f"  Resuming: {len(done)} dataset(s) already in {partial_path}")
+
+    def _save_partial():
+        Path(partial_path).parent.mkdir(parents=True, exist_ok=True)
+        tmp = partial_path + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(final_record, f)
+        os.replace(tmp, partial_path)  # atomic: a cut mid-write cannot corrupt it
+
     test_folders = collect_test_folders(dataset_paths)
     print(f"  Found {len(test_folders)} test folder(s).")
 
     for test_folder in test_folders:
         tf = Path(test_folder).resolve()
         ds_name = tf.parent.name if tf.name == "testing" else tf.name
+
+        if ds_name in done:
+            final_record[ds_name] = done[ds_name]
+            print(f"[Skip] {ds_name}: {len(done[ds_name])} rows from partial file")
+            continue
 
         pairs = scan_pairs_same_folder(test_folder)
         if not pairs:
@@ -1132,11 +1156,14 @@ def evaluate_model(
 
         final_record[ds_name] = ds_rows
         print(f"[Done] {ds_name}: kept={kept}  skipped={skipped}  errors={errors}")
+        _save_partial()
 
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
     with open(save_path, "wb") as f:
         pickle.dump(final_record, f)
     print(f"\nSaved → {save_path}")
+    if os.path.exists(partial_path):
+        os.remove(partial_path)
 
     return final_record
 
@@ -1220,6 +1247,9 @@ def parse_args():
     p.add_argument("--slm-prompt", choices=["box", "mask"], default="box",
                    help="SLM-SAM2 prompt on the cut slice: box (headline protocol, same as "
                         "SAMRI-3D) or mask (SLM-SAM2's native GT-mask prompt).")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip datasets already saved in <save-path>.partial.pkl "
+                        "(written after every dataset).")
     p.add_argument("--slm-recent-n", type=int, default=1,
                    help="SLM-SAM2 short-term memory length; 1 = value used in training.")
     return p.parse_args()
@@ -1252,7 +1282,8 @@ def main():
     log_dir  = Path(args.save_path).parent
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "log.txt"
-    _log_fh  = open(log_path, "w", buffering=1)
+    # append when resuming so the log of the interrupted run is kept
+    _log_fh  = open(log_path, "a" if args.resume else "w", buffering=1)
     sys.stdout = _Tee(sys.__stdout__, _log_fh)
     sys.stderr = _Tee(sys.__stderr__, _log_fh)
     print(f"Logging to: {log_path}")
@@ -1290,6 +1321,7 @@ def main():
             slm_sam2_ckpt=args.slm_sam2_ckpt,
             slm_prompt=args.slm_prompt,
             slm_recent_n=args.slm_recent_n,
+            resume=args.resume,
         )
         all_results[model_name] = record
         print_summary(record, model_name)
