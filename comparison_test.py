@@ -20,12 +20,23 @@ Implemented runners
   medsam2       MedSAM2      — build_sam2_video_predictor_npz (MedSAM2's sam2 fork,
                                swapped via _swap_sam2); (S,3,512,512) tensor input;
                                box prompt at max-fg slice; forward + reverse propagation.
+                               (2026-10 fix: box now passed in original coordinates --
+                               it was previously scaled twice; rerun required.)
   medical_sam2  Medical-SAM2 — build_sam2_video_predictor (sam2_train package, no
                                namespace conflict); (S,3,512,512) tensor input;
                                bbox prompt; val_init_state + propagate_in_video.
   samed2        SAMed-2      — MedicalSegmenter (SAMed-2's sam2 fork, swapped via
                                _swap_sam2); 2D per-slice 1024×1024 input; box prompt
                                from GT per slice; aggregated to 3D volume.
+                               NOTE: SAMed-2 gets a GT box on EVERY slice containing the
+                               target and empty slices are skipped (no propagation), a
+                               stronger prompt than the single cut-slice box used for the
+                               other methods.
+  slm_sam2      SLM-SAM2     — SLM-SAM2's sam2 fork (swapped via _swap_sam2), trained by
+                               us with the official recipe on the SAMRI-3D training split
+                               (comparison/slm_sam2_tools/). JPEG frames along the primary
+                               axis; box (default) or GT-mask (--slm-prompt mask) prompt on
+                               the cut slice; forward + reverse propagation; recent_n=1.
 
 Stub (format incompatible) (running but too slow to run on the full test set, the 
                             initial run is around 20 minutes, then 30 min for big slice case,
@@ -54,6 +65,8 @@ The filename does not matter — the script picks up whichever file is present.
 │                                (override with --medical-sam2-ckpt /explicit/path)
 ├── samed2/         <one .pth>   (SAMed-2 GitHub page)
 │                                (override with --samed2-ckpt /explicit/path)
+├── slm_sam2/       <checkpoint.pt> trained by us (no released weights)
+│                                (override with --slm-sam2-ckpt /explicit/path)
 └── masam/
     ├── sam_vit_h_4b8939.pth    (Meta SAM ViT-H base)
     └── ma_sam_btcv.pth         (MA-SAM Google Drive — see comparison/MA-SAM-main/README.md)
@@ -82,6 +95,14 @@ python comparison_test.py \
 --weights-dir /scratch/user/s4670484/comparison_ckpt/ \
 --save-path /scratch/user/s4670484/Eval_results/comparison/samed2_debug.pkl \
 --max-cases 1
+
+# SLM-SAM2 (our trained checkpoint; see comparison/slm_sam2_tools/README.md)
+python comparison_test.py \
+--model slm_sam2 --slm-prompt box \
+--slm-sam2-ckpt /scratch/user/s4670484/Model_save/slm_sam2_samri3d/checkpoints/checkpoint.pt \
+--dataset-path /scratch/user/s4670484/Datasets/SAMRI_datasets_3D/ /scratch/user/s4670484/Datasets/Zeroshot3D/ \
+--weights-dir /scratch/user/s4670484/comparison_ckpt/ \
+--save-path /scratch/user/s4670484/Eval_results/comparison/slm_sam2_box/slm_sam2_box.pkl
 
 example:
 python comparison_test.py \
@@ -146,6 +167,7 @@ from test_vis3d_multi import (
     get_labels_from_mask,
     choose_primary_axis,
     normalize_to_uint8,
+    write_video_frames_to_dir,
     dice_3d,
     hd_msd_3d_sitk,
     scan_pairs_same_folder,
@@ -403,8 +425,13 @@ def run_medsam2(
     box = mask2d_to_bbox_xyxy((gt_shw[key_s] == label_id).astype(np.uint8))
     if box is None:
         return np.zeros(img_zyx.shape, dtype=bool)
-    box_512 = box * np.array([FRAME_SIZE / W, FRAME_SIZE / H,
-                               FRAME_SIZE / W, FRAME_SIZE / H], dtype=np.float32)
+    # FIX (2026-10): pass the box in ORIGINAL (H, W) pixel coordinates.
+    # init_state(img_tensor, H, W) stores video_height/width = H, W, and
+    # add_new_points_or_box (normalize_coords=True) divides by (W, H) and multiplies
+    # by the model's image_size (512) itself -- exactly as MedSAM2's own
+    # medsam2_infer_3D_CT.py does. The previous code pre-scaled the box to 512
+    # (box_512), so it was scaled twice and landed in the wrong place unless
+    # H = W = 512; this explains MedSAM2's near-zero Dice in the earlier results.
 
     pred_shw = np.zeros((S, H, W), dtype=bool)
     autocast_device = "cuda" if "cuda" in device else "cpu"
@@ -412,7 +439,7 @@ def run_medsam2(
         # Forward pass
         state = predictor.init_state(img_tensor, H, W)
         predictor.add_new_points_or_box(
-            inference_state=state, frame_idx=key_s, obj_id=1, box=box_512)
+            inference_state=state, frame_idx=key_s, obj_id=1, box=box)
         for fidx, _, logits in predictor.propagate_in_video(state):
             # logits[0] shape: (1, H512, W512)
             m = (logits[0] > 0.0).cpu().numpy()[0]
@@ -422,7 +449,7 @@ def run_medsam2(
         # Reverse pass (original MedSAM2 pattern: re-init + re-prompt + reverse=True)
         state = predictor.init_state(img_tensor, H, W)
         predictor.add_new_points_or_box(
-            inference_state=state, frame_idx=key_s, obj_id=1, box=box_512)
+            inference_state=state, frame_idx=key_s, obj_id=1, box=box)
         for fidx, _, logits in predictor.propagate_in_video(state, reverse=True):
             m = (logits[0] > 0.0).cpu().numpy()[0]
             pred_shw[fidx] |= _resize_mask_to_hw(m, H, W)
@@ -690,6 +717,128 @@ def run_samed2(
     return pred_zyx
 
 
+# ─── SLM-SAM2 runner ──────────────────────────────────────────────────────────
+
+SLM_SAM2_CONFIG = "configs/sam2.1/slm_sam2_hiera_t.yaml"
+
+
+def _load_slm_sam2(slm_root: Path, ckpt_path: Path, device: str, recent_n: int):
+    """Build SLM-SAM2's video predictor (its own sam2 fork) and load OUR trained weights.
+
+    * The official inference config sets recent_n: 7, but SLM-SAM2 is trained with
+      recent_n: 1 and the model reads self.recent_n (the propagate_in_video argument is
+      ignored by _track_step), so we override it to match training.
+    * Weights are loaded with an explicit missing-key check: SLM-SAM2's own loader uses
+      strict=False and only logs, which would silently leave the short-term memory
+      branch random if a plain SAM2 checkpoint were passed by mistake.
+    """
+    with _swap_sam2(slm_root):
+        from hydra.core.global_hydra import GlobalHydra  # noqa: PLC0415
+        GlobalHydra.instance().clear()
+        from sam2.build_sam import build_sam2_video_predictor  # noqa: PLC0415
+        predictor = build_sam2_video_predictor(
+            SLM_SAM2_CONFIG, None, device=device,
+            hydra_overrides_extra=[f"++model.recent_n={int(recent_n)}"],
+        )
+    ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+    sd = ckpt.get("model", ckpt)
+    missing, unexpected = predictor.load_state_dict(sd, strict=False)
+    if missing:
+        raise RuntimeError(
+            f"SLM-SAM2 checkpoint {ckpt_path} is missing {len(missing)} keys "
+            f"(e.g. {missing[:5]}). Is this a SLM-SAM2-trained checkpoint?")
+    if unexpected:
+        print(f"  [SLM-SAM2] ignoring {len(unexpected)} unexpected keys, e.g. {unexpected[:3]}")
+    if not any(k.startswith("recent_memory_attention.") for k in sd):
+        raise RuntimeError(f"{ckpt_path} has no recent_memory_attention weights.")
+    predictor.eval()
+    print(f"  [SLM-SAM2] loaded {ckpt_path} | recent_n={predictor.recent_n} | "
+          f"image_size={predictor.image_size}")
+    return predictor
+
+
+def run_slm_sam2(
+    img_path: str, gt_path: str, label_id: int,
+    img_zyx: np.ndarray, gt_zyx: np.ndarray,
+    spacing_zyx: Tuple, weights_dir: str, device: str,
+    comparison_dir: str, tmp_dir: str,
+    slm_sam2_ckpt: str = None, slm_prompt: str = "box", slm_recent_n: int = 1, **_,
+) -> np.ndarray:
+    """
+    SLM-SAM2 (Chen et al., IEEE TMI 2025) -- SAM2.1-Tiny with an extra short-term memory
+    branch, trained by us with the official recipe on the SAMRI-3D training split
+    (no released weights exist).
+
+    Shim: slices along the primary (shortest) axis -> min-max uint8 RGB JPEGs
+          (same preprocessing as SAMRI-3D and as the SLM-SAM2 training export), written
+          once per case and reused across labels.
+    Prompt: on the cut slice (max foreground for this label), as for every other method:
+          slm_prompt="box"  -> GT bounding box (headline protocol, same as SAMRI-3D)
+          slm_prompt="mask" -> GT mask of that slice (SLM-SAM2's native prompt)
+    Propagation: official inference.py pattern -- forward from the cut slice, then
+          reverse from the cut slice in the same state.
+    """
+    comp = Path(comparison_dir)
+    slm_root = comp / "SLM-SAM2-main"
+    ckpt_path = (Path(slm_sam2_ckpt) if slm_sam2_ckpt else
+                 _find_checkpoint(Path(weights_dir) / "slm_sam2", "SLM-SAM2"))
+
+    cache_key = (str(ckpt_path), int(slm_recent_n))
+    if not hasattr(run_slm_sam2, "_cache") or run_slm_sam2._cache[0] != cache_key:
+        run_slm_sam2._cache = (cache_key,
+                               _load_slm_sam2(slm_root, ckpt_path, device, slm_recent_n))
+    predictor = run_slm_sam2._cache[1]
+
+    primary_axis = choose_primary_axis(img_zyx.shape)
+    vol_shw = np.moveaxis(img_zyx, primary_axis, 0)  # [S, H, W]
+    gt_shw = np.moveaxis(gt_zyx, primary_axis, 0)
+    S, H, W = vol_shw.shape
+
+    fg = (gt_shw == label_id).sum(axis=(1, 2))
+    if fg.max() == 0:
+        return np.zeros(img_zyx.shape, dtype=bool)
+    key_s = int(np.argmax(fg))
+    key_mask = (gt_shw[key_s] == label_id)
+
+    # JPEG frames: written once per case, reused for every label of that case
+    prev = getattr(run_slm_sam2, "_frames", None)
+    if prev is None or prev[0] != img_path:
+        if prev is not None:
+            import shutil  # noqa: PLC0415
+            shutil.rmtree(prev[1], ignore_errors=True)
+        frames_dir = tempfile.mkdtemp(prefix="slm_frames_", dir=tmp_dir)
+        write_video_frames_to_dir(vol_shw, list(range(S)), frames_dir)
+        run_slm_sam2._frames = (img_path, frames_dir)
+    frames_dir = run_slm_sam2._frames[1]
+
+    pred_shw = np.zeros((S, H, W), dtype=bool)
+    use_amp = "cuda" in str(device)
+    amp_ctx = (torch.autocast("cuda", dtype=torch.bfloat16) if use_amp
+               else contextlib.nullcontext())
+    with torch.inference_mode(), amp_ctx:
+        state = predictor.init_state(video_path=frames_dir)
+        if slm_prompt == "box":
+            box = mask2d_to_bbox_xyxy(key_mask.astype(np.uint8))  # original (H, W) coords
+            predictor.add_new_points_or_box(
+                inference_state=state, frame_idx=key_s, obj_id=1, box=box)
+        elif slm_prompt == "mask":
+            predictor.add_new_mask(
+                inference_state=state, frame_idx=key_s, obj_id=1, mask=key_mask)
+        else:
+            raise ValueError(f"unknown slm_prompt: {slm_prompt}")
+
+        for fidx, _, logits in predictor.propagate_in_video(
+                state, start_frame_idx=key_s, recent_n=slm_recent_n):
+            pred_shw[fidx] = (logits[0] > 0.0).cpu().numpy()[0]
+        if key_s > 0:
+            for fidx, _, logits in predictor.propagate_in_video(
+                    state, start_frame_idx=key_s, reverse=True, recent_n=slm_recent_n):
+                pred_shw[fidx] = (logits[0] > 0.0).cpu().numpy()[0]
+        predictor.reset_state(state)
+
+    return np.moveaxis(pred_shw, 0, primary_axis)
+
+
 # ─── MA-SAM stub ──────────────────────────────────────────────────────────────
 
 def run_ma_sam(
@@ -840,6 +989,7 @@ RUNNERS = {
     "medsam2":      run_medsam2,
     "medical_sam2": run_medical_sam2,
     "samed2":       run_samed2,
+    "slm_sam2":     run_slm_sam2,
     "ma_sam":       run_ma_sam,
 }
 
@@ -856,6 +1006,9 @@ def evaluate_model(
     max_cases: Optional[int] = None,
     medical_sam2_ckpt: str = None,
     samed2_ckpt: str = None,
+    slm_sam2_ckpt: str = None,
+    slm_prompt: str = "box",
+    slm_recent_n: int = 1,
 ) -> Dict:
     """
     Evaluate one model across all datasets.
@@ -934,6 +1087,9 @@ def evaluate_model(
                                 tmp_dir=tmp_dir,
                                 medical_sam2_ckpt=medical_sam2_ckpt,
                                 samed2_ckpt=samed2_ckpt,
+                                slm_sam2_ckpt=slm_sam2_ckpt,
+                                slm_prompt=slm_prompt,
+                                slm_recent_n=slm_recent_n,
                             )
 
                             dsc = dice_3d(pred_binary, gt_binary)
@@ -1057,6 +1213,15 @@ def parse_args():
     p.add_argument("--samed2-ckpt", default=None,
                    help="Explicit checkpoint path for SAMed-2 "
                         "(overrides <weights-dir>/samed2/samed2.pth).")
+    p.add_argument("--slm-sam2-ckpt", default=None,
+                   help="Our SLM-SAM2 checkpoint (<exp-dir>/checkpoints/checkpoint.pt from "
+                        "comparison/slm_sam2_tools/train_slm_sam2.py); "
+                        "overrides <weights-dir>/slm_sam2/.")
+    p.add_argument("--slm-prompt", choices=["box", "mask"], default="box",
+                   help="SLM-SAM2 prompt on the cut slice: box (headline protocol, same as "
+                        "SAMRI-3D) or mask (SLM-SAM2's native GT-mask prompt).")
+    p.add_argument("--slm-recent-n", type=int, default=1,
+                   help="SLM-SAM2 short-term memory length; 1 = value used in training.")
     return p.parse_args()
 
 
@@ -1122,6 +1287,9 @@ def main():
             max_cases=args.max_cases,
             medical_sam2_ckpt=args.medical_sam2_ckpt,
             samed2_ckpt=args.samed2_ckpt,
+            slm_sam2_ckpt=args.slm_sam2_ckpt,
+            slm_prompt=args.slm_prompt,
+            slm_recent_n=args.slm_recent_n,
         )
         all_results[model_name] = record
         print_summary(record, model_name)
