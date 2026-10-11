@@ -150,13 +150,30 @@ def get_latest_checkpoint(save_path: str, initial_ckpt: str) -> Tuple[str, int]:
     return latest_ckpt, latest_epoch
 
 
-def mask2d_to_bbox_xyxy(mask2d: np.ndarray) -> Optional[np.ndarray]:
-    """Convert binary mask to bounding box in [x0, y0, x1, y1] format."""
+def mask2d_to_bbox_xyxy(mask2d: np.ndarray, jitter: int = 0) -> Optional[np.ndarray]:
+    """Convert binary mask to bounding box in [x0, y0, x1, y1] format.
+
+    jitter > 0 randomly shifts each box edge by up to +/- jitter pixels (training
+    augmentation, same rule as SAMRI v1's gen_bboxes: an axis is only jittered when
+    the box is longer than jitter + 10 pixels along it). The jittered box always
+    stays inside the image and is at least 10 pixels long on each jittered axis.
+    """
     ys, xs = np.where(mask2d > 0)
     if xs.size == 0:
         return None
     x0, x1 = xs.min(), xs.max()
     y0, y1 = ys.min(), ys.max()
+    if jitter > 0:
+        h, w = mask2d.shape
+        min_side = 10
+        if x1 - x0 > jitter + 10:
+            x0 = max(0, x0 + np.random.randint(-jitter, jitter + 1))
+            x1 = min(w - 1, x1 + np.random.randint(-jitter, jitter + 1))
+            x1 = max(x1, x0 + min_side)
+        if y1 - y0 > jitter + 10:
+            y0 = max(0, y0 + np.random.randint(-jitter, jitter + 1))
+            y1 = min(h - 1, y1 + np.random.randint(-jitter, jitter + 1))
+            y1 = max(y1, y0 + min_side)
     return np.array([x0, y0, x1, y1], dtype=np.float32)
 
 
@@ -481,7 +498,7 @@ def train_2d_sample_from_embedding(
     mask_resized = F.interpolate(mask_tensor, size=(256, 256), mode="nearest")
 
     # Generate prompt (box)
-    box = mask2d_to_bbox_xyxy(mask)
+    box = mask2d_to_bbox_xyxy(mask, jitter=getattr(args, 'box_jitter', 0))
     if box is None:
         return torch.tensor(0.0, device=device)
 
@@ -543,6 +560,7 @@ def process_video_with_memory_from_embedding(
     loss_fn,
     device,
     use_amp: bool = False,
+    box_jitter: int = 0,
 ) -> Tuple[torch.Tensor, int]:
     """
     Process a sequence of slices with memory bank using pre-computed embeddings.
@@ -601,7 +619,7 @@ def process_video_with_memory_from_embedding(
         point_inputs = None
 
         if is_init_cond_frame:
-            box = mask2d_to_bbox_xyxy(mask_2d.astype(np.uint8))
+            box = mask2d_to_bbox_xyxy(mask_2d.astype(np.uint8), jitter=box_jitter)
             if box is None:
                 return torch.tensor(0.0, device=device), 0
 
@@ -775,6 +793,7 @@ def train_3d_sample_from_embedding(
                 loss_fn=loss_fn,
                 device=device,
                 use_amp=args.use_amp,
+                box_jitter=getattr(args, 'box_jitter', 0),
             )
             if n1 > 0 and loss1.requires_grad:
                 all_losses.append(loss1)
@@ -796,6 +815,7 @@ def train_3d_sample_from_embedding(
                 loss_fn=loss_fn,
                 device=device,
                 use_amp=args.use_amp,
+                box_jitter=getattr(args, 'box_jitter', 0),
             )
             if n2 > 0 and loss2.requires_grad:
                 all_losses.append(loss2)
@@ -946,6 +966,9 @@ def parse_args():
                         help="Max slices per video sequence during training (default: 32)")
     parser.add_argument("--max-labels-per-sample", type=int, default=1,
                         help="Max labels per 3D sample to prevent OOM (default: 1)")
+    parser.add_argument("--box-jitter", type=int, default=10,
+                        help="Random shift (pixels, original slice resolution) of each "
+                             "box-prompt edge during training; 0 = exact GT box (default: 10)")
 
     # Training configuration
     parser.add_argument("--save-path", type=str, required=True,

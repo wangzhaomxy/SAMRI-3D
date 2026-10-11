@@ -52,6 +52,7 @@ GRAD_ACCUM=1
 MIX_RATIO_3D=0.8           # 80% 3D samples, 20% 2D samples
 SAMPLES_PER_DATASET=100     # Volumes per dataset per epoch
 MAX_SLICES_PER_VIDEO=32
+BOX_JITTER=10               # Random shift (pixels) of each box-prompt edge; 0 = exact GT box
 SAVE_EVERY=1
 NUM_WORKERS=12
 
@@ -175,6 +176,7 @@ echo "  Effective batch  : $((BATCH_SIZE * GRAD_ACCUM)) (batch × accum)"
 echo "  Mix ratio 3D     : ${MIX_RATIO_3D}  (3D fraction of batches)"
 echo "  Samples/dataset  : ${SAMPLES_PER_DATASET}  (volumes per dataset per epoch)"
 echo "  Max slices/video : ${MAX_SLICES_PER_VIDEO}"
+echo "  Box jitter       : ${BOX_JITTER} px"
 echo "  Save every       : ${SAVE_EVERY} epoch(s)"
 echo "  DataLoader wkrs  : ${NUM_WORKERS}"
 echo "  AMP              : enabled"
@@ -203,6 +205,7 @@ if [ "$TRAINING_MODE" == "2d_emb" ]; then
         --lr ${LR} \
         --num-epochs ${NUM_EPOCHS} \
         --max-slices-per-video ${MAX_SLICES_PER_VIDEO} \
+        --box-jitter ${BOX_JITTER} \
         --num-workers ${NUM_WORKERS} \
         --use-amp \
         --save-every ${SAVE_EVERY}
@@ -230,6 +233,7 @@ elif [ "$TRAINING_MODE" == "3d_emb" ]; then
         --lr ${LR} \
         --num-epochs ${NUM_EPOCHS} \
         --max-slices-per-video ${MAX_SLICES_PER_VIDEO} \
+        --box-jitter ${BOX_JITTER} \
         --lambda-2d ${LAMBDA_2D} \
         --lambda-3d ${LAMBDA_3D} \
         --num-workers ${NUM_WORKERS} \
@@ -257,6 +261,7 @@ elif [ "$TRAINING_MODE" == "2d_img" ]; then
         --lr ${LR} \
         --num-epochs ${NUM_EPOCHS} \
         --max-slices-per-video ${MAX_SLICES_PER_VIDEO} \
+        --box-jitter ${BOX_JITTER} \
         --num-workers ${NUM_WORKERS} \
         --use-amp \
         --save-every ${SAVE_EVERY}
@@ -330,6 +335,7 @@ elif [ "$TRAINING_MODE" == "gvt_tsdf" ]; then
         --mix-ratio-3d ${MIX_RATIO_3D} \
         --samples-per-dataset ${SAMPLES_PER_DATASET} \
         --max-slices-per-video ${MAX_SLICES_PER_VIDEO} \
+        --box-jitter ${BOX_JITTER} \
         --max-labels-per-sample ${MAX_LABELS_PER_SAMPLE} \
         --batch-size ${BATCH_SIZE} \
         --grad-accum-steps ${GRAD_ACCUM} \

@@ -409,6 +409,7 @@ def train_3d_sample_from_embedding_gvt_tsdf(
                 use_amp=args.use_amp,
                 lambda_2d=args.lambda_2d,
                 lambda_3d=args.lambda_3d,
+                box_jitter=getattr(args, 'box_jitter', 0),
             )
             if n1 > 0 and loss1.requires_grad:
                 all_losses.append(loss1)
@@ -431,6 +432,7 @@ def train_3d_sample_from_embedding_gvt_tsdf(
                 use_amp=args.use_amp,
                 lambda_2d=args.lambda_2d,
                 lambda_3d=args.lambda_3d,
+                box_jitter=getattr(args, 'box_jitter', 0),
             )
             if n2 > 0 and loss2.requires_grad:
                 all_losses.append(loss2)
@@ -717,6 +719,9 @@ def parse_args():
     parser.add_argument("--samples-per-dataset", type=int, default=100)
     parser.add_argument("--max-slices-per-video", type=int, default=32)
     parser.add_argument("--max-labels-per-sample", type=int, default=1)
+    parser.add_argument("--box-jitter", type=int, default=10,
+                        help="Random shift (pixels, original slice resolution) of each "
+                             "box-prompt edge during training; 0 = exact GT box (default: 10)")
 
     # Training
     parser.add_argument("--save-path", type=str, required=True)

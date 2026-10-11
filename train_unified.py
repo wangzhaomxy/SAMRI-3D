@@ -242,13 +242,30 @@ def get_fast_tmp_root() -> Optional[str]:
     return None
 
 
-def mask2d_to_bbox_xyxy(mask2d: np.ndarray) -> Optional[np.ndarray]:
-    """Convert binary mask to bounding box in [x0, y0, x1, y1] format."""
+def mask2d_to_bbox_xyxy(mask2d: np.ndarray, jitter: int = 0) -> Optional[np.ndarray]:
+    """Convert binary mask to bounding box in [x0, y0, x1, y1] format.
+
+    jitter > 0 randomly shifts each box edge by up to +/- jitter pixels (training
+    augmentation, same rule as SAMRI v1's gen_bboxes: an axis is only jittered when
+    the box is longer than jitter + 10 pixels along it). The jittered box always
+    stays inside the image and is at least 10 pixels long on each jittered axis.
+    """
     ys, xs = np.where(mask2d > 0)
     if xs.size == 0:
         return None
     x0, x1 = xs.min(), xs.max()
     y0, y1 = ys.min(), ys.max()
+    if jitter > 0:
+        h, w = mask2d.shape
+        min_side = 10
+        if x1 - x0 > jitter + 10:
+            x0 = max(0, x0 + np.random.randint(-jitter, jitter + 1))
+            x1 = min(w - 1, x1 + np.random.randint(-jitter, jitter + 1))
+            x1 = max(x1, x0 + min_side)
+        if y1 - y0 > jitter + 10:
+            y0 = max(0, y0 + np.random.randint(-jitter, jitter + 1))
+            y1 = min(h - 1, y1 + np.random.randint(-jitter, jitter + 1))
+            y1 = max(y1, y0 + min_side)
     return np.array([x0, y0, x1, y1], dtype=np.float32)
 
 
@@ -896,7 +913,7 @@ def train_2d_sample(
     mask_resized = F.interpolate(mask_tensor, size=(256, 256), mode="nearest")
 
     # Generate prompt (box)
-    box = mask2d_to_bbox_xyxy(mask)
+    box = mask2d_to_bbox_xyxy(mask, jitter=getattr(args, 'box_jitter', 0))
     if box is None:
         return torch.tensor(0.0, device=device)
 
@@ -955,6 +972,7 @@ def process_video_with_memory(
     loss_fn,
     device,
     use_amp: bool = False,
+    box_jitter: int = 0,
 ) -> Tuple[torch.Tensor, int]:
     """
     Process a sequence of slices with memory bank, computing loss at each frame.
@@ -1017,7 +1035,7 @@ def process_video_with_memory(
 
         if is_init_cond_frame:
             # Get bounding box prompt
-            box = mask2d_to_bbox_xyxy(mask_2d.astype(np.uint8))
+            box = mask2d_to_bbox_xyxy(mask_2d.astype(np.uint8), jitter=box_jitter)
             if box is None:
                 return torch.tensor(0.0, device=device), 0
 
@@ -1203,6 +1221,7 @@ def train_3d_sample_with_memory(
                 loss_fn=loss_fn,
                 device=device,
                 use_amp=args.use_amp,
+                box_jitter=getattr(args, 'box_jitter', 0),
             )
             if n1 > 0 and loss1.requires_grad:
                 all_losses.append(loss1)
@@ -1221,6 +1240,7 @@ def train_3d_sample_with_memory(
                 loss_fn=loss_fn,
                 device=device,
                 use_amp=args.use_amp,
+                box_jitter=getattr(args, 'box_jitter', 0),
             )
             if n2 > 0 and loss2.requires_grad:
                 all_losses.append(loss2)
@@ -1372,6 +1392,9 @@ def parse_args():
     parser.add_argument("--max-slices-per-video", type=int, default=32,
                         help="Max slices per video sequence during training (default: 32). "
                              "Reduces memory usage by subsampling long sequences.")
+    parser.add_argument("--box-jitter", type=int, default=10,
+                        help="Random shift (pixels, original slice resolution) of each "
+                             "box-prompt edge during training; 0 = exact GT box (default: 10)")
 
     # Training configuration
     parser.add_argument("--save-path", type=str, required=True,
